@@ -87,6 +87,54 @@ WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY schemaname, tablename, indexname
 "#;
 
+/// List all databases (\l)
+const META_QUERY_DATABASES: &str = r#"
+SELECT 
+    datname AS name,
+    pg_catalog.pg_get_userbyid(datdba) AS owner,
+    pg_catalog.pg_encoding_to_char(encoding) AS encoding
+FROM pg_catalog.pg_database
+WHERE datallowconn = true
+ORDER BY datname
+"#;
+
+/// List all roles/users (\du)
+const META_QUERY_ROLES: &str = r#"
+SELECT 
+    rolname AS role,
+    CASE WHEN rolsuper THEN 'Superuser' ELSE '' END AS super,
+    CASE WHEN rolcreaterole THEN 'Create role' ELSE '' END AS create_role,
+    CASE WHEN rolcreatedb THEN 'Create DB' ELSE '' END AS create_db,
+    CASE WHEN rolcanlogin THEN 'Login' ELSE '' END AS login
+FROM pg_catalog.pg_roles
+WHERE rolname NOT LIKE 'pg_%'
+ORDER BY rolname
+"#;
+
+/// List all views (\dv)
+const META_QUERY_VIEWS: &str = r#"
+SELECT 
+    schemaname AS schema,
+    viewname AS name,
+    viewowner AS owner
+FROM pg_catalog.pg_views
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, viewname
+"#;
+
+/// List all functions (\df)
+const META_QUERY_FUNCTIONS: &str = r#"
+SELECT 
+    n.nspname AS schema,
+    p.proname AS name,
+    pg_catalog.pg_get_function_result(p.oid) AS result_type,
+    pg_catalog.pg_get_function_arguments(p.oid) AS arguments
+FROM pg_catalog.pg_proc p
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY n.nspname, p.proname
+"#;
+
 /// Get primary key columns for a table
 const META_QUERY_PRIMARY_KEYS: &str = r#"
 SELECT ku.column_name
@@ -1713,6 +1761,25 @@ impl App {
             "\\di" | "di" => {
                 self.execute_meta_query(META_QUERY_INDEXES, None);
             }
+            "\\l" | "l" => {
+                self.execute_meta_query(META_QUERY_DATABASES, None);
+            }
+            "\\du" | "du" => {
+                self.execute_meta_query(META_QUERY_ROLES, None);
+            }
+            "\\dv" | "dv" => {
+                self.execute_meta_query(META_QUERY_VIEWS, None);
+            }
+            "\\df" | "df" => {
+                self.execute_meta_query(META_QUERY_FUNCTIONS, None);
+            }
+            "\\conninfo" | "conninfo" => {
+                self.show_connection_info();
+            }
+            "\\?" | "?" => {
+                // psql-style help alias
+                self.show_help = true;
+            }
             "history" => {
                 self.open_history_picker();
             }
@@ -1857,6 +1924,36 @@ impl App {
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed to write file: {}", e));
+            }
+        }
+    }
+
+    /// Show connection information (psql \conninfo equivalent).
+    fn show_connection_info(&mut self) {
+        match self.db.status {
+            DbStatus::Disconnected => {
+                self.last_status = Some("Not connected.".to_string());
+            }
+            DbStatus::Connecting => {
+                self.last_status = Some("Connection in progress...".to_string());
+            }
+            DbStatus::Connected => {
+                if let Some(ref conn_str) = self.db.conn_str {
+                    let info = ConnectionInfo::parse(conn_str);
+                    let user = info.user.as_deref().unwrap_or("unknown");
+                    let host = info.host.as_deref().unwrap_or("localhost");
+                    let port = info.port.unwrap_or(5432);
+                    let database = info.database.as_deref().unwrap_or("unknown");
+                    self.last_status = Some(format!(
+                        "Connected to database \"{}\" as user \"{}\" on host \"{}\" port {}.",
+                        database, user, host, port
+                    ));
+                } else {
+                    self.last_status = Some("Connected (no connection string available).".to_string());
+                }
+            }
+            DbStatus::Error => {
+                self.last_status = Some("Connection error. Use :connect <url> to reconnect.".to_string());
             }
         }
     }
@@ -3185,7 +3282,12 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("       ", Style::default()),
             Span::raw("   "),
-            Span::raw(": commands (:connect, :export, :gen, :\\dt, :\\d <tbl>, :\\dn, :\\di)"),
+            Span::raw(": commands (:connect, :export, :gen, :\\?, :\\conninfo)"),
+        ]),
+        Line::from(vec![
+            Span::styled("       ", Style::default()),
+            Span::raw("   "),
+            Span::raw("  schema: :\\dt, :\\d <tbl>, :\\dn, :\\di, :\\l, :\\du, :\\dv, :\\df"),
         ]),
         Line::from(vec![
             Span::styled("Visual", Style::default().add_modifier(Modifier::BOLD)),
