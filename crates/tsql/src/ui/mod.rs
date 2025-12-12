@@ -8,5 +8,5 @@ pub use completion::{
     TableInfo, determine_context, get_word_before_cursor,
 };
 pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
-pub use grid::{DataGrid, GridKeyResult, GridModel, GridSearch, GridState};
+pub use grid::{DataGrid, GridKeyResult, GridModel, GridSearch, GridState, ResizeAction};
 pub use highlighted_editor::{HighlightedTextArea, create_sql_highlighter};

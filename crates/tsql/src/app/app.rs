@@ -18,8 +18,8 @@ use tui_textarea::{CursorMove, Input};
 use super::state::{DbStatus, Focus, Mode, SearchTarget};
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridKeyResult,
-    GridModel, GridState, HighlightedTextArea, QueryEditor, SchemaCache, SearchPrompt, TableInfo,
-    create_sql_highlighter, determine_context, get_word_before_cursor,
+    GridModel, GridState, HighlightedTextArea, QueryEditor, ResizeAction, SchemaCache,
+    SearchPrompt, TableInfo, create_sql_highlighter, determine_context, get_word_before_cursor,
 };
 use crate::util::format_pg_error;
 use tui_syntax::Highlighter;
@@ -524,6 +524,13 @@ impl App {
                         }
                         GridKeyResult::CopyToClipboard(text) => {
                             self.copy_to_clipboard(&text);
+                        }
+                        GridKeyResult::ResizeColumn { col, action } => {
+                            match action {
+                                ResizeAction::Widen => self.grid.widen_column(col, 2),
+                                ResizeAction::Narrow => self.grid.narrow_column(col, 2),
+                                ResizeAction::AutoFit => self.grid.autofit_column(col),
+                            }
                         }
                         GridKeyResult::None => {}
                     }
@@ -1493,6 +1500,9 @@ impl App {
                 self.grid = GridModel::new(result.headers, result.rows);
                 self.grid_state = GridState::default();
 
+                // Move focus to grid to show results
+                self.focus = Focus::Grid;
+
                 let mut msg = String::new();
                 if let Some(tag) = result.command_tag {
                     msg.push_str(&tag);
@@ -1644,16 +1654,59 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("Grid", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":  "),
-            Span::raw("j/k move, h/l scroll cols, Space select, a all, Esc clear"),
+            Span::raw("j/k rows, h/l cols, H/L scroll, Space select, a all, Esc clear"),
         ]),
         Line::from(vec![
             Span::styled("     ", Style::default()),
             Span::raw("   "),
-            Span::raw("/ search, n/N next/prev, c copy cell, y yank row, Y yank w/headers"),
+            Span::raw("/ search, n/N next/prev, c copy cell, y yank row, Y w/headers"),
+        ]),
+        Line::from(vec![
+            Span::styled("     ", Style::default()),
+            Span::raw("   "),
+            Span::raw("+/> widen col, -/< narrow col, = auto-fit col"),
         ]),
     ];
 
     Paragraph::new(lines)
         .block(Block::default().title("Help").borders(Borders::ALL))
         .style(Style::default().fg(Color::White))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_finished_moves_focus_to_grid() {
+        // Create a minimal App for testing
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Initially focus should be on Query
+        assert_eq!(app.focus, Focus::Query, "Initial focus should be Query");
+
+        // Simulate a query finishing with results
+        let result = QueryResult {
+            headers: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec!["1".to_string(), "Alice".to_string()]],
+            command_tag: Some("SELECT 1".to_string()),
+            truncated: false,
+            elapsed: Duration::from_millis(10),
+        };
+
+        app.apply_db_event(DbEvent::QueryFinished { result });
+
+        // Focus should now be on Grid
+        assert_eq!(
+            app.focus,
+            Focus::Grid,
+            "Focus should move to Grid after query finishes"
+        );
+    }
 }

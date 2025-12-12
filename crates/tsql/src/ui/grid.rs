@@ -7,6 +7,17 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Action for column resize operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeAction {
+    /// Widen the column.
+    Widen,
+    /// Narrow the column.
+    Narrow,
+    /// Auto-fit the column to its content.
+    AutoFit,
+}
+
 /// Result of handling a key in the grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GridKeyResult {
@@ -18,6 +29,8 @@ pub enum GridKeyResult {
     OpenCommand,
     /// Copy text to clipboard.
     CopyToClipboard(String),
+    /// Resize a column.
+    ResizeColumn { col: usize, action: ResizeAction },
 }
 
 /// A match location in the grid (row, column).
@@ -166,10 +179,10 @@ impl GridState {
                     self.cursor_row = (self.cursor_row + 1).min(row_count - 1);
                 }
             }
-            (KeyCode::PageUp, _) => {
+            (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.cursor_row = self.cursor_row.saturating_sub(10);
             }
-            (KeyCode::PageDown, _) => {
+            (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                 if row_count > 0 {
                     self.cursor_row = (self.cursor_row + 10).min(row_count - 1);
                 }
@@ -183,11 +196,20 @@ impl GridState {
                 }
             }
 
-            // Horizontal scroll is column-based (jump by columns).
-            (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
+            // Column cursor movement (h/l move cursor, H/L scroll viewport)
+            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                self.cursor_col = self.cursor_col.saturating_sub(1);
+            }
+            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
+                if col_count > 0 {
+                    self.cursor_col = (self.cursor_col + 1).min(col_count - 1);
+                }
+            }
+            // Viewport scrolling (Shift+H/L)
+            (KeyCode::Char('H'), KeyModifiers::SHIFT) | (KeyCode::Char('H'), KeyModifiers::NONE) => {
                 self.col_offset = self.col_offset.saturating_sub(1);
             }
-            (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
+            (KeyCode::Char('L'), KeyModifiers::SHIFT) | (KeyCode::Char('L'), KeyModifiers::NONE) => {
                 if col_count > 0 {
                     self.col_offset = (self.col_offset + 1).min(col_count - 1);
                 }
@@ -293,6 +315,35 @@ impl GridState {
                 }
             }
 
+            // Column resize controls
+            // + or > to widen column
+            (KeyCode::Char('+'), _) | (KeyCode::Char('>'), _) => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::Widen,
+                    };
+                }
+            }
+            // - or < to narrow column
+            (KeyCode::Char('-'), _) | (KeyCode::Char('<'), _) => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::Narrow,
+                    };
+                }
+            }
+            // = to auto-fit column
+            (KeyCode::Char('='), _) => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::AutoFit,
+                    };
+                }
+            }
+
             _ => {}
         }
 
@@ -315,25 +366,101 @@ impl GridState {
         self.search.clear();
     }
 
-    pub fn ensure_cursor_visible(&mut self, viewport_rows: usize, row_count: usize) {
+    pub fn ensure_cursor_visible(
+        &mut self,
+        viewport_rows: usize,
+        row_count: usize,
+        col_count: usize,
+        col_widths: &[u16],
+        viewport_width: u16,
+    ) {
+        // Handle rows
         if viewport_rows == 0 || row_count == 0 {
             self.row_offset = 0;
             self.cursor_row = 0;
-            return;
+        } else {
+            self.cursor_row = self.cursor_row.min(row_count - 1);
+
+            if self.cursor_row < self.row_offset {
+                self.row_offset = self.cursor_row;
+            }
+
+            let last_visible = self.row_offset + viewport_rows - 1;
+            if self.cursor_row > last_visible {
+                self.row_offset = self.cursor_row.saturating_sub(viewport_rows - 1);
+            }
+
+            self.row_offset = self.row_offset.min(row_count.saturating_sub(1));
         }
 
-        self.cursor_row = self.cursor_row.min(row_count - 1);
+        // Handle columns - ensure cursor_col is visible
+        if col_count == 0 {
+            self.col_offset = 0;
+            self.cursor_col = 0;
+        } else {
+            self.cursor_col = self.cursor_col.min(col_count - 1);
 
-        if self.cursor_row < self.row_offset {
-            self.row_offset = self.cursor_row;
+            // If cursor is before visible area, scroll left
+            if self.cursor_col < self.col_offset {
+                self.col_offset = self.cursor_col;
+            }
+
+            // If cursor is after visible area, scroll right
+            // Calculate the rightmost visible column from current col_offset
+            if !col_widths.is_empty() && viewport_width > 0 {
+                let mut width_used: u16 = 0;
+                let mut last_fully_visible_col = self.col_offset;
+
+                for col in self.col_offset..col_count {
+                    let col_w = col_widths.get(col).copied().unwrap_or(0);
+                    let col_total = col_w + 1; // +1 for padding
+
+                    if width_used + col_w <= viewport_width {
+                        last_fully_visible_col = col;
+                        width_used += col_total;
+                    } else {
+                        break;
+                    }
+                }
+
+                // If cursor is beyond the last fully visible column, scroll right
+                if self.cursor_col > last_fully_visible_col {
+                    // Scroll so cursor_col is visible
+                    // We want cursor_col to be the rightmost visible column
+                    let mut new_offset = self.cursor_col;
+                    let mut width_needed: u16 = 0;
+
+                    // Work backwards from cursor_col to find how many columns fit
+                    while new_offset > 0 {
+                        let col_w = col_widths.get(new_offset).copied().unwrap_or(0);
+                        let col_total = col_w + 1;
+
+                        if width_needed + col_total <= viewport_width {
+                            width_needed += col_total;
+                            new_offset -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Adjust: new_offset should be the first column to show
+                    if new_offset < self.cursor_col {
+                        new_offset += 1;
+                    }
+
+                    // Make sure cursor column itself fits
+                    let cursor_width = col_widths.get(self.cursor_col).copied().unwrap_or(0);
+                    if cursor_width > viewport_width {
+                        // Column is wider than viewport, just show it from the start
+                        new_offset = self.cursor_col;
+                    }
+
+                    self.col_offset = new_offset.max(self.col_offset);
+                }
+            }
+
+            self.col_offset = self.col_offset.min(col_count.saturating_sub(1));
         }
-
-        let last_visible = self.row_offset + viewport_rows - 1;
-        if self.cursor_row > last_visible {
-            self.row_offset = self.cursor_row.saturating_sub(viewport_rows - 1);
-        }
-
-        self.row_offset = self.row_offset.min(row_count.saturating_sub(1));
     }
 }
 
@@ -458,6 +585,43 @@ impl GridModel {
 
         format!("[\n{}\n]", objects.join(",\n"))
     }
+
+    /// Widen a column by a given amount.
+    pub fn widen_column(&mut self, col: usize, amount: u16) {
+        if let Some(width) = self.col_widths.get_mut(col) {
+            *width = width.saturating_add(amount).min(200); // Max width of 200
+        }
+    }
+
+    /// Narrow a column by a given amount.
+    pub fn narrow_column(&mut self, col: usize, amount: u16) {
+        if let Some(width) = self.col_widths.get_mut(col) {
+            *width = width.saturating_sub(amount).max(3); // Min width of 3
+        }
+    }
+
+    /// Auto-fit a column to its content.
+    pub fn autofit_column(&mut self, col: usize) {
+        if col >= self.headers.len() {
+            return;
+        }
+
+        // Calculate optimal width based on header and all row values
+        let header_width = display_width(&self.headers[col]) as u16;
+        let max_data_width = self
+            .rows
+            .iter()
+            .filter_map(|row| row.get(col))
+            .map(|cell| display_width(cell) as u16)
+            .max()
+            .unwrap_or(0);
+
+        let optimal_width = header_width.max(max_data_width).max(3).min(100); // Between 3 and 100
+
+        if let Some(width) = self.col_widths.get_mut(col) {
+            *width = optimal_width;
+        }
+    }
 }
 
 /// Escape a string for CSV output.
@@ -487,7 +651,7 @@ pub struct DataGrid<'a> {
 impl<'a> Widget for DataGrid<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Build title with search info if active
-        let base_title = "Results (j/k move, h/l scroll cols, Space select, / search)";
+        let base_title = "Results (j/k rows, h/l cols, +/- resize, = autofit, / search)";
         let title = if let Some(search_info) = self.state.search.match_info() {
             format!("{} {}", base_title, search_info)
         } else {
@@ -546,7 +710,17 @@ impl<'a> Widget for DataGrid<'a> {
         let data_x = header_area.x.saturating_add(marker_w);
         let data_w = header_area.width.saturating_sub(marker_w);
 
-        // Header row (frozen).
+        // Calculate the actual scroll position first (before rendering header)
+        let mut state = self.state.clone();
+        state.ensure_cursor_visible(
+            body_area.height as usize,
+            self.model.rows.len(),
+            self.model.headers.len(),
+            &self.model.col_widths,
+            data_w,
+        );
+
+        // Header row (frozen vertically, but scrolls horizontally with body).
         render_marker_header(header_area, buf, marker_w);
         render_row_cells(
             data_x,
@@ -554,7 +728,7 @@ impl<'a> Widget for DataGrid<'a> {
             data_w,
             &self.model.headers,
             &self.model.col_widths,
-            self.state.col_offset,
+            state.col_offset, // Use the adjusted col_offset
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -569,9 +743,6 @@ impl<'a> Widget for DataGrid<'a> {
                 .render(body_area, buf);
             return;
         }
-
-        let mut state = self.state.clone();
-        state.ensure_cursor_visible(body_area.height as usize, self.model.rows.len());
 
         for i in 0..(body_area.height as usize) {
             let row_idx = state.row_offset + i;
@@ -599,6 +770,13 @@ impl<'a> Widget for DataGrid<'a> {
                 buf,
             );
 
+            // Determine cursor column for this row (only if this is the cursor row)
+            let cursor_col = if is_cursor {
+                Some(state.cursor_col)
+            } else {
+                None
+            };
+
             render_row_cells_with_search(
                 data_x,
                 y,
@@ -608,6 +786,7 @@ impl<'a> Widget for DataGrid<'a> {
                 state.col_offset,
                 row_style,
                 row_idx,
+                cursor_col,
                 &self.state.search,
                 buf,
             );
@@ -691,7 +870,7 @@ fn render_row_cells(
     }
 }
 
-/// Render row cells with search highlighting.
+/// Render row cells with search highlighting and cursor column.
 fn render_row_cells_with_search(
     mut x: u16,
     y: u16,
@@ -701,6 +880,7 @@ fn render_row_cells_with_search(
     col_offset: usize,
     base_style: Style,
     row_idx: usize,
+    cursor_col: Option<usize>,
     search: &GridSearch,
     buf: &mut Buffer,
 ) {
@@ -711,9 +891,10 @@ fn render_row_cells_with_search(
     let padding: u16 = 1;
     let max_x = x.saturating_add(available_w);
 
-    // Styles for search matches
+    // Styles for search matches and cursor
     let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
     let current_match_style = Style::default().bg(Color::Rgb(255, 165, 0)).fg(Color::Black); // Orange
+    let cursor_cell_style = Style::default().bg(Color::Cyan).fg(Color::Black);
 
     let mut col = col_offset;
     while col < cells.len() && col < col_widths.len() && x < max_x {
@@ -728,8 +909,11 @@ fn render_row_cells_with_search(
             break;
         }
 
-        // Determine cell style based on search state
-        let cell_style = if search.is_current_match(row_idx, col) {
+        // Determine cell style based on cursor position and search state
+        let is_cursor_cell = cursor_col == Some(col);
+        let cell_style = if is_cursor_cell {
+            cursor_cell_style
+        } else if search.is_current_match(row_idx, col) {
             current_match_style
         } else if search.is_match(row_idx, col) {
             match_style
@@ -922,5 +1106,343 @@ mod tests {
             }
             _ => panic!("Expected CopyToClipboard result, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn test_h_l_move_column_cursor() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Initial state: cursor_col should be 0
+        assert_eq!(state.cursor_col, 0);
+
+        // Press 'l' to move column cursor right
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        state.handle_key(key, &model);
+        assert_eq!(state.cursor_col, 1, "l should move cursor_col right");
+
+        // Press 'l' again - should stay at max (1 for 2-column model)
+        state.handle_key(key, &model);
+        assert_eq!(state.cursor_col, 1, "cursor_col should not exceed column count");
+
+        // Press 'h' to move column cursor left
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        state.handle_key(key, &model);
+        assert_eq!(state.cursor_col, 0, "h should move cursor_col left");
+
+        // Press 'h' again - should stay at 0
+        state.handle_key(key, &model);
+        assert_eq!(state.cursor_col, 0, "cursor_col should not go below 0");
+    }
+
+    #[test]
+    fn test_shift_h_l_scroll_viewport() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Initial state: col_offset should be 0
+        assert_eq!(state.col_offset, 0);
+
+        // Press 'L' (Shift+l) to scroll viewport right
+        let key = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        state.handle_key(key, &model);
+        assert_eq!(state.col_offset, 1, "L should scroll col_offset right");
+
+        // Press 'H' (Shift+h) to scroll viewport left
+        let key = KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT);
+        state.handle_key(key, &model);
+        assert_eq!(state.col_offset, 0, "H should scroll col_offset left");
+    }
+
+    fn create_wide_test_model() -> GridModel {
+        // Create a model with many columns to test scrolling
+        GridModel::new(
+            vec![
+                "col1".to_string(),
+                "col2".to_string(),
+                "col3".to_string(),
+                "col4".to_string(),
+                "col5".to_string(),
+            ],
+            vec![vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ]],
+        )
+    }
+
+    #[test]
+    fn test_cursor_col_scrolls_viewport_right() {
+        let mut state = GridState::default();
+        let model = create_wide_test_model();
+
+        // Initial state
+        assert_eq!(state.cursor_col, 0);
+        assert_eq!(state.col_offset, 0);
+
+        // Move cursor to the right multiple times
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        for _ in 0..4 {
+            state.handle_key(key, &model);
+        }
+
+        // Cursor should be at column 4
+        assert_eq!(state.cursor_col, 4, "cursor_col should be at 4");
+
+        // Now call ensure_cursor_visible with a narrow viewport
+        // col_widths are 4 each (from "col1", "col2", etc.), + 1 padding = 5 per col
+        // viewport of 12 would show ~2 columns (5 + 5 = 10, leaving room for 2 cols)
+        let viewport_width = 12;
+        state.ensure_cursor_visible(10, 1, 5, &model.col_widths, viewport_width);
+
+        // col_offset should have scrolled right to make cursor visible
+        // If cursor is at col 4 and we can see ~2 cols, offset should be >= 3
+        assert!(
+            state.col_offset > 0,
+            "col_offset should scroll right to keep cursor visible, but col_offset={}",
+            state.col_offset
+        );
+    }
+
+    #[test]
+    fn test_header_scrolls_with_body() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        // Create a model with several columns
+        let model = create_wide_test_model();
+
+        // Create state with cursor at rightmost column but col_offset at 0
+        // This simulates the bug: cursor moved right but header hasn't scrolled
+        let mut state = GridState::default();
+        state.cursor_col = 4; // Last column
+        state.col_offset = 0; // Header would use this if not updated
+
+        let grid = DataGrid {
+            model: &model,
+            state: &state,
+            focused: true,
+        };
+
+        // Render to a small buffer (narrow viewport)
+        // Width of 20 should only fit ~2-3 columns with border + marker
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(area);
+        grid.render(area, &mut buf);
+
+        // The header row is at y=1 (after border)
+        // After marker column (3 chars), data starts at x=4
+        // Check that the header shows same columns as body
+        let header_row: String = (4..area.width - 1)
+            .map(|x| buf.cell((x, 1)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .collect();
+
+        // Body row is at y=2
+        let body_row: String = (4..area.width - 1)
+            .map(|x| buf.cell((x, 2)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .collect();
+
+        // The first column shown in header should match the first column shown in body
+        // Extract first word from each
+        let header_first_col: String = header_row.trim().split_whitespace().next().unwrap_or("").to_string();
+        let body_first_col: String = body_row.trim().split_whitespace().next().unwrap_or("").to_string();
+
+        // Get the column index from header (col1 -> 1, col2 -> 2, etc)
+        let header_col_num: Option<u32> = header_first_col.strip_prefix("col").and_then(|n| n.parse().ok());
+        let _body_col_num: Option<u32> = body_first_col.strip_prefix("col").and_then(|n| n.parse().ok());
+
+        // For body, it shows data "a", "b", "c", etc which correspond to col1, col2, col3...
+        // So body shows starting from col_offset that ensure_cursor_visible calculated
+        // Header should show the same starting column
+
+        // With cursor at col 4 in a narrow viewport, the viewport should scroll
+        // Both header and body should start from a column > 1
+        assert!(
+            header_col_num.unwrap_or(1) > 1 || body_first_col == "a",
+            "Header first col '{}' should scroll to match body which starts with '{}'. Full header: '{}', body: '{}'",
+            header_first_col,
+            body_first_col,
+            header_row.trim(),
+            body_row.trim()
+        );
+    }
+
+    #[test]
+    fn test_plus_key_widens_column() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Press '+' to widen the current column
+        let key = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::ResizeColumn {
+                col: 0,
+                action: ResizeAction::Widen
+            },
+            "'+' should return ResizeColumn with Widen action for current column"
+        );
+    }
+
+    #[test]
+    fn test_greater_than_key_widens_column() {
+        let mut state = GridState::default();
+        state.cursor_col = 1; // Move to second column
+        let model = create_test_model();
+
+        // Press '>' to widen the current column
+        let key = KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::ResizeColumn {
+                col: 1,
+                action: ResizeAction::Widen
+            },
+            "'>' should return ResizeColumn with Widen action for current column"
+        );
+    }
+
+    #[test]
+    fn test_minus_key_narrows_column() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Press '-' to narrow the current column
+        let key = KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::ResizeColumn {
+                col: 0,
+                action: ResizeAction::Narrow
+            },
+            "'-' should return ResizeColumn with Narrow action for current column"
+        );
+    }
+
+    #[test]
+    fn test_less_than_key_narrows_column() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Press '<' to narrow the current column
+        let key = KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::ResizeColumn {
+                col: 0,
+                action: ResizeAction::Narrow
+            },
+            "'<' should return ResizeColumn with Narrow action for current column"
+        );
+    }
+
+    #[test]
+    fn test_equals_key_autofits_column() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Press '=' to auto-fit the current column
+        let key = KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::ResizeColumn {
+                col: 0,
+                action: ResizeAction::AutoFit
+            },
+            "'=' should return ResizeColumn with AutoFit action for current column"
+        );
+    }
+
+    #[test]
+    fn test_widen_column_increases_width() {
+        let mut model = create_test_model();
+        let original_width = model.col_widths[0];
+
+        model.widen_column(0, 2);
+
+        assert_eq!(
+            model.col_widths[0],
+            original_width + 2,
+            "widen_column should increase width by the given amount"
+        );
+    }
+
+    #[test]
+    fn test_narrow_column_decreases_width() {
+        let mut model = create_test_model();
+        // Set a known width first
+        model.col_widths[0] = 10;
+
+        model.narrow_column(0, 2);
+
+        assert_eq!(
+            model.col_widths[0],
+            8,
+            "narrow_column should decrease width by the given amount"
+        );
+    }
+
+    #[test]
+    fn test_narrow_column_has_minimum_width() {
+        let mut model = create_test_model();
+        model.col_widths[0] = 5;
+
+        // Try to narrow below minimum
+        model.narrow_column(0, 10);
+
+        assert_eq!(
+            model.col_widths[0],
+            3,
+            "narrow_column should not go below minimum width of 3"
+        );
+    }
+
+    #[test]
+    fn test_widen_column_has_maximum_width() {
+        let mut model = create_test_model();
+        model.col_widths[0] = 199;
+
+        // Try to widen above maximum
+        model.widen_column(0, 10);
+
+        assert_eq!(
+            model.col_widths[0],
+            200,
+            "widen_column should not exceed maximum width of 200"
+        );
+    }
+
+    #[test]
+    fn test_autofit_column_fits_content() {
+        let mut model = GridModel::new(
+            vec!["short".to_string(), "verylongheadername".to_string()],
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()],
+            ],
+        );
+
+        // Second column should fit "verylongheadername" (18 chars)
+        model.autofit_column(1);
+
+        assert_eq!(
+            model.col_widths[1],
+            18,
+            "autofit_column should size to longest content (header in this case)"
+        );
     }
 }
