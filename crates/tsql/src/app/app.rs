@@ -16,13 +16,118 @@ use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
 use super::state::{DbStatus, Focus, Mode, SearchTarget};
+use crate::config::Config;
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridKeyResult,
     GridModel, GridState, HighlightedTextArea, QueryEditor, ResizeAction, SchemaCache,
-    SearchPrompt, TableInfo, create_sql_highlighter, determine_context, get_word_before_cursor,
+    SearchPrompt, TableInfo, create_sql_highlighter, determine_context, escape_sql_value,
+    get_word_before_cursor, quote_identifier,
 };
 use crate::util::format_pg_error;
 use tui_syntax::Highlighter;
+
+// Meta-command SQL queries (psql-style \dt, \d, etc.)
+
+/// List all tables in the current database
+const META_QUERY_TABLES: &str = r#"
+SELECT 
+    schemaname AS schema,
+    tablename AS name,
+    tableowner AS owner
+FROM pg_catalog.pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename
+"#;
+
+/// List all schemas
+const META_QUERY_SCHEMAS: &str = r#"
+SELECT 
+    schema_name AS name,
+    schema_owner AS owner
+FROM information_schema.schemata
+WHERE schema_name NOT LIKE 'pg_%'
+  AND schema_name != 'information_schema'
+ORDER BY schema_name
+"#;
+
+/// Describe a table (columns, types, constraints)
+const META_QUERY_DESCRIBE: &str = r#"
+SELECT 
+    c.column_name AS column,
+    c.data_type AS type,
+    CASE WHEN c.is_nullable = 'YES' THEN 'NULL' ELSE 'NOT NULL' END AS nullable,
+    c.column_default AS default,
+    CASE WHEN pk.column_name IS NOT NULL THEN 'PK' ELSE '' END AS key
+FROM information_schema.columns c
+LEFT JOIN (
+    SELECT ku.column_name
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage ku
+        ON tc.constraint_name = ku.constraint_name
+        AND tc.table_schema = ku.table_schema
+    WHERE tc.constraint_type = 'PRIMARY KEY'
+      AND tc.table_name = '$1'
+) pk ON c.column_name = pk.column_name
+WHERE c.table_name = '$1'
+ORDER BY c.ordinal_position
+"#;
+
+/// List all indexes
+const META_QUERY_INDEXES: &str = r#"
+SELECT 
+    schemaname AS schema,
+    tablename AS table,
+    indexname AS index,
+    indexdef AS definition
+FROM pg_catalog.pg_indexes
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename, indexname
+"#;
+
+/// Get primary key columns for a table
+const META_QUERY_PRIMARY_KEYS: &str = r#"
+SELECT ku.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage ku
+    ON tc.constraint_name = ku.constraint_name
+    AND tc.table_schema = ku.table_schema
+WHERE tc.constraint_type = 'PRIMARY KEY'
+  AND tc.table_name = '$1'
+ORDER BY ku.ordinal_position
+"#;
+
+/// Escape a SQL identifier for use in queries (prevents SQL injection)
+fn escape_sql_identifier(s: &str) -> String {
+    // Remove any existing quotes and escape internal quotes
+    let cleaned = s.trim_matches('"').replace('"', "\"\"");
+    // For simple identifiers, return as-is; otherwise quote
+    if cleaned.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        cleaned
+    } else {
+        format!("\"{}\"", cleaned)
+    }
+}
+
+/// Fetch primary key column names for a table.
+async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
+    let query = META_QUERY_PRIMARY_KEYS.replace("$1", &escape_sql_identifier(table));
+    let guard = client.lock().await;
+    
+    match guard.simple_query(&query).await {
+        Ok(messages) => {
+            let mut pks = Vec::new();
+            for msg in messages {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    if let Some(col_name) = row.get(0) {
+                        pks.push(col_name.to_string());
+                    }
+                }
+            }
+            pks
+        }
+        Err(_) => Vec::new(), // Silently fail - PK detection is optional
+    }
+}
 
 pub struct QueryResult {
     pub headers: Vec<String>,
@@ -30,6 +135,55 @@ pub struct QueryResult {
     pub command_tag: Option<String>,
     pub truncated: bool,
     pub elapsed: Duration,
+    /// The source table name, if extracted from a simple SELECT query.
+    pub source_table: Option<String>,
+    /// Primary key column names for the source table.
+    pub primary_keys: Vec<String>,
+}
+
+/// Extract the table name from a simple SELECT query.
+/// Returns Some(table_name) for queries like:
+/// - SELECT * FROM users
+/// - SELECT id, name FROM public.users
+/// - select * from "My Table"
+/// Returns None for complex queries (JOINs, subqueries, etc.)
+fn extract_table_from_query(query: &str) -> Option<String> {
+    let query = query.trim().to_lowercase();
+    
+    // Must start with SELECT
+    if !query.starts_with("select") {
+        return None;
+    }
+    
+    // Find FROM keyword
+    let from_pos = query.find(" from ")?;
+    let after_from = &query[from_pos + 6..].trim_start();
+    
+    // Extract the table name (first word after FROM)
+    // Stop at whitespace, semicolon, or end of string
+    let table_end = after_from
+        .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
+        .unwrap_or(after_from.len());
+    
+    let table = after_from[..table_end].trim();
+    
+    if table.is_empty() {
+        return None;
+    }
+    
+    // Check for complex queries (JOINs, subqueries)
+    let rest = &after_from[table_end..];
+    if rest.contains(" join ") || table.starts_with('(') {
+        return None;
+    }
+    
+    // Remove schema prefix if present (public.users -> users)
+    let table_name = table.rsplit('.').next().unwrap_or(table);
+    
+    // Remove quotes if present
+    let table_name = table_name.trim_matches('"').trim_matches('\'');
+    
+    Some(table_name.to_string())
 }
 
 pub type SharedClient = Arc<Mutex<Client>>;
@@ -54,6 +208,12 @@ pub enum DbEvent {
     QueryCancelled,
     SchemaLoaded {
         tables: Vec<TableInfo>,
+    },
+    /// A cell was successfully updated.
+    CellUpdated {
+        row: usize,
+        col: usize,
+        value: String,
     },
 }
 
@@ -87,9 +247,190 @@ impl Default for DbSession {
     }
 }
 
+/// State for inline cell editing with cursor support.
+#[derive(Default)]
+pub struct CellEditor {
+    /// Whether cell editing is active.
+    pub active: bool,
+    /// The row being edited.
+    pub row: usize,
+    /// The column being edited.
+    pub col: usize,
+    /// The current edit value.
+    pub value: String,
+    /// The original value (for cancel).
+    pub original_value: String,
+    /// Cursor position within the value (byte offset).
+    pub cursor: usize,
+    /// Horizontal scroll offset for display.
+    pub scroll_offset: usize,
+}
+
+impl CellEditor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn open(&mut self, row: usize, col: usize, value: String) {
+        self.active = true;
+        self.row = row;
+        self.col = col;
+        self.original_value = value.clone();
+        self.cursor = value.len(); // Start cursor at end
+        self.scroll_offset = 0;
+        self.value = value;
+    }
+
+    pub fn close(&mut self) {
+        self.active = false;
+        self.value.clear();
+        self.original_value.clear();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Insert a character at the current cursor position.
+    pub fn insert_char(&mut self, c: char) {
+        self.value.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor (backspace).
+    pub fn delete_char_before(&mut self) {
+        if self.cursor > 0 {
+            // Find the previous character boundary
+            let prev_boundary = self.value[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.value.remove(prev_boundary);
+            self.cursor = prev_boundary;
+        }
+    }
+
+    /// Delete the character at the cursor (delete key).
+    pub fn delete_char_at(&mut self) {
+        if self.cursor < self.value.len() {
+            self.value.remove(self.cursor);
+        }
+    }
+
+    /// Move cursor left by one character.
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            // Find the previous character boundary
+            self.cursor = self.value[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move cursor right by one character.
+    pub fn move_right(&mut self) {
+        if self.cursor < self.value.len() {
+            // Find the next character boundary
+            self.cursor = self.value[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.value.len());
+        }
+    }
+
+    /// Move cursor to the start of the value.
+    pub fn move_to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move cursor to the end of the value.
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
+    /// Clear the entire value.
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
+
+    /// Delete from cursor to end of line (Ctrl+K).
+    pub fn delete_to_end(&mut self) {
+        self.value.truncate(self.cursor);
+    }
+
+    /// Delete from start to cursor (Ctrl+U).
+    pub fn delete_to_start(&mut self) {
+        self.value = self.value[self.cursor..].to_string();
+        self.cursor = 0;
+    }
+
+    /// Get the visible portion of the value for display, given a width.
+    /// Returns (visible_text, cursor_position_in_visible).
+    pub fn visible_text(&self, width: usize) -> (String, usize) {
+        if width == 0 {
+            return (String::new(), 0);
+        }
+
+        let chars: Vec<char> = self.value.chars().collect();
+        let cursor_char_pos = self.value[..self.cursor].chars().count();
+
+        // Adjust scroll offset to keep cursor visible
+        let mut scroll = self.scroll_offset;
+
+        // If cursor is before the visible window, scroll left
+        if cursor_char_pos < scroll {
+            scroll = cursor_char_pos;
+        }
+
+        // If cursor is after the visible window, scroll right
+        // Leave room for the cursor indicator
+        let visible_width = width.saturating_sub(1);
+        if cursor_char_pos >= scroll + visible_width {
+            scroll = cursor_char_pos.saturating_sub(visible_width) + 1;
+        }
+
+        // Extract visible characters
+        let visible_chars: String = chars
+            .iter()
+            .skip(scroll)
+            .take(visible_width)
+            .collect();
+
+        let cursor_in_visible = cursor_char_pos.saturating_sub(scroll);
+
+        (visible_chars, cursor_in_visible)
+    }
+
+    /// Update scroll offset based on cursor position and display width.
+    pub fn update_scroll(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+
+        let cursor_char_pos = self.value[..self.cursor].chars().count();
+        let visible_width = width.saturating_sub(1);
+
+        // If cursor is before the visible window, scroll left
+        if cursor_char_pos < self.scroll_offset {
+            self.scroll_offset = cursor_char_pos;
+        }
+
+        // If cursor is after the visible window, scroll right
+        if cursor_char_pos >= self.scroll_offset + visible_width {
+            self.scroll_offset = cursor_char_pos.saturating_sub(visible_width) + 1;
+        }
+    }
+}
+
 pub struct App {
     pub focus: Focus,
     pub mode: Mode,
+
+    /// Application configuration
+    pub config: Config,
 
     pub editor: QueryEditor,
     pub highlighter: Highlighter,
@@ -99,6 +440,8 @@ pub struct App {
     pub completion: CompletionPopup,
     pub schema_cache: SchemaCache,
     pub pending_key: Option<char>,
+    /// Editor scroll offset (row, col) for horizontal scrolling support.
+    pub editor_scroll: (u16, u16),
 
     pub rt: tokio::runtime::Handle,
     pub db_events_tx: mpsc::UnboundedSender<DbEvent>,
@@ -107,6 +450,9 @@ pub struct App {
 
     pub grid: GridModel,
     pub grid_state: GridState,
+
+    /// Cell editor for inline editing.
+    pub cell_editor: CellEditor,
 
     pub show_help: bool,
     pub last_status: Option<String>,
@@ -121,11 +467,34 @@ impl App {
         db_events_rx: mpsc::UnboundedReceiver<DbEvent>,
         conn_str: Option<String>,
     ) -> Self {
+        Self::with_config(
+            grid,
+            rt,
+            db_events_tx,
+            db_events_rx,
+            conn_str,
+            Config::default(),
+        )
+    }
+
+    pub fn with_config(
+        grid: GridModel,
+        rt: tokio::runtime::Handle,
+        db_events_tx: mpsc::UnboundedSender<DbEvent>,
+        db_events_rx: mpsc::UnboundedReceiver<DbEvent>,
+        conn_str: Option<String>,
+        config: Config,
+    ) -> Self {
         let editor = QueryEditor::new();
+
+        // Determine connection string: CLI arg > config > env var
+        let effective_conn_str = conn_str.or_else(|| config.connection.default_url.clone());
 
         let mut app = Self {
             focus: Focus::Query,
             mode: Mode::Normal,
+
+            config,
 
             editor,
             highlighter: create_sql_highlighter(),
@@ -135,6 +504,7 @@ impl App {
             completion: CompletionPopup::new(),
             schema_cache: SchemaCache::new(),
             pending_key: None,
+            editor_scroll: (0, 0),
 
             rt,
             db_events_tx,
@@ -144,13 +514,15 @@ impl App {
             grid,
             grid_state: GridState::default(),
 
+            cell_editor: CellEditor::new(),
+
             show_help: false,
             last_status: None,
             last_error: None,
         };
 
         // Auto-connect if connection string provided
-        if let Some(url) = conn_str {
+        if let Some(url) = effective_conn_str {
             app.start_connect(url);
         }
 
@@ -225,9 +597,23 @@ impl App {
                     &self.editor.textarea,
                     highlighted_lines.clone(),
                 )
-                .block(query_block);
+                .block(query_block)
+                .scroll(self.editor_scroll);
 
                 frame.render_widget(highlighted_editor, query_area);
+                
+                // Update editor scroll based on cursor position
+                // The inner area height is query_area.height - 2 (for borders)
+                let inner_height = query_area.height.saturating_sub(2) as usize;
+                let inner_width = query_area.width.saturating_sub(2) as usize;
+                let (cursor_row, cursor_col) = self.editor.textarea.cursor();
+                self.editor_scroll = calculate_editor_scroll(
+                    cursor_row,
+                    cursor_col,
+                    self.editor_scroll,
+                    inner_height,
+                    inner_width,
+                );
 
                 // Error display (if any).
                 if let Some(ref err) = self.last_error {
@@ -374,6 +760,119 @@ impl App {
                         frame.render_widget(completion_list, popup_area);
                     }
                 }
+
+                // Render cell editor popup if active
+                if self.cell_editor.active {
+                    let col_name = self
+                        .grid
+                        .headers
+                        .get(self.cell_editor.col)
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string());
+
+                    // Calculate popup size - make it wider for large content
+                    let value_len = self.cell_editor.value.chars().count();
+                    let min_width = 50u16;
+                    let max_width = size.width.saturating_sub(4);
+                    // Use 80% of screen width for large values, but at least min_width
+                    let desired_width = if value_len > 45 {
+                        (size.width as f32 * 0.8) as u16
+                    } else {
+                        min_width
+                    };
+                    let popup_width = desired_width.clamp(min_width, max_width);
+                    let popup_height = 5u16;
+                    let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+                    let popup_y = grid_area.y + 2; // Near top of grid
+
+                    let popup_area = Rect {
+                        x: popup_x,
+                        y: popup_y,
+                        width: popup_width,
+                        height: popup_height,
+                    };
+
+                    // Calculate inner width for text display (minus borders)
+                    let inner_width = popup_width.saturating_sub(2) as usize;
+
+                    // Update scroll offset based on cursor position
+                    self.cell_editor.update_scroll(inner_width);
+
+                    let title = format!("Edit: {} (Enter confirm, Esc cancel)", col_name);
+                    let edit_block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(Style::default().fg(Color::Yellow));
+
+                    // Get visible text with cursor position
+                    let (visible_text, cursor_pos) = self.cell_editor.visible_text(inner_width);
+
+                    // Build display with cursor
+                    let mut display_spans = Vec::new();
+                    let chars: Vec<char> = visible_text.chars().collect();
+
+                    if cursor_pos < chars.len() {
+                        // Cursor is within text
+                        let before: String = chars[..cursor_pos].iter().collect();
+                        let cursor_char = chars[cursor_pos];
+                        let after: String = chars[cursor_pos + 1..].iter().collect();
+
+                        display_spans.push(Span::raw(before));
+                        display_spans.push(Span::styled(
+                            cursor_char.to_string(),
+                            Style::default().bg(Color::White).fg(Color::Black),
+                        ));
+                        display_spans.push(Span::raw(after));
+                    } else {
+                        // Cursor is at end
+                        display_spans.push(Span::raw(visible_text));
+                        display_spans.push(Span::styled(
+                            " ",
+                            Style::default().bg(Color::White).fg(Color::Black),
+                        ));
+                    }
+
+                    // Show scroll indicators if needed
+                    let total_chars = self.cell_editor.value.chars().count();
+                    let scroll_indicator = if self.cell_editor.scroll_offset > 0 || total_chars > inner_width {
+                        let at_start = self.cell_editor.scroll_offset == 0;
+                        let at_end = self.cell_editor.scroll_offset + inner_width >= total_chars;
+                        match (at_start, at_end) {
+                            (true, false) => " →",
+                            (false, true) => "← ",
+                            (false, false) => "←→",
+                            (true, true) => "",
+                        }
+                    } else {
+                        ""
+                    };
+
+                    let edit_content = Paragraph::new(Line::from(display_spans))
+                        .block(edit_block)
+                        .style(Style::default().fg(Color::White));
+
+                    frame.render_widget(Clear, popup_area);
+                    frame.render_widget(edit_content, popup_area);
+
+                    // Show scroll indicator and length info in a second line if there's room
+                    if popup_height > 4 && (!scroll_indicator.is_empty() || value_len > 20) {
+                        let info = format!(
+                            "{} len: {} pos: {}",
+                            scroll_indicator,
+                            value_len,
+                            self.cell_editor.value[..self.cell_editor.cursor].chars().count()
+                        );
+                        let info_area = Rect {
+                            x: popup_area.x + 1,
+                            y: popup_area.y + 3,
+                            width: popup_area.width.saturating_sub(2),
+                            height: 1,
+                        };
+                        let info_widget = Paragraph::new(info)
+                            .style(Style::default().fg(Color::DarkGray));
+                        frame.render_widget(info_widget, info_area);
+                    }
+                }
             })?;
 
             if event::poll(Duration::from_millis(50))? {
@@ -412,6 +911,7 @@ impl App {
             self.search.close();
             self.command.close();
             self.completion.close();
+            self.cell_editor.close();
             self.pending_key = None;
             self.last_error = None;
             self.mode = Mode::Normal;
@@ -435,6 +935,11 @@ impl App {
 
         if self.command.active {
             return self.handle_command_key(key);
+        }
+
+        // Handle cell editor when active
+        if self.cell_editor.active {
+            return self.handle_cell_edit_key(key);
         }
 
         // Handle completion popup when active
@@ -532,6 +1037,9 @@ impl App {
                                 ResizeAction::AutoFit => self.grid.autofit_column(col),
                             }
                         }
+                        GridKeyResult::EditCell { row, col } => {
+                            self.start_cell_edit(row, col);
+                        }
                         GridKeyResult::None => {}
                     }
                 }
@@ -568,6 +1076,206 @@ impl App {
                 self.last_error = Some(format!("Clipboard unavailable: {}", e));
             }
         }
+    }
+
+    fn start_cell_edit(&mut self, row: usize, col: usize) {
+        // Check if we have a valid PK for safe editing
+        if !self.grid.has_valid_pk() {
+            self.last_error = Some(
+                "Cannot edit: no primary key detected. Run a simple SELECT from a table with a PK."
+                    .to_string(),
+            );
+            return;
+        }
+
+        // Check if we have a source table
+        if self.grid.source_table.is_none() {
+            self.last_error =
+                Some("Cannot edit: unknown source table. Run a simple SELECT query.".to_string());
+            return;
+        }
+
+        // Get the current cell value
+        let value = self
+            .grid
+            .cell(row, col)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        self.cell_editor.open(row, col, value);
+    }
+
+    fn handle_cell_edit_key(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            // Enter: confirm edit
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.commit_cell_edit();
+                return false;
+            }
+            // Escape: cancel edit
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.cell_editor.close();
+                self.last_status = Some("Edit cancelled".to_string());
+                return false;
+            }
+            // Backspace: delete character before cursor
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.cell_editor.delete_char_before();
+            }
+            // Delete: delete character at cursor
+            (KeyCode::Delete, KeyModifiers::NONE) => {
+                self.cell_editor.delete_char_at();
+            }
+            // Arrow keys for cursor movement
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                self.cell_editor.move_left();
+            }
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                self.cell_editor.move_right();
+            }
+            // Home/End for start/end of line
+            (KeyCode::Home, KeyModifiers::NONE) => {
+                self.cell_editor.move_to_start();
+            }
+            (KeyCode::End, KeyModifiers::NONE) => {
+                self.cell_editor.move_to_end();
+            }
+            // Ctrl+A: move to start
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                self.cell_editor.move_to_start();
+            }
+            // Ctrl+E: move to end
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                self.cell_editor.move_to_end();
+            }
+            // Ctrl+U: delete from start to cursor
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                self.cell_editor.delete_to_start();
+            }
+            // Ctrl+K: delete from cursor to end
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                self.cell_editor.delete_to_end();
+            }
+            // Ctrl+W: delete word before cursor (simplified: clear all)
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                self.cell_editor.clear();
+            }
+            // Regular character input
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.cell_editor.insert_char(c);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn commit_cell_edit(&mut self) {
+        let row = self.cell_editor.row;
+        let col = self.cell_editor.col;
+        let new_value = self.cell_editor.value.clone();
+        let original_value = self.cell_editor.original_value.clone();
+
+        // If value hasn't changed, just close
+        if new_value == original_value {
+            self.cell_editor.close();
+            self.last_status = Some("No changes".to_string());
+            return;
+        }
+
+        // Generate UPDATE SQL
+        let table = match &self.grid.source_table {
+            Some(t) => t.clone(),
+            None => {
+                self.cell_editor.close();
+                self.last_error = Some("Cannot update: unknown source table".to_string());
+                return;
+            }
+        };
+
+        let column_name = match self.grid.headers.get(col) {
+            Some(name) => name.clone(),
+            None => {
+                self.cell_editor.close();
+                self.last_error = Some("Cannot update: invalid column".to_string());
+                return;
+            }
+        };
+
+        // Build WHERE clause from primary key values
+        let pk_conditions: Vec<String> = self
+            .grid
+            .primary_keys
+            .iter()
+            .filter_map(|pk_name| {
+                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
+                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
+                Some(format!(
+                    "{} = {}",
+                    quote_identifier(pk_name),
+                    escape_sql_value(pk_value)
+                ))
+            })
+            .collect();
+
+        if pk_conditions.is_empty() {
+            self.cell_editor.close();
+            self.last_error = Some("Cannot update: missing primary key values".to_string());
+            return;
+        }
+
+        let update_sql = format!(
+            "UPDATE {} SET {} = {} WHERE {}",
+            table,
+            quote_identifier(&column_name),
+            escape_sql_value(&new_value),
+            pk_conditions.join(" AND ")
+        );
+
+        // Close editor and execute update
+        self.cell_editor.close();
+        self.execute_cell_update(update_sql, row, col, new_value);
+    }
+
+    fn execute_cell_update(&mut self, sql: String, row: usize, col: usize, new_value: String) {
+        let Some(client) = self.db.client.clone() else {
+            self.last_error = Some("Not connected".to_string());
+            return;
+        };
+
+        if self.db.running {
+            self.last_error = Some("Another query is running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.last_status = Some("Updating...".to_string());
+
+        let tx = self.db_events_tx.clone();
+
+        // Store row/col/value for updating grid on success
+        let update_row = row;
+        let update_col = col;
+        let update_value = new_value;
+
+        self.rt.spawn(async move {
+            let guard = client.lock().await;
+            match guard.simple_query(&sql).await {
+                Ok(_) => {
+                    drop(guard);
+                    // Send a custom event to update the cell
+                    let _ = tx.send(DbEvent::CellUpdated {
+                        row: update_row,
+                        col: update_col,
+                        value: update_value,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format_pg_error(&e),
+                    });
+                }
+            }
+        });
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
@@ -696,12 +1404,110 @@ impl App {
             "export" | "e" => {
                 self.handle_export_command(args);
             }
+            "gen" | "generate" => {
+                self.handle_gen_command(args);
+            }
+            // psql-style backslash commands
+            "\\dt" | "dt" => {
+                self.execute_meta_query(META_QUERY_TABLES, None);
+            }
+            "\\dn" | "dn" => {
+                self.execute_meta_query(META_QUERY_SCHEMAS, None);
+            }
+            "\\d" | "d" => {
+                if args.is_empty() {
+                    // \d without args is same as \dt
+                    self.execute_meta_query(META_QUERY_TABLES, None);
+                } else {
+                    // \d <table> - describe table
+                    self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
+                }
+            }
+            "\\di" | "di" => {
+                self.execute_meta_query(META_QUERY_INDEXES, None);
+            }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
             }
         }
 
         false
+    }
+
+    /// Execute a meta-command query (like \dt, \d, etc.)
+    fn execute_meta_query(&mut self, query_template: &str, table_arg: Option<&str>) {
+        let Some(client) = self.db.client.clone() else {
+            self.last_error = Some("Not connected. Use :connect <url> first.".to_string());
+            return;
+        };
+
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        // Build the query, substituting table name if provided
+        let query = if let Some(table) = table_arg {
+            query_template.replace("$1", &escape_sql_identifier(table))
+        } else {
+            query_template.to_string()
+        };
+
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+
+        let tx = self.db_events_tx.clone();
+        let started = Instant::now();
+
+        self.rt.spawn(async move {
+            let guard = client.lock().await;
+            match guard.simple_query(&query).await {
+                Ok(messages) => {
+                    drop(guard);
+                    let elapsed = started.elapsed();
+
+                    let mut headers: Vec<String> = Vec::new();
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+
+                    for msg in messages {
+                        match msg {
+                            SimpleQueryMessage::Row(row) => {
+                                if headers.is_empty() {
+                                    headers = row.columns()
+                                        .iter()
+                                        .map(|c| c.name().to_string())
+                                        .collect();
+                                }
+                                let mut out_row = Vec::with_capacity(row.len());
+                                for i in 0..row.len() {
+                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                }
+                                rows.push(out_row);
+                            }
+                            SimpleQueryMessage::CommandComplete(_) => {}
+                            _ => {}
+                        }
+                    }
+
+                    let result = QueryResult {
+                        headers,
+                        rows,
+                        command_tag: None,
+                        truncated: false,
+                        elapsed,
+                        source_table: None,
+                        primary_keys: Vec::new(),
+                    };
+
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format_pg_error(&e),
+                    });
+                }
+            }
+        });
     }
 
     fn handle_export_command(&mut self, args: &str) {
@@ -762,6 +1568,107 @@ impl App {
                 self.last_error = Some(format!("Failed to write file: {}", e));
             }
         }
+    }
+
+    fn handle_gen_command(&mut self, args: &str) {
+        if self.grid.rows.is_empty() {
+            self.last_error = Some("No data to generate SQL from".to_string());
+            return;
+        }
+
+        // Parse: gen <type> [table] [key_col1,key_col2,...]
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.is_empty() {
+            self.last_status =
+                Some("Usage: :gen <update|delete|insert> [table] [key_columns]".to_string());
+            return;
+        }
+
+        let gen_type = parts[0].to_lowercase();
+        
+        // Use provided table or fall back to source_table from query
+        let table: String = match parts.get(1) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                match &self.grid.source_table {
+                    Some(t) => t.clone(),
+                    None => {
+                        self.last_error = Some(format!(
+                            "No table specified and couldn't infer from query. Usage: :gen {} <table>",
+                            gen_type
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Parse optional key columns (comma-separated) - shifts by 1 if table was provided
+        // If not provided, try to use primary keys from the grid
+        let explicit_keys: Option<Vec<String>> = if parts.len() > 2 {
+            Some(parts[2].split(',').map(|s| s.to_string()).collect())
+        } else {
+            None
+        };
+
+        // Get row indices: selected rows or current row
+        let row_indices: Vec<usize> = if self.grid_state.selected_rows.is_empty() {
+            vec![self.grid_state.cursor_row]
+        } else {
+            self.grid_state.selected_rows.iter().copied().collect()
+        };
+
+        // Determine which key columns to use:
+        // 1. Explicitly provided keys
+        // 2. Primary keys from grid (if available and valid)
+        // 3. None (will use defaults in generate functions)
+        let key_columns: Option<Vec<String>> = explicit_keys.or_else(|| {
+            if self.grid.has_valid_pk() {
+                Some(self.grid.primary_keys.clone())
+            } else {
+                None
+            }
+        });
+
+        let sql = match gen_type.as_str() {
+            "update" | "u" => {
+                let keys: Option<Vec<&str>> = key_columns.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                self.grid
+                    .generate_update_sql(&table, &row_indices, keys.as_deref())
+            }
+            "delete" | "d" => {
+                let keys: Option<Vec<&str>> = key_columns.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                self.grid
+                    .generate_delete_sql(&table, &row_indices, keys.as_deref())
+            }
+            "insert" | "i" => self.grid.generate_insert_sql(&table, &row_indices),
+            _ => {
+                self.last_error = Some(format!(
+                    "Unknown generate type: {}. Use update, delete, or insert.",
+                    gen_type
+                ));
+                return;
+            }
+        };
+
+        // Put the generated SQL into the editor
+        self.editor.textarea.select_all();
+        self.editor.textarea.cut();
+        self.editor.textarea.insert_str(&sql);
+
+        // Move focus to the editor so user can review/edit
+        self.focus = Focus::Query;
+        self.mode = Mode::Normal;
+
+        let row_count = row_indices.len();
+        self.last_status = Some(format!(
+            "Generated {} {} statement{} for {} row{}",
+            gen_type.to_uppercase(),
+            row_count,
+            if row_count == 1 { "" } else { "s" },
+            row_count,
+            if row_count == 1 { "" } else { "s" }
+        ));
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -1345,6 +2252,7 @@ impl App {
 
         let tx = self.db_events_tx.clone();
         let started = Instant::now();
+        let source_table = extract_table_from_query(&query);
 
         self.rt.spawn(async move {
             const MAX_ROWS: usize = 2000;
@@ -1415,12 +2323,21 @@ impl App {
                         (last_headers, last_rows)
                     };
 
+                    // Fetch primary keys if we have a source table
+                    let primary_keys = if let Some(ref table) = source_table {
+                        fetch_primary_keys(&client, table).await
+                    } else {
+                        Vec::new()
+                    };
+
                     let result = QueryResult {
                         headers,
                         rows,
                         command_tag: last_cmd,
                         truncated,
                         elapsed,
+                        source_table,
+                        primary_keys,
                     };
 
                     let _ = tx.send(DbEvent::QueryFinished { result });
@@ -1497,7 +2414,9 @@ impl App {
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
 
-                self.grid = GridModel::new(result.headers, result.rows);
+                self.grid = GridModel::new(result.headers, result.rows)
+                    .with_source_table(result.source_table)
+                    .with_primary_keys(result.primary_keys);
                 self.grid_state = GridState::default();
 
                 // Move focus to grid to show results
@@ -1531,6 +2450,16 @@ impl App {
                     "Schema loaded: {} tables",
                     self.schema_cache.tables.len()
                 ));
+            }
+            DbEvent::CellUpdated { row, col, value } => {
+                self.db.running = false;
+                // Update the grid cell
+                if let Some(grid_row) = self.grid.rows.get_mut(row) {
+                    if let Some(cell) = grid_row.get_mut(col) {
+                        *cell = value;
+                    }
+                }
+                self.last_status = Some("Cell updated successfully".to_string());
             }
         }
     }
@@ -1644,7 +2573,7 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("       ", Style::default()),
             Span::raw("   "),
-            Span::raw(": commands (:connect, :disconnect, :export csv|json|tsv <path>)"),
+            Span::raw(": commands (:connect, :export, :gen, :\\dt, :\\d <tbl>, :\\dn, :\\di)"),
         ]),
         Line::from(vec![
             Span::styled("Visual", Style::default().add_modifier(Modifier::BOLD)),
@@ -1664,7 +2593,7 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("     ", Style::default()),
             Span::raw("   "),
-            Span::raw("+/> widen col, -/< narrow col, = auto-fit col"),
+            Span::raw("+/> widen col, -/< narrow col, = auto-fit col, e/Enter edit cell"),
         ]),
     ];
 
@@ -1673,9 +2602,346 @@ fn help_popup() -> Paragraph<'static> {
         .style(Style::default().fg(Color::White))
 }
 
+/// Calculate the scroll offset needed to keep cursor visible in the editor viewport.
+fn calculate_editor_scroll(
+    cursor_row: usize,
+    cursor_col: usize,
+    current_scroll: (u16, u16),
+    viewport_height: usize,
+    viewport_width: usize,
+) -> (u16, u16) {
+    let (mut scroll_row, mut scroll_col) = (current_scroll.0 as usize, current_scroll.1 as usize);
+
+    // Vertical scrolling
+    if viewport_height > 0 {
+        // If cursor is above the viewport, scroll up
+        if cursor_row < scroll_row {
+            scroll_row = cursor_row;
+        }
+        // If cursor is below the viewport, scroll down
+        let viewport_bottom = scroll_row + viewport_height;
+        if cursor_row >= viewport_bottom {
+            scroll_row = cursor_row.saturating_sub(viewport_height - 1);
+        }
+    }
+
+    // Horizontal scrolling
+    if viewport_width > 0 {
+        // Leave some margin (3 chars) for context
+        let margin = 3.min(viewport_width / 4);
+        
+        // If cursor is left of the viewport, scroll left
+        if cursor_col < scroll_col + margin {
+            scroll_col = cursor_col.saturating_sub(margin);
+        }
+        // If cursor is right of the viewport, scroll right
+        let viewport_right = scroll_col + viewport_width;
+        if cursor_col + margin >= viewport_right {
+            scroll_col = (cursor_col + margin).saturating_sub(viewport_width - 1);
+        }
+    }
+
+    (scroll_row as u16, scroll_col as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========== CellEditor Tests ==========
+
+    #[test]
+    fn test_cell_editor_open_sets_cursor_at_end() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        assert!(editor.active);
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 5); // Cursor at end
+        assert_eq!(editor.original_value, "hello");
+    }
+
+    #[test]
+    fn test_cell_editor_insert_char_at_cursor() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hllo".to_string());
+        editor.cursor = 1; // Position after 'h'
+
+        editor.insert_char('e');
+
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 2); // Cursor moved after inserted char
+    }
+
+    #[test]
+    fn test_cell_editor_insert_char_at_end() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hell".to_string());
+
+        editor.insert_char('o');
+
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 5);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_char_before() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        editor.delete_char_before(); // Delete 'o'
+
+        assert_eq!(editor.value, "hell");
+        assert_eq!(editor.cursor, 4);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_char_before_in_middle() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 2; // After 'he'
+
+        editor.delete_char_before(); // Delete 'e'
+
+        assert_eq!(editor.value, "hllo");
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_char_before_at_start_does_nothing() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 0;
+
+        editor.delete_char_before();
+
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_char_at() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 0;
+
+        editor.delete_char_at(); // Delete 'h'
+
+        assert_eq!(editor.value, "ello");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_char_at_end_does_nothing() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        // cursor is at end (5)
+
+        editor.delete_char_at();
+
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 5);
+    }
+
+    #[test]
+    fn test_cell_editor_move_left() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        editor.move_left();
+        assert_eq!(editor.cursor, 4);
+
+        editor.move_left();
+        assert_eq!(editor.cursor, 3);
+    }
+
+    #[test]
+    fn test_cell_editor_move_left_at_start_stays() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 0;
+
+        editor.move_left();
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_move_right() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 0;
+
+        editor.move_right();
+        assert_eq!(editor.cursor, 1);
+
+        editor.move_right();
+        assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn test_cell_editor_move_right_at_end_stays() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        // cursor at end (5)
+
+        editor.move_right();
+        assert_eq!(editor.cursor, 5);
+    }
+
+    #[test]
+    fn test_cell_editor_move_to_start_end() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.cursor = 3;
+
+        editor.move_to_start();
+        assert_eq!(editor.cursor, 0);
+
+        editor.move_to_end();
+        assert_eq!(editor.cursor, 5);
+    }
+
+    #[test]
+    fn test_cell_editor_clear() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        editor.clear();
+
+        assert_eq!(editor.value, "");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_to_end() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello world".to_string());
+        editor.cursor = 5; // After "hello"
+
+        editor.delete_to_end();
+
+        assert_eq!(editor.value, "hello");
+        assert_eq!(editor.cursor, 5);
+    }
+
+    #[test]
+    fn test_cell_editor_delete_to_start() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello world".to_string());
+        editor.cursor = 6; // After "hello "
+
+        editor.delete_to_start();
+
+        assert_eq!(editor.value, "world");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_unicode_handling() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "héllo".to_string()); // 'é' is 2 bytes
+
+        assert_eq!(editor.cursor, 6); // 6 bytes total
+
+        editor.move_left();
+        assert_eq!(editor.cursor, 5); // Before 'o'
+
+        editor.move_left();
+        assert_eq!(editor.cursor, 4); // Before 'l'
+
+        editor.delete_char_before();
+        assert_eq!(editor.value, "hélo");
+    }
+
+    #[test]
+    fn test_cell_editor_visible_text_short_string() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        let (visible, cursor_pos) = editor.visible_text(20);
+
+        assert_eq!(visible, "hello");
+        assert_eq!(cursor_pos, 5); // Cursor at end
+    }
+
+    #[test]
+    fn test_cell_editor_visible_text_long_string_cursor_at_end() {
+        let mut editor = CellEditor::new();
+        let long_text = "This is a very long string that exceeds the width";
+        editor.open(0, 0, long_text.to_string());
+
+        // Width of 20, cursor at end (49 chars)
+        editor.update_scroll(20);
+        let (visible, cursor_pos) = editor.visible_text(20);
+
+        // Should show the end of the string
+        assert!(visible.len() <= 19); // Leave room for cursor
+        assert!(cursor_pos <= 19);
+    }
+
+    #[test]
+    fn test_cell_editor_visible_text_long_string_cursor_at_start() {
+        let mut editor = CellEditor::new();
+        let long_text = "This is a very long string that exceeds the width";
+        editor.open(0, 0, long_text.to_string());
+        editor.cursor = 0;
+
+        editor.update_scroll(20);
+        let (visible, cursor_pos) = editor.visible_text(20);
+
+        // Should show the start of the string
+        assert!(visible.starts_with("This"));
+        assert_eq!(cursor_pos, 0);
+    }
+
+    #[test]
+    fn test_cell_editor_visible_text_cursor_in_middle() {
+        let mut editor = CellEditor::new();
+        let long_text = "This is a very long string that exceeds the width";
+        editor.open(0, 0, long_text.to_string());
+        editor.cursor = 20; // Middle of string
+
+        editor.update_scroll(20);
+        let (visible, cursor_pos) = editor.visible_text(20);
+
+        // Cursor should be visible within the window
+        assert!(cursor_pos < 20);
+    }
+
+    #[test]
+    fn test_cell_editor_scroll_follows_cursor() {
+        let mut editor = CellEditor::new();
+        let long_text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        editor.open(0, 0, long_text.to_string());
+        editor.cursor = 0;
+        editor.scroll_offset = 0;
+
+        // Move cursor to end character by character
+        for _ in 0..36 {
+            editor.move_right();
+            editor.update_scroll(10);
+            let (_, cursor_pos) = editor.visible_text(10);
+            // Cursor should always be visible (within window)
+            assert!(cursor_pos < 10, "Cursor should be visible, got pos {}", cursor_pos);
+        }
+    }
+
+    #[test]
+    fn test_cell_editor_close_resets_all_state() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+        editor.scroll_offset = 10;
+
+        editor.close();
+
+        assert!(!editor.active);
+        assert_eq!(editor.value, "");
+        assert_eq!(editor.original_value, "");
+        assert_eq!(editor.cursor, 0);
+        assert_eq!(editor.scroll_offset, 0);
+    }
+
+    // ========== App Tests ==========
 
     #[test]
     fn test_query_finished_moves_focus_to_grid() {
@@ -1698,6 +2964,8 @@ mod tests {
             command_tag: Some("SELECT 1".to_string()),
             truncated: false,
             elapsed: Duration::from_millis(10),
+            source_table: Some("users".to_string()),
+            primary_keys: vec!["id".to_string()],
         };
 
         app.apply_db_event(DbEvent::QueryFinished { result });
@@ -1707,6 +2975,53 @@ mod tests {
             app.focus,
             Focus::Grid,
             "Focus should move to Grid after query finishes"
+        );
+    }
+
+    #[test]
+    fn test_extract_table_from_simple_select() {
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM users"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_query("select id, name from users"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM public.users"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM users WHERE id = 1"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM users;"),
+            Some("users".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_table_returns_none_for_complex_queries() {
+        // JOINs
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM users JOIN orders ON users.id = orders.user_id"),
+            None
+        );
+        // Subqueries
+        assert_eq!(
+            extract_table_from_query("SELECT * FROM (SELECT * FROM users) AS u"),
+            None
+        );
+        // Non-SELECT
+        assert_eq!(
+            extract_table_from_query("INSERT INTO users VALUES (1, 'Alice')"),
+            None
+        );
+        assert_eq!(
+            extract_table_from_query("UPDATE users SET name = 'Bob'"),
+            None
         );
     }
 }
