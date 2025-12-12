@@ -1,9 +1,15 @@
-[package]
-name = "tsql"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/fcoury/tsql"
+
+[workspace.dependencies]
+# Shared dependencies
 anyhow = "1"
 crossterm = "0.28"
 ratatui = "0.29"
@@ -12,6 +18,15 @@ tokio-postgres = "0.7"
 tui-textarea = { version = "0.7", features = ["search"] }
 unicode-width = "0.2"
 
-[dev-dependencies]
+# Tree-sitter for syntax highlighting
+tree-sitter = "0.24"
+tree-sitter-highlight = "0.24"
+tree-sitter-sequel = "0.3"
+
+# Theme/config parsing
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Dev dependencies
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }

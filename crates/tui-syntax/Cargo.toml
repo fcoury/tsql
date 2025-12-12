@@ -1,0 +1,24 @@
+[package]
+name = "tui-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tree-sitter based syntax highlighting for TUI applications"
+keywords = ["syntax", "highlighting", "tree-sitter", "tui", "ratatui"]
+categories = ["text-processing", "command-line-interface"]
+
+[lib]
+name = "tui_syntax"
+path = "src/lib.rs"
+
+[dependencies]
+ratatui.workspace = true
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-sequel.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+# For testing
