@@ -67,10 +67,23 @@ impl Widget for HighlightedTextArea<'_> {
         let (cursor_row, cursor_col) = self.textarea.cursor();
         let selection = self.textarea.selection_range();
 
-        // Build the final lines with cursor and selection applied
-        let mut final_lines: Vec<Line<'static>> = Vec::with_capacity(self.highlighted_lines.len());
+        // Get the actual number of lines in the textarea (may differ from highlighted_lines)
+        let textarea_line_count = self.textarea.lines().len();
+        let highlighted_line_count = self.highlighted_lines.len();
+        let total_lines = textarea_line_count.max(highlighted_line_count).max(1);
 
-        for (row_idx, line) in self.highlighted_lines.into_iter().enumerate() {
+        // Convert highlighted_lines into a vec we can index and take from
+        let mut highlighted_lines = self.highlighted_lines;
+        
+        // Pad with empty lines if textarea has more lines than highlighted
+        while highlighted_lines.len() < total_lines {
+            highlighted_lines.push(Line::from(vec![]));
+        }
+
+        // Build the final lines with cursor and selection applied
+        let mut final_lines: Vec<Line<'static>> = Vec::with_capacity(total_lines);
+
+        for (row_idx, line) in highlighted_lines.into_iter().enumerate() {
             let is_cursor_line = row_idx == cursor_row;
 
             // Convert Line to mutable spans for manipulation
@@ -101,7 +114,7 @@ impl Widget for HighlightedTextArea<'_> {
             final_lines.push(result_line);
         }
 
-        // Handle empty editor - show cursor on empty line
+        // Handle completely empty editor - show cursor on empty line
         if final_lines.is_empty() {
             let cursor_span = Span::styled(" ", self.cursor_style);
             final_lines.push(Line::from(vec![cursor_span]));
@@ -288,5 +301,78 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].content.as_ref(), "SELECT");
         assert_eq!(result[1].content.as_ref(), " ");
+    }
+
+    #[test]
+    fn test_apply_cursor_to_empty_spans() {
+        // This simulates the bug: cursor on an empty line (e.g., after pressing Enter)
+        let spans: Vec<Span<'static>> = vec![];
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+
+        let result = apply_cursor_to_spans(spans, 0, cursor_style);
+
+        // Should have a cursor space even with empty spans
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.as_ref(), " ");
+        assert!(result[0].style.add_modifier == Modifier::REVERSED);
+    }
+
+    #[test]
+    fn test_cursor_on_new_line_after_text() {
+        // Simulates: "SELECT\n" with cursor on line 1, col 0
+        // highlighted_lines would be ["SELECT"] but cursor is on row 1
+        // This test verifies our fix handles this case
+        
+        let mut textarea = TextArea::new(vec!["SELECT".to_string(), "".to_string()]);
+        // Move cursor to second line
+        textarea.move_cursor(tui_textarea::CursorMove::Down);
+        
+        let (cursor_row, cursor_col) = textarea.cursor();
+        assert_eq!(cursor_row, 1, "cursor should be on row 1");
+        assert_eq!(cursor_col, 0, "cursor should be at column 0");
+        
+        // Highlighted lines might only have one line if the second is empty
+        let highlighted_lines = vec![Line::from("SELECT")];
+        
+        // The number of highlighted lines (1) is less than cursor_row + 1 (2)
+        // This is the bug condition
+        assert!(
+            highlighted_lines.len() <= cursor_row,
+            "Bug condition: highlighted_lines.len()={} <= cursor_row={}",
+            highlighted_lines.len(),
+            cursor_row
+        );
+    }
+
+    #[test]
+    fn test_widget_renders_cursor_on_new_line() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        // Create a textarea with two lines, cursor on second (empty) line
+        let mut textarea = TextArea::new(vec!["SELECT".to_string(), "".to_string()]);
+        textarea.move_cursor(tui_textarea::CursorMove::Down);
+
+        // Only provide one highlighted line (simulating the bug condition)
+        let highlighted_lines = vec![Line::from("SELECT")];
+
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines);
+
+        // Render to a buffer
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // The cursor should be visible on line 1 (second line)
+        // Check that something is rendered on the second line at position (0, 1)
+        let cell = buf.cell((0, 1)).unwrap();
+        
+        // The cursor should be a space with reversed style (cursor on empty line)
+        assert_eq!(cell.symbol(), " ", "Cursor should render as space on empty line");
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "Cursor should have REVERSED modifier"
+        );
     }
 }

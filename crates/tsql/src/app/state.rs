@@ -11,6 +11,15 @@ pub enum Mode {
     Visual,
 }
 
+/// Target for the search prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchTarget {
+    /// Search in the query editor.
+    Editor,
+    /// Search in the results grid.
+    Grid,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DbStatus {
     Disconnected,

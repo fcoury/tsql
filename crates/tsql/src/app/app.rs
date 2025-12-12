@@ -15,10 +15,10 @@ use tokio::sync::mpsc;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
-use super::state::{DbStatus, Focus, Mode};
+use super::state::{DbStatus, Focus, Mode, SearchTarget};
 use crate::ui::{
-    ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridModel, GridState,
-    HighlightedTextArea, QueryEditor, SchemaCache, SearchPrompt, TableInfo,
+    ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridKeyResult,
+    GridModel, GridState, HighlightedTextArea, QueryEditor, SchemaCache, SearchPrompt, TableInfo,
     create_sql_highlighter, determine_context, get_word_before_cursor,
 };
 use crate::util::format_pg_error;
@@ -94,6 +94,7 @@ pub struct App {
     pub editor: QueryEditor,
     pub highlighter: Highlighter,
     pub search: SearchPrompt,
+    pub search_target: SearchTarget,
     pub command: CommandPrompt,
     pub completion: CompletionPopup,
     pub schema_cache: SchemaCache,
@@ -129,6 +130,7 @@ impl App {
             editor,
             highlighter: create_sql_highlighter(),
             search: SearchPrompt::new(),
+            search_target: SearchTarget::Editor,
             command: CommandPrompt::new(),
             completion: CompletionPopup::new(),
             schema_cache: SchemaCache::new(),
@@ -270,10 +272,15 @@ impl App {
                         height: h,
                     };
 
+                    let search_title = match self.search_target {
+                        SearchTarget::Editor => "/ Search Query (Enter apply, Esc cancel)",
+                        SearchTarget::Grid => "/ Search Grid (Enter apply, Esc cancel)",
+                    };
+
                     self.search.textarea.set_block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title("/ Search (Enter apply, Esc cancel)")
+                            .title(search_title)
                             .border_style(Style::default().fg(Color::Yellow)),
                     );
 
@@ -506,7 +513,20 @@ impl App {
         match self.focus {
             Focus::Grid => {
                 if self.mode == Mode::Normal {
-                    self.grid_state.handle_key(key, &self.grid);
+                    let result = self.grid_state.handle_key(key, &self.grid);
+                    match result {
+                        GridKeyResult::OpenSearch => {
+                            self.search_target = SearchTarget::Grid;
+                            self.search.open();
+                        }
+                        GridKeyResult::OpenCommand => {
+                            self.command.open();
+                        }
+                        GridKeyResult::CopyToClipboard(text) => {
+                            self.copy_to_clipboard(&text);
+                        }
+                        GridKeyResult::None => {}
+                    }
                 }
             }
             Focus::Query => {
@@ -517,35 +537,44 @@ impl App {
         false
     }
 
+    fn copy_to_clipboard(&mut self, text: &str) {
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => {
+                match clipboard.set_text(text) {
+                    Ok(()) => {
+                        let lines = text.lines().count();
+                        let chars = text.len();
+                        self.last_status = Some(format!(
+                            "Copied {} line{}, {} char{}",
+                            lines,
+                            if lines == 1 { "" } else { "s" },
+                            chars,
+                            if chars == 1 { "" } else { "s" }
+                        ));
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to copy: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Clipboard unavailable: {}", e));
+            }
+        }
+    }
+
     fn handle_search_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 let pattern = self.search.text();
                 let pattern = pattern.trim().to_string();
 
-                if pattern.is_empty() {
-                    let _ = self.editor.textarea.set_search_pattern("");
-                    self.search.last_applied = None;
-                    self.search.close();
-                    self.last_status = Some("Search cleared".to_string());
-                    return;
-                }
-
-                match self.editor.textarea.set_search_pattern(&pattern) {
-                    Ok(()) => {
-                        self.search.last_applied = Some(pattern.clone());
-                        self.search.close();
-
-                        let found = self.editor.textarea.search_forward(true);
-                        if found {
-                            self.last_status = Some(format!("Search: /{}", pattern));
-                        } else {
-                            self.last_status = Some(format!("Search: /{} (no match)", pattern));
-                        }
+                match self.search_target {
+                    SearchTarget::Editor => {
+                        self.handle_editor_search(pattern);
                     }
-                    Err(e) => {
-                        // Keep the prompt open so the user can fix the regex.
-                        self.last_status = Some(format!("Invalid search pattern: {}", e));
+                    SearchTarget::Grid => {
+                        self.handle_grid_search(pattern);
                     }
                 }
             }
@@ -557,6 +586,53 @@ impl App {
                 let input: Input = key.into();
                 self.search.textarea.input(input);
             }
+        }
+    }
+
+    fn handle_editor_search(&mut self, pattern: String) {
+        if pattern.is_empty() {
+            let _ = self.editor.textarea.set_search_pattern("");
+            self.search.last_applied = None;
+            self.search.close();
+            self.last_status = Some("Search cleared".to_string());
+            return;
+        }
+
+        match self.editor.textarea.set_search_pattern(&pattern) {
+            Ok(()) => {
+                self.search.last_applied = Some(pattern.clone());
+                self.search.close();
+
+                let found = self.editor.textarea.search_forward(true);
+                if found {
+                    self.last_status = Some(format!("Search: /{}", pattern));
+                } else {
+                    self.last_status = Some(format!("Search: /{} (no match)", pattern));
+                }
+            }
+            Err(e) => {
+                // Keep the prompt open so the user can fix the regex.
+                self.last_status = Some(format!("Invalid search pattern: {}", e));
+            }
+        }
+    }
+
+    fn handle_grid_search(&mut self, pattern: String) {
+        if pattern.is_empty() {
+            self.grid_state.clear_search();
+            self.search.close();
+            self.last_status = Some("Grid search cleared".to_string());
+            return;
+        }
+
+        self.grid_state.apply_search(&pattern, &self.grid);
+        self.search.close();
+
+        let match_count = self.grid_state.search.matches.len();
+        if match_count > 0 {
+            self.last_status = Some(format!("Grid: /{} ({} matches)", pattern, match_count));
+        } else {
+            self.last_status = Some(format!("Grid: /{} (no matches)", pattern));
         }
     }
 
@@ -610,12 +686,75 @@ impl App {
             "help" | "h" => {
                 self.show_help = true;
             }
+            "export" | "e" => {
+                self.handle_export_command(args);
+            }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
             }
         }
 
         false
+    }
+
+    fn handle_export_command(&mut self, args: &str) {
+        if self.grid.rows.is_empty() {
+            self.last_error = Some("No data to export".to_string());
+            return;
+        }
+
+        let parts: Vec<&str> = args.splitn(2, ' ').collect();
+        if parts.is_empty() || parts[0].is_empty() {
+            self.last_status = Some("Usage: :export csv|json|tsv <path>".to_string());
+            return;
+        }
+
+        let format = parts[0].to_lowercase();
+        let path = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        if path.is_empty() {
+            self.last_status = Some(format!("Usage: :export {} <path>", format));
+            return;
+        }
+
+        // Get all row indices
+        let indices: Vec<usize> = (0..self.grid.rows.len()).collect();
+
+        let content = match format.as_str() {
+            "csv" => self.grid.rows_as_csv(&indices, true),
+            "json" => self.grid.rows_as_json(&indices),
+            "tsv" => self.grid.rows_as_tsv(&indices, true),
+            _ => {
+                self.last_error = Some(format!("Unknown format: {}. Use csv, json, or tsv.", format));
+                return;
+            }
+        };
+
+        // Expand ~ to home directory
+        let expanded_path = if path.starts_with("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                std::path::PathBuf::from(home).join(&path[2..])
+            } else {
+                std::path::PathBuf::from(path)
+            }
+        } else {
+            std::path::PathBuf::from(path)
+        };
+
+        match std::fs::write(&expanded_path, &content) {
+            Ok(()) => {
+                let rows = self.grid.rows.len();
+                self.last_status = Some(format!(
+                    "Exported {} rows to {} as {}",
+                    rows,
+                    expanded_path.display(),
+                    format.to_uppercase()
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed to write file: {}", e));
+            }
+        }
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -720,7 +859,7 @@ impl App {
                     (KeyCode::Char('c'), KeyModifiers::NONE) => {
                         self.pending_key = Some('c');
                     }
-                    (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Bottom);
                     }
@@ -749,6 +888,7 @@ impl App {
 
                     (KeyCode::Char('/'), KeyModifiers::NONE) => {
                         self.pending_key = None;
+                        self.search_target = SearchTarget::Editor;
                         self.search.open();
                     }
                     (KeyCode::Char(':'), KeyModifiers::NONE) => {
@@ -766,7 +906,7 @@ impl App {
                             }
                         }
                     }
-                    (KeyCode::Char('N'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('N'), KeyModifiers::SHIFT) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         if let Some(p) = self.search.last_applied.clone() {
                             let found = self.editor.textarea.search_back(false);
@@ -800,12 +940,12 @@ impl App {
                         self.editor.textarea.move_cursor(CursorMove::Forward);
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('A'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('A'), KeyModifiers::SHIFT) | (KeyCode::Char('A'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::End);
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('I'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('I'), KeyModifiers::SHIFT) | (KeyCode::Char('I'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Head);
                         self.mode = Mode::Insert;
@@ -816,7 +956,7 @@ impl App {
                         self.editor.textarea.insert_newline();
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('O'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('O'), KeyModifiers::SHIFT) | (KeyCode::Char('O'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Head);
                         self.editor.textarea.insert_newline();
@@ -829,15 +969,15 @@ impl App {
                         self.pending_key = None;
                         self.editor.textarea.delete_next_char();
                     }
-                    (KeyCode::Char('X'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('X'), KeyModifiers::SHIFT) | (KeyCode::Char('X'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_char();
                     }
-                    (KeyCode::Char('D'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('D'), KeyModifiers::SHIFT) | (KeyCode::Char('D'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_line_by_end();
                     }
-                    (KeyCode::Char('C'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('C'), KeyModifiers::SHIFT) | (KeyCode::Char('C'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_line_by_end();
                         self.mode = Mode::Insert;
@@ -865,7 +1005,7 @@ impl App {
                         self.pending_key = None;
                         self.editor.textarea.paste();
                     }
-                    (KeyCode::Char('P'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('P'), KeyModifiers::SHIFT) | (KeyCode::Char('P'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         // Paste before cursor: move back, paste, then adjust.
                         self.editor.textarea.move_cursor(CursorMove::Back);
@@ -992,7 +1132,7 @@ impl App {
                     (KeyCode::Char('g'), KeyModifiers::NONE) => {
                         self.pending_key = Some('g');
                     }
-                    (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::Bottom);
                     }
                     _ => {}
@@ -1494,7 +1634,7 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("       ", Style::default()),
             Span::raw("   "),
-            Span::raw(": command mode (:connect <url>, :disconnect, :q, :help)"),
+            Span::raw(": commands (:connect, :disconnect, :export csv|json|tsv <path>)"),
         ]),
         Line::from(vec![
             Span::styled("Visual", Style::default().add_modifier(Modifier::BOLD)),
@@ -1504,7 +1644,12 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("Grid", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":  "),
-            Span::raw("j/k move, h/l scroll columns, Space select, a all, c clear"),
+            Span::raw("j/k move, h/l scroll cols, Space select, a all, Esc clear"),
+        ]),
+        Line::from(vec![
+            Span::styled("     ", Style::default()),
+            Span::raw("   "),
+            Span::raw("/ search, n/N next/prev, c copy cell, y yank row, Y yank w/headers"),
         ]),
     ];
 
