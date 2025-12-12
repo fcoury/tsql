@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
