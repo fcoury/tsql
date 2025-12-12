@@ -516,9 +516,11 @@ impl HelpPopup {
             .track_symbol(Some("│"))
             .thumb_symbol("█");
 
-        let mut scrollbar_state = ScrollbarState::new(self.total_lines)
-            .position(self.scroll_offset)
-            .viewport_content_length(self.visible_height);
+        // The scrollbar needs to know the max scroll position (total - visible)
+        // and the current scroll position
+        let max_scroll = self.total_lines.saturating_sub(self.visible_height);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll)
+            .position(self.scroll_offset);
 
         // Render scrollbar in a slightly inset area
         let scrollbar_area = Rect {
