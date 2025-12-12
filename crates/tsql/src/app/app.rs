@@ -17,11 +17,13 @@ use tui_textarea::{CursorMove, Input};
 
 use super::state::{DbStatus, Focus, Mode, SearchTarget};
 use crate::config::{Action, Config, KeyBinding, Keymap};
+use crate::history::{History, HistoryEntry};
 use crate::ui::{
-    ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridKeyResult,
-    GridModel, GridState, HighlightedTextArea, QueryEditor, ResizeAction, SchemaCache,
-    SearchPrompt, TableInfo, create_sql_highlighter, determine_context, escape_sql_value,
-    get_word_before_cursor, quote_identifier,
+    ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo, DataGrid,
+    FuzzyPicker, GridKeyResult, GridModel, GridState, HighlightedTextArea, PickerAction, Priority,
+    QueryEditor, ResizeAction, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment,
+    TableInfo, create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
+    quote_identifier,
 };
 use crate::util::format_pg_error;
 use tui_syntax::Highlighter;
@@ -468,6 +470,11 @@ pub struct App {
     pub show_help: bool,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
+
+    /// Query history with persistence.
+    pub history: History,
+    /// Fuzzy picker for history search (when open).
+    pub history_picker: Option<FuzzyPicker<HistoryEntry>>,
 }
 
 impl App {
@@ -497,6 +504,12 @@ impl App {
         config: Config,
     ) -> Self {
         let editor = QueryEditor::new();
+
+        // Load history
+        let history = History::load(config.editor.max_history).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to load history: {}", e);
+            History::new_empty(config.editor.max_history)
+        });
 
         // Determine connection string: CLI arg > config > env var
         let effective_conn_str = conn_str.or_else(|| config.connection.default_url.clone());
@@ -541,6 +554,9 @@ impl App {
             show_help: false,
             last_status: None,
             last_error: None,
+
+            history,
+            history_picker: None,
         };
 
         // Auto-connect if connection string provided
@@ -651,9 +667,9 @@ impl App {
 
                 let query_title = match (self.focus, self.mode) {
                     (Focus::Query, Mode::Normal) => {
-                        "Query [NORMAL] (i insert, Enter run, Ctrl-p/n history, Tab to grid)"
+                        "Query [NORMAL] (i insert, Enter run, Ctrl-r history, Tab to grid)"
                     }
-                    (Focus::Query, Mode::Insert) => "Query [INSERT] (Esc to normal)",
+                    (Focus::Query, Mode::Insert) => "Query [INSERT] (Esc normal, Ctrl-r history)",
                     (Focus::Query, Mode::Visual) => "Query [VISUAL] (y yank, d delete, Esc cancel)",
                     (Focus::Grid, _) => "Query (Tab to focus)",
                 };
@@ -730,12 +746,17 @@ impl App {
                 frame.render_widget(grid_widget, grid_area);
 
                 // Status.
-                frame.render_widget(self.status_line(), status_area);
+                frame.render_widget(self.status_line(status_area.width), status_area);
 
                 if self.show_help {
                     let popup = centered_rect(80, 70, size);
                     frame.render_widget(Clear, popup);
                     frame.render_widget(help_popup(), popup);
+                }
+
+                // Render history picker if open
+                if let Some(ref mut picker) = self.history_picker {
+                    picker.render(frame, size);
                 }
 
                 if self.search.active {
@@ -1003,6 +1024,7 @@ impl App {
             self.command.close();
             self.completion.close();
             self.cell_editor.close();
+            self.history_picker = None;
             self.pending_key = None;
             self.last_error = None;
             self.mode = Mode::Normal;
@@ -1017,6 +1039,11 @@ impl App {
             }
             // Absorb other keys while error is showing, except Esc which we handled above.
             return false;
+        }
+
+        // Handle history picker when open
+        if self.history_picker.is_some() {
+            return self.handle_history_picker_key(key);
         }
 
         if self.search.active {
@@ -1546,6 +1573,9 @@ impl App {
             "\\di" | "di" => {
                 self.execute_meta_query(META_QUERY_INDEXES, None);
             }
+            "history" => {
+                self.open_history_picker();
+            }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
             }
@@ -1926,7 +1956,7 @@ impl App {
                 self.show_help = true;
             }
             Action::ShowHistory => {
-                self.editor.history_prev();
+                self.open_history_picker();
             }
 
             // Actions not applicable to editor
@@ -2553,7 +2583,12 @@ impl App {
             return;
         }
 
+        // Push to both editor history (for Ctrl-p/n navigation) and persistent history.
         self.editor.push_history(query.clone());
+        let conn_info = self.db.conn_str.as_ref().map(|s| {
+            ConnectionInfo::parse(s).format(50)
+        });
+        self.history.push(query.clone(), conn_info);
 
         let Some(client) = self.db.client.clone() else {
             self.last_error = Some("Not connected. Use :connect <url> or set DATABASE_URL.".to_string());
@@ -2782,7 +2817,7 @@ impl App {
         }
     }
 
-    fn status_line(&self) -> Paragraph<'static> {
+    fn status_line(&self, width: u16) -> Paragraph<'static> {
         let row_count = self.grid.rows.len();
         let selected_count = self.grid_state.selected_rows.len();
         let cursor_row = if row_count == 0 {
@@ -2791,43 +2826,146 @@ impl App {
             self.grid_state.cursor_row.saturating_add(1)
         };
 
-        let focus = match self.focus {
-            Focus::Query => "QUERY",
-            Focus::Grid => "GRID",
-        };
-        let mode = match self.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
-            Mode::Visual => "VISUAL",
+        // Mode indicator with color
+        let (mode_text, mode_style) = match self.mode {
+            Mode::Normal => ("NORMAL", Style::default().fg(Color::Cyan)),
+            Mode::Insert => ("INSERT", Style::default().fg(Color::Green)),
+            Mode::Visual => ("VISUAL", Style::default().fg(Color::Yellow)),
         };
 
-        let mut db_part = format!("DB: {}", self.db.status.label());
-        if self.db.running {
-            db_part.push_str(" (running)");
-        }
-        if let Some(tag) = self.db.last_command_tag.as_deref() {
-            db_part.push_str("  Last: ");
-            db_part.push_str(tag);
-        }
-        if let Some(elapsed) = self.db.last_elapsed {
-            db_part.push_str(&format!(" ({} ms)", elapsed.as_millis()));
+        // Connection info
+        let conn_segment = if self.db.status == DbStatus::Connected {
+            if let Some(ref conn_str) = self.db.conn_str {
+                let info = ConnectionInfo::parse(conn_str);
+                // Allow up to 30 chars for connection, will be auto-truncated if needed
+                info.format(30)
+            } else {
+                "connected".to_string()
+            }
+        } else if self.db.status == DbStatus::Connecting {
+            "connecting...".to_string()
+        } else if self.db.status == DbStatus::Error {
+            "error".to_string()
+        } else {
+            "disconnected".to_string()
+        };
+
+        let conn_style = match self.db.status {
+            DbStatus::Connected => Style::default().fg(Color::Green),
+            DbStatus::Connecting => Style::default().fg(Color::Yellow),
+            DbStatus::Error => Style::default().fg(Color::Red),
+            DbStatus::Disconnected => Style::default().fg(Color::DarkGray),
+        };
+
+        // Row info
+        let row_info = format!("Row {}/{}", cursor_row, row_count);
+
+        // Selection info (only if selected)
+        let selection_info = if selected_count > 0 {
+            Some(format!("{} sel", selected_count))
+        } else {
+            None
+        };
+
+        // Query timing info
+        let timing_info = if let Some(ref tag) = self.db.last_command_tag {
+            let time_part = self.db.last_elapsed
+                .map(|e| format!(" ({}ms)", e.as_millis()))
+                .unwrap_or_default();
+            Some(format!("{}{}", tag, time_part))
+        } else {
+            None
+        };
+
+        // Running indicator
+        let running_indicator = if self.db.running {
+            Some("⏳ running")
+        } else {
+            None
+        };
+
+        // Status message (right-aligned)
+        let status = self.last_status.as_deref().unwrap_or("Ready").to_string();
+        let status_style = if self.last_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        // Build status line with priority-based segments
+        let line = StatusLineBuilder::new()
+            // Critical: Mode (always shown)
+            .add(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
+            // Critical: Connection info
+            .add(StatusSegment::new(conn_segment, Priority::Critical).style(conn_style).min_width(40))
+            // High: Running indicator (if running)
+            .add_if(
+                running_indicator.is_some(),
+                StatusSegment::new(running_indicator.unwrap_or_default(), Priority::High)
+                    .style(Style::default().fg(Color::Yellow))
+            )
+            // Medium: Row info
+            .add(StatusSegment::new(row_info, Priority::Medium).min_width(50))
+            // Medium: Selection (if any selected)
+            .add_if(
+                selection_info.is_some(),
+                StatusSegment::new(selection_info.unwrap_or_default(), Priority::Medium)
+                    .style(Style::default().fg(Color::Cyan))
+                    .min_width(60)
+            )
+            // Low: Query timing
+            .add_if(
+                timing_info.is_some(),
+                StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .min_width(80)
+            )
+            // Right-aligned: Status message
+            .add(StatusSegment::new(status, Priority::Critical).style(status_style).right_align())
+            .build(width);
+
+        Paragraph::new(line)
+    }
+
+    /// Open the history fuzzy picker.
+    fn open_history_picker(&mut self) {
+        if self.history.is_empty() {
+            self.last_status = Some("No history yet".to_string());
+            return;
         }
 
-        let status = self.last_status.as_deref().unwrap_or("Ready");
-
-        let text = format!(
-            "Focus: {}  Mode: {}  {}  Rows: {}  Selected: {}  Cursor: {}  ColOffset: {}   | {}",
-            focus,
-            mode,
-            db_part,
-            row_count,
-            selected_count,
-            cursor_row,
-            self.grid_state.col_offset,
-            status
+        // Create picker with history entries.
+        let entries: Vec<HistoryEntry> = self.history.entries().to_vec();
+        let picker = FuzzyPicker::with_display(
+            entries,
+            format!("History (Ctrl-R) - {} queries", self.history.len()),
+            |entry| entry.query.clone(),
         );
 
-        Paragraph::new(text).style(Style::default().fg(Color::Gray))
+        self.history_picker = Some(picker);
+    }
+
+    /// Handle key events when history picker is open.
+    fn handle_history_picker_key(&mut self, key: KeyEvent) -> bool {
+        let picker = match self.history_picker.as_mut() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        match picker.handle_key(key) {
+            PickerAction::Continue => false,
+            PickerAction::Selected(entry) => {
+                // Load selected query into editor.
+                self.editor.set_text(entry.query);
+                self.history_picker = None;
+                self.last_status = Some("Loaded from history".to_string());
+                false
+            }
+            PickerAction::Cancelled => {
+                self.history_picker = None;
+                false
+            }
+        }
     }
 }
 
@@ -2886,7 +3024,12 @@ fn help_popup() -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("       ", Style::default()),
             Span::raw("   "),
-            Span::raw("/ search, n/N next/prev, Enter run, Ctrl-p/n history"),
+            Span::raw("/ search, n/N next/prev, Enter run, Ctrl-p/n history nav"),
+        ]),
+        Line::from(vec![
+            Span::styled("       ", Style::default()),
+            Span::raw("   "),
+            Span::raw("Ctrl-r fuzzy history search, :history command"),
         ]),
         Line::from(vec![
             Span::styled("       ", Style::default()),

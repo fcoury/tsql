@@ -701,6 +701,12 @@ impl Keymap {
             Action::ToggleFocus,
         );
 
+        // Show history picker
+        km.bind(
+            KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Action::ShowHistory,
+        );
+
         km
     }
 
@@ -744,6 +750,12 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
             Action::SelectAll,
+        );
+
+        // Show history picker
+        km.bind(
+            KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Action::ShowHistory,
         );
 
         km
