@@ -18,9 +18,12 @@ path = "src/lib.rs"
 anyhow.workspace = true
 arboard.workspace = true
 crossterm.workspace = true
+dirs.workspace = true
 ratatui.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+toml.workspace = true
 tui-textarea.workspace = true
 unicode-width.workspace = true
 

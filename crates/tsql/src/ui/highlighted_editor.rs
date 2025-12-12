@@ -13,12 +13,15 @@ use tui_textarea::TextArea;
 /// This widget:
 /// 1. Takes pre-computed highlighted lines
 /// 2. Overlays cursor position and selection from the TextArea
+/// 3. Supports horizontal and vertical scrolling to keep cursor visible
 pub struct HighlightedTextArea<'a> {
     textarea: &'a TextArea<'a>,
     highlighted_lines: Vec<Line<'static>>,
     block: Option<Block<'a>>,
     cursor_style: Style,
     selection_style: Style,
+    /// Current scroll offset (row, col). Updated during render.
+    scroll_offset: (u16, u16),
 }
 
 impl<'a> HighlightedTextArea<'a> {
@@ -29,6 +32,7 @@ impl<'a> HighlightedTextArea<'a> {
             block: None,
             cursor_style: Style::default().add_modifier(Modifier::REVERSED),
             selection_style: Style::default().bg(Color::Blue),
+            scroll_offset: (0, 0),
         }
     }
 
@@ -44,6 +48,12 @@ impl<'a> HighlightedTextArea<'a> {
 
     pub fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
+        self
+    }
+
+    /// Set the scroll offset (row, col).
+    pub fn scroll(mut self, offset: (u16, u16)) -> Self {
+        self.scroll_offset = offset;
         self
     }
 }
@@ -66,6 +76,15 @@ impl Widget for HighlightedTextArea<'_> {
         // Get cursor position and selection from textarea
         let (cursor_row, cursor_col) = self.textarea.cursor();
         let selection = self.textarea.selection_range();
+
+        // Calculate scroll offset to keep cursor visible
+        let (scroll_row, scroll_col) = calculate_scroll_offset(
+            cursor_row,
+            cursor_col,
+            self.scroll_offset,
+            inner_area.height as usize,
+            inner_area.width as usize,
+        );
 
         // Get the actual number of lines in the textarea (may differ from highlighted_lines)
         let textarea_line_count = self.textarea.lines().len();
@@ -104,7 +123,7 @@ impl Widget for HighlightedTextArea<'_> {
                 }
             }
 
-            // Apply cursor highlighting
+            // Apply cursor highlighting (use original cursor_col for span manipulation)
             if is_cursor_line {
                 line_spans =
                     apply_cursor_to_spans(line_spans, cursor_col, self.cursor_style);
@@ -120,10 +139,53 @@ impl Widget for HighlightedTextArea<'_> {
             final_lines.push(Line::from(vec![cursor_span]));
         }
 
-        // Render the highlighted text as a Paragraph
-        let paragraph = Paragraph::new(final_lines);
+        // Render the highlighted text as a Paragraph with scroll offset
+        let paragraph = Paragraph::new(final_lines)
+            .scroll((scroll_row as u16, scroll_col as u16));
         paragraph.render(inner_area, buf);
     }
+}
+
+/// Calculate the scroll offset needed to keep cursor visible in the viewport.
+fn calculate_scroll_offset(
+    cursor_row: usize,
+    cursor_col: usize,
+    current_scroll: (u16, u16),
+    viewport_height: usize,
+    viewport_width: usize,
+) -> (usize, usize) {
+    let (mut scroll_row, mut scroll_col) = (current_scroll.0 as usize, current_scroll.1 as usize);
+
+    // Vertical scrolling
+    if viewport_height > 0 {
+        // If cursor is above the viewport, scroll up
+        if cursor_row < scroll_row {
+            scroll_row = cursor_row;
+        }
+        // If cursor is below the viewport, scroll down
+        let viewport_bottom = scroll_row + viewport_height;
+        if cursor_row >= viewport_bottom {
+            scroll_row = cursor_row.saturating_sub(viewport_height - 1);
+        }
+    }
+
+    // Horizontal scrolling
+    if viewport_width > 0 {
+        // Leave some margin (3 chars) for context
+        let margin = 3.min(viewport_width / 4);
+        
+        // If cursor is left of the viewport, scroll left
+        if cursor_col < scroll_col + margin {
+            scroll_col = cursor_col.saturating_sub(margin);
+        }
+        // If cursor is right of the viewport, scroll right
+        let viewport_right = scroll_col + viewport_width;
+        if cursor_col + margin >= viewport_right {
+            scroll_col = (cursor_col + margin).saturating_sub(viewport_width - 1);
+        }
+    }
+
+    (scroll_row, scroll_col)
 }
 
 /// Apply selection highlighting to spans in a line.

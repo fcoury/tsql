@@ -28,6 +28,9 @@ tree-sitter-sequel = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Platform directories
+dirs = "5"
+
 # Dev dependencies
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }
