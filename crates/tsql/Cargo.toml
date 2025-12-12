@@ -26,6 +26,9 @@ tokio-postgres.workspace = true
 toml.workspace = true
 tui-textarea.workspace = true
 unicode-width.workspace = true
+nucleo-matcher.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
 
 # Internal crate
 tui-syntax = { path = "../tui-syntax" }
