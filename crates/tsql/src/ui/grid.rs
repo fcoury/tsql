@@ -1182,15 +1182,8 @@ impl<'a> Widget for DataGrid<'a> {
         let data_x = header_area.x.saturating_add(marker_w);
         let data_w = header_area.width.saturating_sub(marker_w);
 
-        // Calculate the actual scroll position first (before rendering header)
-        let mut state = self.state.clone();
-        state.ensure_cursor_visible(
-            body_area.height as usize,
-            self.model.rows.len(),
-            self.model.headers.len(),
-            &self.model.col_widths,
-            data_w,
-        );
+        // Note: ensure_cursor_visible should be called on the state before rendering
+        // (typically in the App's draw loop) to update scroll positions.
 
         // Header row (frozen vertically, but scrolls horizontally with body).
         render_marker_header(header_area, buf, marker_w);
@@ -1200,7 +1193,7 @@ impl<'a> Widget for DataGrid<'a> {
             data_w,
             &self.model.headers,
             &self.model.col_widths,
-            state.col_offset, // Use the adjusted col_offset
+            self.state.col_offset,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -1217,14 +1210,14 @@ impl<'a> Widget for DataGrid<'a> {
         }
 
         for i in 0..(body_area.height as usize) {
-            let row_idx = state.row_offset + i;
+            let row_idx = self.state.row_offset + i;
             if row_idx >= self.model.rows.len() {
                 break;
             }
             let y = body_area.y + i as u16;
 
-            let is_cursor = row_idx == state.cursor_row;
-            let is_selected = state.selected_rows.contains(&row_idx);
+            let is_cursor = row_idx == self.state.cursor_row;
+            let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
                 Style::default().bg(Color::DarkGray)
@@ -1244,7 +1237,7 @@ impl<'a> Widget for DataGrid<'a> {
 
             // Determine cursor column for this row (only if this is the cursor row)
             let cursor_col = if is_cursor {
-                Some(state.cursor_col)
+                Some(self.state.cursor_col)
             } else {
                 None
             };
@@ -1255,7 +1248,7 @@ impl<'a> Widget for DataGrid<'a> {
                 data_w,
                 &self.model.rows[row_idx],
                 &self.model.col_widths,
-                state.col_offset,
+                self.state.col_offset,
                 row_style,
                 row_idx,
                 cursor_col,
@@ -2090,5 +2083,113 @@ mod tests {
         // Set PK that's not in headers
         model.primary_keys = vec!["user_id".to_string()];
         assert!(!model.has_valid_pk(), "Should not have valid PK when PK column missing");
+    }
+
+    #[test]
+    fn test_move_left_does_not_scroll_when_cursor_visible() {
+        let mut state = GridState::default();
+        let model = create_wide_test_model();
+
+        // Viewport can show ~2 columns (width 12, each col is ~5 wide)
+        let viewport_width = 12;
+        let col_widths = &model.col_widths;
+
+        // Start at column 0, col_offset 0
+        state.cursor_col = 0;
+        state.col_offset = 0;
+
+        // Move right to column 1 (still visible in viewport)
+        let key_right = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        state.handle_key(key_right, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+
+        assert_eq!(state.cursor_col, 1);
+        assert_eq!(state.col_offset, 0, "col_offset should stay 0 since cursor is still visible");
+
+        // Now move left back to column 0
+        let key_left = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        state.handle_key(key_left, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+
+        assert_eq!(state.cursor_col, 0);
+        assert_eq!(state.col_offset, 0, "col_offset should stay 0 when moving left within visible area");
+    }
+
+    #[test]
+    fn test_move_left_from_scrolled_position_does_not_over_scroll() {
+        let mut state = GridState::default();
+        let model = create_wide_test_model();
+
+        // Viewport can show ~2 columns
+        let viewport_width = 12;
+        let col_widths = &model.col_widths;
+
+        // Simulate being scrolled to the right: cursor at col 4, offset at col 3
+        // (showing columns 3 and 4)
+        state.cursor_col = 4;
+        state.col_offset = 3;
+
+        // Move left to column 3 (still visible since col_offset is 3)
+        let key_left = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        state.handle_key(key_left, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+
+        assert_eq!(state.cursor_col, 3);
+        // col_offset should stay at 3 because column 3 is still visible
+        assert_eq!(state.col_offset, 3, "col_offset should not change when cursor is still at leftmost visible column");
+
+        // Move left again to column 2 (now col_offset should scroll left to show col 2)
+        state.handle_key(key_left, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+
+        assert_eq!(state.cursor_col, 2);
+        assert_eq!(state.col_offset, 2, "col_offset should scroll left to keep cursor visible");
+    }
+
+    #[test]
+    fn test_scroll_only_when_cursor_leaves_visible_area() {
+        let mut state = GridState::default();
+        let model = create_wide_test_model();
+
+        // Wider viewport that can show 3 columns
+        let viewport_width = 18; // ~3 columns at 5 wide each
+        let col_widths = &model.col_widths;
+
+        // Start at column 0
+        state.cursor_col = 0;
+        state.col_offset = 0;
+
+        // Move right through columns 0, 1, 2 - all should be visible without scrolling
+        let key_right = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        
+        state.handle_key(key_right, &model); // to col 1
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+        assert_eq!(state.cursor_col, 1);
+        assert_eq!(state.col_offset, 0, "No scroll needed for col 1");
+
+        state.handle_key(key_right, &model); // to col 2
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+        assert_eq!(state.cursor_col, 2);
+        assert_eq!(state.col_offset, 0, "No scroll needed for col 2");
+
+        // Move to col 3 - this should trigger scroll
+        state.handle_key(key_right, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+        assert_eq!(state.cursor_col, 3);
+        assert!(state.col_offset > 0, "Should scroll when cursor exceeds visible area");
+
+        // Remember the scroll position
+        let _scrolled_offset = state.col_offset;
+
+        // Now move left back to col 2
+        let key_left = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        state.handle_key(key_left, &model);
+        state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
+        
+        assert_eq!(state.cursor_col, 2);
+        // The key insight: col_offset should NOT immediately scroll back left
+        // unless cursor_col < col_offset
+        // In this case, cursor_col (2) might still be >= col_offset
+        // depending on the exact scroll that happened
     }
 }

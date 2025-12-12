@@ -461,6 +461,10 @@ pub struct App {
     /// Cell editor for inline editing.
     pub cell_editor: CellEditor,
 
+    /// Last known grid viewport dimensions for scroll calculations.
+    /// (viewport_rows, viewport_width)
+    pub last_grid_viewport: Option<(usize, u16)>,
+
     pub show_help: bool,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
@@ -531,6 +535,8 @@ impl App {
             grid_state: GridState::default(),
 
             cell_editor: CellEditor::new(),
+
+            last_grid_viewport: None,
 
             show_help: false,
             last_status: None,
@@ -693,6 +699,27 @@ impl App {
 
                     frame.render_widget(error_text, error_area);
                 }
+
+                // Calculate grid viewport dimensions for scroll handling
+                // Inner area: grid_area minus borders (2 for borders)
+                // Body area: inner minus header row (1)
+                // Data width: inner width minus marker column (3)
+                let inner_height = grid_area.height.saturating_sub(2);
+                let body_height = inner_height.saturating_sub(1); // minus header
+                let inner_width = grid_area.width.saturating_sub(2);
+                let data_width = inner_width.saturating_sub(3); // minus marker column
+
+                // Update grid state scroll position based on viewport
+                self.grid_state.ensure_cursor_visible(
+                    body_height as usize,
+                    self.grid.rows.len(),
+                    self.grid.headers.len(),
+                    &self.grid.col_widths,
+                    data_width,
+                );
+
+                // Store viewport dimensions for potential future use
+                self.last_grid_viewport = Some((body_height as usize, data_width));
 
                 // Results grid.
                 let grid_widget = DataGrid {
@@ -3193,7 +3220,7 @@ mod tests {
         editor.cursor = 20; // Middle of string
 
         editor.update_scroll(20);
-        let (visible, cursor_pos) = editor.visible_text(20);
+        let (_visible, cursor_pos) = editor.visible_text(20);
 
         // Cursor should be visible within the window
         assert!(cursor_pos < 20);
