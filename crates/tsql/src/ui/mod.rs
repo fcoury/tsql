@@ -1,7 +1,9 @@
 mod completion;
 mod editor;
+pub mod fuzzy_picker;
 mod grid;
 mod highlighted_editor;
+mod status_line;
 
 pub use completion::{
     ColumnInfo, CompletionContext, CompletionItem, CompletionKind, CompletionPopup, SchemaCache,
@@ -13,3 +15,5 @@ pub use grid::{
     quote_identifier,
 };
 pub use highlighted_editor::{HighlightedTextArea, create_sql_highlighter};
+pub use fuzzy_picker::{FilteredItem, FuzzyPicker, PickerAction};
+pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};
