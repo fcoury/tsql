@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use tsql::app::App;
+use tsql::config;
 use tsql::ui::GridModel;
 
 fn print_usage() {
@@ -29,6 +30,11 @@ fn print_usage() {
     eprintln!("Environment Variables:");
     eprintln!("  DATABASE_URL      Default connection URL if not provided as argument");
     eprintln!();
+    eprintln!("Configuration:");
+    if let Some(path) = config::config_path() {
+        eprintln!("  Config file: {}", path.display());
+    }
+    eprintln!();
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
@@ -44,6 +50,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Load configuration from ~/.config/tsql/config.toml
+    let cfg = config::load_config().unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to load config: {}", e);
+        config::Config::default()
+    });
+
+    // Connection string priority: CLI arg > DATABASE_URL env var > config file
     let conn_str = if args.len() > 1 && !args[1].starts_with('-') {
         // First argument is the connection string
         Some(args[1].clone())
@@ -58,12 +71,13 @@ fn main() -> Result<()> {
     let mut terminal =
         init_terminal().context("failed to initialize terminal; are you running in a real TTY?")?;
 
-    let mut app = App::new(
+    let mut app = App::with_config(
         GridModel::empty(),
         rt.handle().clone(),
         db_events_tx,
         db_events_rx,
         conn_str,
+        cfg,
     );
     let res = app.run(&mut terminal);
 
