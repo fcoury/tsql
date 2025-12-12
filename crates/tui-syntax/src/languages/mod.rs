@@ -2,8 +2,10 @@
 //!
 //! Each language provides a tree-sitter grammar and highlight queries.
 
+mod json;
 mod sql;
 
+pub use json::json;
 pub use sql::sql;
 
 use tree_sitter::Language as TsLanguage;

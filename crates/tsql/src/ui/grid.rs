@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
+use crate::util::looks_like_json;
 
 /// Action for column resize operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -668,17 +669,21 @@ pub struct GridModel {
     pub source_table: Option<String>,
     /// Primary key column names for the source table, if known.
     pub primary_keys: Vec<String>,
+    /// Column data types from PostgreSQL (e.g., "jsonb", "text", "int4").
+    pub col_types: Vec<String>,
 }
 
 impl GridModel {
     pub fn new(headers: Vec<String>, rows: Vec<Vec<String>>) -> Self {
         let col_widths = compute_column_widths(&headers, &rows);
+        let col_count = headers.len();
         Self {
             headers,
             rows,
             col_widths,
             source_table: None,
             primary_keys: Vec::new(),
+            col_types: vec![String::new(); col_count],
         }
     }
 
@@ -692,6 +697,11 @@ impl GridModel {
         self
     }
 
+    pub fn with_col_types(mut self, types: Vec<String>) -> Self {
+        self.col_types = types;
+        self
+    }
+
     pub fn empty() -> Self {
         Self {
             headers: Vec::new(),
@@ -699,7 +709,13 @@ impl GridModel {
             col_widths: Vec::new(),
             source_table: None,
             primary_keys: Vec::new(),
+            col_types: Vec::new(),
         }
+    }
+
+    /// Get the column type for a given column index.
+    pub fn col_type(&self, col: usize) -> Option<&str> {
+        self.col_types.get(col).map(|s| s.as_str())
     }
 
     /// Get the primary key column indices that are present in the current headers.
@@ -1317,7 +1333,7 @@ fn render_row_cells(
 
         // Allow a partially visible last column.
         let draw_w = w.min(remaining);
-        let content = fit_to_width(&cells[col], draw_w);
+        let content = format_cell_for_display(&cells[col], draw_w);
         buf.set_string(x, y, content, style);
         x += draw_w;
 
@@ -1388,7 +1404,7 @@ fn render_row_cells_with_search(
 
         // Allow a partially visible last column.
         let draw_w = w.min(remaining);
-        let content = fit_to_width(&cells[col], draw_w);
+        let content = format_cell_for_display(&cells[col], draw_w);
         buf.set_string(x, y, content, cell_style);
         x += draw_w;
 
@@ -1437,6 +1453,24 @@ fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Format a cell value for display, with special handling for JSON values.
+/// If the value looks like JSON and is long, show a condensed preview.
+fn format_cell_for_display(s: &str, width: u16) -> String {
+    // For JSON-like values, show a condensed single-line representation
+    if looks_like_json(s) && s.contains('\n') {
+        // Multi-line JSON - condense to single line
+        let condensed: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace() || *c == ' ')
+            .collect::<String>()
+            .replace("  ", " "); // Collapse multiple spaces
+        return fit_to_width(&condensed, width);
+    }
+
+    // For other JSON-like values or regular values
+    fit_to_width(s, width)
+}
+
 fn fit_to_width(s: &str, width: u16) -> String {
     let width = width as usize;
     if width == 0 {
@@ -1454,14 +1488,14 @@ fn fit_to_width(s: &str, width: u16) -> String {
         return out;
     }
 
-    // Truncate, keeping ASCII-only ellipsis.
+    // Truncate, keeping ellipsis character.
     if width <= 3 {
         return truncate_by_display_width(s, width);
     }
 
-    let prefix_w = width.saturating_sub(3);
+    let prefix_w = width.saturating_sub(1); // Leave room for ellipsis
     let mut out = truncate_by_display_width(s, prefix_w);
-    out.push_str("...");
+    out.push('…'); // Unicode ellipsis
 
     truncate_by_display_width(&out, width)
 }

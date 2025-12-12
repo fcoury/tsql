@@ -23,6 +23,7 @@ unicode-width = "0.2"
 tree-sitter = "0.24"
 tree-sitter-highlight = "0.24"
 tree-sitter-sequel = "0.3"
+tree-sitter-json = "0.24"
 
 # Theme/config parsing
 serde = { version = "1", features = ["derive"] }

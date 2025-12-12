@@ -20,11 +20,12 @@ use crate::config::{Action, Config, KeyBinding, Keymap};
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo, DataGrid,
-    FuzzyPicker, GridKeyResult, GridModel, GridState, HighlightedTextArea, PickerAction, Priority,
-    QueryEditor, ResizeAction, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment,
-    TableInfo, create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    quote_identifier,
+    FuzzyPicker, GridKeyResult, GridModel, GridState, HighlightedTextArea, JsonEditorAction,
+    JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, SchemaCache, SearchPrompt,
+    StatusLineBuilder, StatusSegment, TableInfo, create_sql_highlighter, determine_context,
+    escape_sql_value, get_word_before_cursor, quote_identifier,
 };
+use crate::util::{is_json_column_type, should_use_multiline_editor};
 use crate::util::format_pg_error;
 use tui_syntax::Highlighter;
 
@@ -131,6 +132,35 @@ async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
     }
 }
 
+/// Query to fetch column types for a table.
+const META_QUERY_COLUMN_TYPES: &str = r#"
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_name = '$1'
+ORDER BY ordinal_position
+"#;
+
+/// Fetch column types for a table, returning a map of column_name -> data_type.
+async fn fetch_column_types(client: &SharedClient, table: &str) -> std::collections::HashMap<String, String> {
+    let query = META_QUERY_COLUMN_TYPES.replace("$1", &escape_sql_identifier(table));
+    let guard = client.lock().await;
+    
+    match guard.simple_query(&query).await {
+        Ok(messages) => {
+            let mut types = std::collections::HashMap::new();
+            for msg in messages {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    if let (Some(col_name), Some(data_type)) = (row.get(0), row.get(1)) {
+                        types.insert(col_name.to_string(), data_type.to_string());
+                    }
+                }
+            }
+            types
+        }
+        Err(_) => std::collections::HashMap::new(), // Silently fail - type detection is optional
+    }
+}
+
 pub struct QueryResult {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -141,6 +171,8 @@ pub struct QueryResult {
     pub source_table: Option<String>,
     /// Primary key column names for the source table.
     pub primary_keys: Vec<String>,
+    /// Column data types from PostgreSQL (e.g., "jsonb", "text", "int4").
+    pub col_types: Vec<String>,
 }
 
 /// Extract the table name from a simple SELECT query.
@@ -463,6 +495,9 @@ pub struct App {
     /// Cell editor for inline editing.
     pub cell_editor: CellEditor,
 
+    /// JSON editor modal for multiline JSON editing.
+    pub json_editor: Option<JsonEditorModal<'static>>,
+
     /// Last known grid viewport dimensions for scroll calculations.
     /// (viewport_rows, viewport_width)
     pub last_grid_viewport: Option<(usize, u16)>,
@@ -548,6 +583,7 @@ impl App {
             grid_state: GridState::default(),
 
             cell_editor: CellEditor::new(),
+            json_editor: None,
 
             last_grid_viewport: None,
 
@@ -985,6 +1021,11 @@ impl App {
                         frame.render_widget(info_widget, info_area);
                     }
                 }
+
+                // Render JSON editor modal if active
+                if let Some(ref mut json_editor) = self.json_editor {
+                    json_editor.render(frame, size);
+                }
             })?;
 
             if event::poll(Duration::from_millis(50))? {
@@ -1004,6 +1045,11 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Handle JSON editor when active - it captures all input
+        if self.json_editor.is_some() {
+            return self.handle_json_editor_key(key);
+        }
+
         // Ctrl-c: cancel running query.
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             if self.db.running {
@@ -1249,7 +1295,20 @@ impl App {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        self.cell_editor.open(row, col, value);
+        // Get the column type and name
+        let col_type = self.grid.col_type(col).unwrap_or("").to_string();
+        let col_name = self.grid.headers.get(col).cloned().unwrap_or_default();
+
+        // Determine if we should use the multiline JSON editor
+        if should_use_multiline_editor(&value) || is_json_column_type(&col_type) {
+            // Open JSON editor modal
+            self.json_editor = Some(JsonEditorModal::new(
+                value, col_name, col_type, row, col,
+            ));
+        } else {
+            // Use inline editor for simple values
+            self.cell_editor.open(row, col, value);
+        }
     }
 
     fn handle_cell_edit_key(&mut self, key: KeyEvent) -> bool {
@@ -1314,6 +1373,87 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Handle key events for the JSON editor modal.
+    fn handle_json_editor_key(&mut self, key: KeyEvent) -> bool {
+        // Take the editor temporarily to avoid borrow issues
+        let mut editor = match self.json_editor.take() {
+            Some(e) => e,
+            None => return false,
+        };
+
+        match editor.handle_key(key) {
+            JsonEditorAction::Continue => {
+                // Put the editor back
+                self.json_editor = Some(editor);
+            }
+            JsonEditorAction::Save { value, row, col } => {
+                // Commit the edit
+                self.commit_json_edit(value, row, col);
+            }
+            JsonEditorAction::Cancel => {
+                // Editor is already taken, just don't put it back
+                self.last_status = Some("Edit cancelled".to_string());
+            }
+            JsonEditorAction::Error(msg) => {
+                // Show error but keep editor open
+                self.last_error = Some(msg);
+                self.json_editor = Some(editor);
+            }
+        }
+        false
+    }
+
+    /// Commit a JSON edit to the database.
+    fn commit_json_edit(&mut self, new_value: String, row: usize, col: usize) {
+        // Generate UPDATE SQL (similar to commit_cell_edit)
+        let table = match &self.grid.source_table {
+            Some(t) => t.clone(),
+            None => {
+                self.last_error = Some("Cannot update: unknown source table".to_string());
+                return;
+            }
+        };
+
+        let column_name = match self.grid.headers.get(col) {
+            Some(name) => name.clone(),
+            None => {
+                self.last_error = Some("Cannot update: invalid column".to_string());
+                return;
+            }
+        };
+
+        // Build WHERE clause from primary key values
+        let pk_conditions: Vec<String> = self
+            .grid
+            .primary_keys
+            .iter()
+            .filter_map(|pk_name| {
+                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
+                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
+                Some(format!(
+                    "{} = {}",
+                    quote_identifier(pk_name),
+                    escape_sql_value(pk_value)
+                ))
+            })
+            .collect();
+
+        if pk_conditions.is_empty() {
+            self.last_error = Some("Cannot update: missing primary key values".to_string());
+            return;
+        }
+
+        let update_sql = format!(
+            "UPDATE {} SET {} = {} WHERE {}",
+            table,
+            quote_identifier(&column_name),
+            escape_sql_value(&new_value),
+            pk_conditions.join(" AND ")
+        );
+
+        self.execute_cell_update(update_sql, row, col, new_value);
     }
 
     fn commit_cell_edit(&mut self) {
@@ -1647,6 +1787,7 @@ impl App {
                         elapsed,
                         source_table: None,
                         primary_keys: Vec::new(),
+                        col_types: Vec::new(), // Meta queries don't need column types
                     };
 
                     let _ = tx.send(DbEvent::QueryFinished { result });
@@ -2676,6 +2817,14 @@ impl App {
                         (last_headers, last_rows)
                     };
 
+                    // Fetch column types if we have a source table
+                    let col_types = if let Some(ref table) = source_table {
+                        let type_map = fetch_column_types(&client, table).await;
+                        headers.iter().map(|h| type_map.get(h).cloned().unwrap_or_default()).collect()
+                    } else {
+                        vec![String::new(); headers.len()]
+                    };
+
                     // Fetch primary keys if we have a source table
                     let primary_keys = if let Some(ref table) = source_table {
                         fetch_primary_keys(&client, table).await
@@ -2691,6 +2840,7 @@ impl App {
                         elapsed,
                         source_table,
                         primary_keys,
+                        col_types,
                     };
 
                     let _ = tx.send(DbEvent::QueryFinished { result });
@@ -2769,7 +2919,8 @@ impl App {
 
                 self.grid = GridModel::new(result.headers, result.rows)
                     .with_source_table(result.source_table)
-                    .with_primary_keys(result.primary_keys);
+                    .with_primary_keys(result.primary_keys)
+                    .with_col_types(result.col_types);
                 self.grid_state = GridState::default();
 
                 // Move focus to grid to show results
@@ -3427,6 +3578,7 @@ mod tests {
             elapsed: Duration::from_millis(10),
             source_table: Some("users".to_string()),
             primary_keys: vec!["id".to_string()],
+            col_types: vec!["int4".to_string(), "text".to_string()],
         };
 
         app.apply_db_event(DbEvent::QueryFinished { result });
