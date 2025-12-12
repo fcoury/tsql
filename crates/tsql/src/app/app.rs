@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tokio::sync::Mutex;
@@ -20,10 +20,11 @@ use crate::config::{Action, Config, KeyBinding, Keymap};
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo, DataGrid,
-    FuzzyPicker, GridKeyResult, GridModel, GridState, HighlightedTextArea, JsonEditorAction,
-    JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, SchemaCache, SearchPrompt,
-    StatusLineBuilder, StatusSegment, TableInfo, create_sql_highlighter, determine_context,
-    escape_sql_value, get_word_before_cursor, quote_identifier,
+    FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
+    JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction,
+    SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
+    create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
+    quote_identifier,
 };
 use crate::util::{is_json_column_type, should_use_multiline_editor};
 use crate::util::format_pg_error;
@@ -550,7 +551,8 @@ pub struct App {
     /// (viewport_rows, viewport_width)
     pub last_grid_viewport: Option<(usize, u16)>,
 
-    pub show_help: bool,
+    /// Help popup (Some when open, None when closed).
+    pub help_popup: Option<HelpPopup>,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
 
@@ -635,7 +637,7 @@ impl App {
 
             last_grid_viewport: None,
 
-            show_help: false,
+            help_popup: None,
             last_status: None,
             last_error: None,
 
@@ -832,10 +834,8 @@ impl App {
                 // Status.
                 frame.render_widget(self.status_line(status_area.width), status_area);
 
-                if self.show_help {
-                    let popup = centered_rect(80, 70, size);
-                    frame.render_widget(Clear, popup);
-                    frame.render_widget(help_popup(), popup);
+                if let Some(ref mut help) = self.help_popup {
+                    help.render(frame, size);
                 }
 
                 // Render history picker if open
@@ -1113,7 +1113,7 @@ impl App {
                 return false;
             }
 
-            self.show_help = false;
+            self.help_popup = None;
             self.search.close();
             self.command.close();
             self.completion.close();
@@ -1209,7 +1209,12 @@ impl App {
             match (key.code, key.modifiers) {
                 (KeyCode::Char('q'), KeyModifiers::NONE) => return true,
                 (KeyCode::Char('?'), KeyModifiers::NONE) => {
-                    self.show_help = !self.show_help;
+                    // Toggle help popup
+                    if self.help_popup.is_some() {
+                        self.help_popup = None;
+                    } else {
+                        self.help_popup = Some(HelpPopup::new());
+                    }
                     return false;
                 }
                 (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -1223,7 +1228,14 @@ impl App {
             }
         }
 
-        if self.show_help {
+        // Handle help popup key events
+        if let Some(ref mut help) = self.help_popup {
+            match help.handle_key(key) {
+                HelpAction::Close => {
+                    self.help_popup = None;
+                }
+                HelpAction::Continue => {}
+            }
             return false;
         }
 
@@ -1247,7 +1259,7 @@ impl App {
                                 return true;
                             }
                             Action::Help => {
-                                self.show_help = true;
+                                self.help_popup = Some(HelpPopup::new());
                                 GridKeyResult::None
                             }
                             _ => {
@@ -1734,7 +1746,7 @@ impl App {
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
-                self.show_help = true;
+                self.help_popup = Some(HelpPopup::new());
             }
             "export" | "e" => {
                 self.handle_export_command(args);
@@ -1778,7 +1790,7 @@ impl App {
             }
             "\\?" | "?" => {
                 // psql-style help alias
-                self.show_help = true;
+                self.help_popup = Some(HelpPopup::new());
             }
             "history" => {
                 self.open_history_picker();
@@ -2191,7 +2203,7 @@ impl App {
 
             // Application
             Action::Help => {
-                self.show_help = true;
+                self.help_popup = Some(HelpPopup::new());
             }
             Action::ShowHistory => {
                 self.open_history_picker();
@@ -3215,105 +3227,6 @@ impl App {
             }
         }
     }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn help_popup() -> Paragraph<'static> {
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "tsql - PostgreSQL CLI",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Global", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":  "),
-            Span::raw("Tab focus switch, Esc normal/close, q quit, ? help"),
-        ]),
-        Line::from(vec![
-            Span::styled("Query", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":  "),
-            Span::raw("NORMAL: h/j/k/l move, w/b/e word, 0/$ line, gg/G doc, Ctrl-d/u scroll"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("i/a/A/I insert, o/O open line, x/X delete char, D/C del/chg to EOL"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("dd/cc del/chg line, dw/cw/db/cb del/chg word, u undo, Ctrl-r redo"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("v visual mode, yy yank line, p/P paste after/before"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("/ search, n/N next/prev, Enter run, Ctrl-p/n history nav"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("Ctrl-r fuzzy history search, :history command"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw(": commands (:connect, :export, :gen, :\\?, :\\conninfo)"),
-        ]),
-        Line::from(vec![
-            Span::styled("       ", Style::default()),
-            Span::raw("   "),
-            Span::raw("  schema: :\\dt, :\\d <tbl>, :\\dn, :\\di, :\\l, :\\du, :\\dv, :\\df"),
-        ]),
-        Line::from(vec![
-            Span::styled("Visual", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(": "),
-            Span::raw("h/j/k/l extend selection, y yank, d delete, c change, Esc cancel"),
-        ]),
-        Line::from(vec![
-            Span::styled("Grid", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":  "),
-            Span::raw("j/k rows, h/l cols, H/L scroll, Space select, a all, Esc clear"),
-        ]),
-        Line::from(vec![
-            Span::styled("     ", Style::default()),
-            Span::raw("   "),
-            Span::raw("/ search, n/N next/prev, c copy cell, y yank row, Y w/headers"),
-        ]),
-        Line::from(vec![
-            Span::styled("     ", Style::default()),
-            Span::raw("   "),
-            Span::raw("+/> widen col, -/< narrow col, = auto-fit col, e/Enter edit cell"),
-        ]),
-    ];
-
-    Paragraph::new(lines)
-        .block(Block::default().title("Help").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White))
 }
 
 /// Calculate the scroll offset needed to keep cursor visible in the editor viewport.
