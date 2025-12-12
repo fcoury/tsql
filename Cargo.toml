@@ -1,0 +1,13 @@
+[package]
+name = "tsql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+ratatui = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-postgres = "0.7"
+tui-textarea = { version = "0.7", features = ["search"] }
+unicode-width = "0.2"
