@@ -31,6 +31,8 @@ pub enum GridKeyResult {
     CopyToClipboard(String),
     /// Resize a column.
     ResizeColumn { col: usize, action: ResizeAction },
+    /// Edit the current cell.
+    EditCell { row: usize, col: usize },
 }
 
 /// A match location in the grid (row, column).
@@ -340,6 +342,16 @@ impl GridState {
                     return GridKeyResult::ResizeColumn {
                         col: self.cursor_col,
                         action: ResizeAction::AutoFit,
+                    };
+                }
+            }
+
+            // e or Enter to edit cell
+            (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                if row_count > 0 && col_count > 0 {
+                    return GridKeyResult::EditCell {
+                        row: self.cursor_row,
+                        col: self.cursor_col,
                     };
                 }
             }
@@ -867,7 +879,7 @@ impl GridModel {
 }
 
 /// Quote a SQL identifier (column/table name).
-fn quote_identifier(s: &str) -> String {
+pub fn quote_identifier(s: &str) -> String {
     // If it contains special chars or is a reserved word, quote it
     if s.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
@@ -880,7 +892,7 @@ fn quote_identifier(s: &str) -> String {
 }
 
 /// Escape a SQL value for use in a statement.
-fn escape_sql_value(s: &str) -> String {
+pub fn escape_sql_value(s: &str) -> String {
     // Handle NULL
     if s.is_empty() || s.eq_ignore_ascii_case("null") {
         return "NULL".to_string();
@@ -1841,5 +1853,58 @@ mod tests {
             sql.contains("\"user-id\"") || sql.contains("\"First Name\""),
             "Should quote identifiers with special characters"
         );
+    }
+
+    #[test]
+    fn test_e_key_opens_cell_editor() {
+        let mut state = GridState::default();
+        let model = create_test_model();
+
+        // Press 'e' to edit the current cell
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::EditCell { row: 0, col: 0 },
+            "'e' should return EditCell for current cell"
+        );
+    }
+
+    #[test]
+    fn test_enter_key_opens_cell_editor() {
+        let mut state = GridState::default();
+        state.cursor_row = 1;
+        state.cursor_col = 1;
+        let model = create_test_model();
+
+        // Press Enter to edit the current cell
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::EditCell { row: 1, col: 1 },
+            "Enter should return EditCell for current cell"
+        );
+    }
+
+    #[test]
+    fn test_has_valid_pk() {
+        let mut model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        );
+
+        // No PKs yet
+        assert!(!model.has_valid_pk(), "Should not have valid PK without primary_keys set");
+
+        // Set PK that's in headers
+        model.primary_keys = vec!["id".to_string()];
+        assert!(model.has_valid_pk(), "Should have valid PK when PK column exists");
+
+        // Set PK that's not in headers
+        model.primary_keys = vec!["user_id".to_string()];
+        assert!(!model.has_valid_pk(), "Should not have valid PK when PK column missing");
     }
 }
