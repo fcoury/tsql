@@ -18,9 +18,11 @@ use tui_textarea::{CursorMove, Input};
 use super::state::{DbStatus, Focus, Mode};
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridModel, GridState,
-    QueryEditor, SchemaCache, SearchPrompt, TableInfo, determine_context, get_word_before_cursor,
+    HighlightedTextArea, QueryEditor, SchemaCache, SearchPrompt, TableInfo,
+    create_sql_highlighter, determine_context, get_word_before_cursor,
 };
 use crate::util::format_pg_error;
+use tui_syntax::Highlighter;
 
 pub struct QueryResult {
     pub headers: Vec<String>,
@@ -90,6 +92,7 @@ pub struct App {
     pub mode: Mode,
 
     pub editor: QueryEditor,
+    pub highlighter: Highlighter,
     pub search: SearchPrompt,
     pub command: CommandPrompt,
     pub completion: CompletionPopup,
@@ -124,6 +127,7 @@ impl App {
             mode: Mode::Normal,
 
             editor,
+            highlighter: create_sql_highlighter(),
             search: SearchPrompt::new(),
             command: CommandPrompt::new(),
             completion: CompletionPopup::new(),
@@ -155,6 +159,19 @@ impl App {
         loop {
             self.drain_db_events();
 
+            // Pre-compute highlighted lines before the draw closure
+            let query_text = self.editor.text();
+            let highlighted_lines = self
+                .highlighter
+                .highlight("sql", &query_text)
+                .unwrap_or_else(|_| {
+                    // Fallback to plain text if highlighting fails
+                    query_text
+                        .lines()
+                        .map(|s| Line::from(s.to_string()))
+                        .collect()
+                });
+
             terminal.draw(|frame| {
                 let size = frame.area();
 
@@ -180,7 +197,7 @@ impl App {
                 let grid_area = chunks[2];
                 let status_area = chunks[3];
 
-                // Query editor.
+                // Query editor with syntax highlighting
                 let query_border = match (self.focus, self.mode) {
                     (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
                     (Focus::Query, Mode::Insert) => Style::default().fg(Color::Green),
@@ -197,14 +214,18 @@ impl App {
                     (Focus::Grid, _) => "Query (Tab to focus)",
                 };
 
-                self.editor.textarea.set_block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(query_title)
-                        .border_style(query_border),
-                );
+                let query_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(query_title)
+                    .border_style(query_border);
 
-                frame.render_widget(&self.editor.textarea, query_area);
+                let highlighted_editor = HighlightedTextArea::new(
+                    &self.editor.textarea,
+                    highlighted_lines.clone(),
+                )
+                .block(query_block);
+
+                frame.render_widget(highlighted_editor, query_area);
 
                 // Error display (if any).
                 if let Some(ref err) = self.last_error {

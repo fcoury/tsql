@@ -1,6 +1,7 @@
 mod completion;
 mod editor;
 mod grid;
+mod highlighted_editor;
 
 pub use completion::{
     ColumnInfo, CompletionContext, CompletionItem, CompletionKind, CompletionPopup, SchemaCache,
@@ -8,3 +9,4 @@ pub use completion::{
 };
 pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
 pub use grid::{DataGrid, GridModel, GridState};
+pub use highlighted_editor::{HighlightedTextArea, create_sql_highlighter};

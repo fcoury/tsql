@@ -1,0 +1,31 @@
+[package]
+name = "tsql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A modern, keyboard-first PostgreSQL CLI"
+
+[[bin]]
+name = "tsql"
+path = "src/main.rs"
+
+[lib]
+name = "tsql"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tui-textarea.workspace = true
+unicode-width.workspace = true
+
+# Internal crate
+tui-syntax = { path = "../tui-syntax" }
+
+[dev-dependencies]
+dotenvy.workspace = true
+uuid.workspace = true
