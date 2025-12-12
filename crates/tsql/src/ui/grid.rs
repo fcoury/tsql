@@ -468,6 +468,10 @@ pub struct GridModel {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub col_widths: Vec<u16>,
+    /// The source table name, if known (extracted from simple SELECT queries).
+    pub source_table: Option<String>,
+    /// Primary key column names for the source table, if known.
+    pub primary_keys: Vec<String>,
 }
 
 impl GridModel {
@@ -477,7 +481,19 @@ impl GridModel {
             headers,
             rows,
             col_widths,
+            source_table: None,
+            primary_keys: Vec::new(),
         }
+    }
+
+    pub fn with_source_table(mut self, table: Option<String>) -> Self {
+        self.source_table = table;
+        self
+    }
+
+    pub fn with_primary_keys(mut self, keys: Vec<String>) -> Self {
+        self.primary_keys = keys;
+        self
     }
 
     pub fn empty() -> Self {
@@ -485,7 +501,26 @@ impl GridModel {
             headers: Vec::new(),
             rows: Vec::new(),
             col_widths: Vec::new(),
+            source_table: None,
+            primary_keys: Vec::new(),
         }
+    }
+
+    /// Get the primary key column indices that are present in the current headers.
+    pub fn pk_column_indices(&self) -> Vec<usize> {
+        self.primary_keys
+            .iter()
+            .filter_map(|pk| self.headers.iter().position(|h| h == pk))
+            .collect()
+    }
+
+    /// Check if we have valid primary key information for UPDATE/DELETE operations.
+    pub fn has_valid_pk(&self) -> bool {
+        if self.primary_keys.is_empty() {
+            return false;
+        }
+        // All PK columns must be present in the headers
+        self.primary_keys.iter().all(|pk| self.headers.contains(pk))
     }
 
     /// Get a specific cell value.
@@ -622,6 +657,247 @@ impl GridModel {
             *width = optimal_width;
         }
     }
+
+    /// Generate UPDATE SQL statements for specified rows.
+    ///
+    /// # Arguments
+    /// * `table` - The table name to use in the UPDATE statement
+    /// * `row_indices` - The row indices to generate UPDATE statements for
+    /// * `key_columns` - Optional list of column names to use in WHERE clause.
+    ///                   If None, all columns are used.
+    ///
+    /// # Returns
+    /// A string containing one UPDATE statement per row, separated by newlines.
+    pub fn generate_update_sql(
+        &self,
+        table: &str,
+        row_indices: &[usize],
+        key_columns: Option<&[&str]>,
+    ) -> String {
+        let mut statements = Vec::new();
+
+        for &row_idx in row_indices {
+            if let Some(row) = self.rows.get(row_idx) {
+                let stmt = self.generate_single_update(table, row, key_columns);
+                statements.push(stmt);
+            }
+        }
+
+        statements.join("\n")
+    }
+
+    fn generate_single_update(
+        &self,
+        table: &str,
+        row: &[String],
+        key_columns: Option<&[&str]>,
+    ) -> String {
+        // Determine which columns are keys and which are values to set
+        let key_indices: Vec<usize> = match key_columns {
+            Some(keys) => self
+                .headers
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| keys.contains(&h.as_str()))
+                .map(|(i, _)| i)
+                .collect(),
+            None => {
+                // Use first column as key by default
+                if self.headers.is_empty() {
+                    vec![]
+                } else {
+                    vec![0]
+                }
+            }
+        };
+
+        // SET clause: all non-key columns
+        let set_parts: Vec<String> = self
+            .headers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !key_indices.contains(i))
+            .filter_map(|(i, header)| {
+                row.get(i).map(|value| {
+                    format!("{} = {}", quote_identifier(header), escape_sql_value(value))
+                })
+            })
+            .collect();
+
+        // WHERE clause: key columns
+        let where_parts: Vec<String> = key_indices
+            .iter()
+            .filter_map(|&i| {
+                let header = self.headers.get(i)?;
+                let value = row.get(i)?;
+                Some(format!(
+                    "{} = {}",
+                    quote_identifier(header),
+                    escape_sql_value(value)
+                ))
+            })
+            .collect();
+
+        if set_parts.is_empty() {
+            format!(
+                "-- UPDATE {}: no columns to update (all columns are keys)",
+                table
+            )
+        } else if where_parts.is_empty() {
+            format!(
+                "UPDATE {} SET {};  -- WARNING: no WHERE clause",
+                table,
+                set_parts.join(", ")
+            )
+        } else {
+            format!(
+                "UPDATE {} SET {} WHERE {};",
+                table,
+                set_parts.join(", "),
+                where_parts.join(" AND ")
+            )
+        }
+    }
+
+    /// Generate DELETE SQL statements for specified rows.
+    ///
+    /// # Arguments
+    /// * `table` - The table name to use in the DELETE statement
+    /// * `row_indices` - The row indices to generate DELETE statements for
+    /// * `key_columns` - Optional list of column names to use in WHERE clause.
+    ///                   If None, all columns are used.
+    ///
+    /// # Returns
+    /// A string containing one DELETE statement per row, separated by newlines.
+    pub fn generate_delete_sql(
+        &self,
+        table: &str,
+        row_indices: &[usize],
+        key_columns: Option<&[&str]>,
+    ) -> String {
+        let mut statements = Vec::new();
+
+        for &row_idx in row_indices {
+            if let Some(row) = self.rows.get(row_idx) {
+                let stmt = self.generate_single_delete(table, row, key_columns);
+                statements.push(stmt);
+            }
+        }
+
+        statements.join("\n")
+    }
+
+    fn generate_single_delete(
+        &self,
+        table: &str,
+        row: &[String],
+        key_columns: Option<&[&str]>,
+    ) -> String {
+        // Determine which columns to use in WHERE clause
+        let key_indices: Vec<usize> = match key_columns {
+            Some(keys) => self
+                .headers
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| keys.contains(&h.as_str()))
+                .map(|(i, _)| i)
+                .collect(),
+            None => {
+                // Use all columns by default for safety
+                (0..self.headers.len()).collect()
+            }
+        };
+
+        // WHERE clause
+        let where_parts: Vec<String> = key_indices
+            .iter()
+            .filter_map(|&i| {
+                let header = self.headers.get(i)?;
+                let value = row.get(i)?;
+                Some(format!(
+                    "{} = {}",
+                    quote_identifier(header),
+                    escape_sql_value(value)
+                ))
+            })
+            .collect();
+
+        if where_parts.is_empty() {
+            format!("-- DELETE FROM {}: no columns for WHERE clause", table)
+        } else {
+            format!("DELETE FROM {} WHERE {};", table, where_parts.join(" AND "))
+        }
+    }
+
+    /// Generate INSERT SQL statement for specified rows.
+    ///
+    /// # Arguments
+    /// * `table` - The table name to use in the INSERT statement
+    /// * `row_indices` - The row indices to generate INSERT statement for
+    ///
+    /// # Returns
+    /// A string containing an INSERT statement with all rows as VALUES.
+    pub fn generate_insert_sql(&self, table: &str, row_indices: &[usize]) -> String {
+        if row_indices.is_empty() || self.headers.is_empty() {
+            return format!("-- INSERT INTO {}: no data", table);
+        }
+
+        let columns: Vec<String> = self.headers.iter().map(|h| quote_identifier(h)).collect();
+
+        let values: Vec<String> = row_indices
+            .iter()
+            .filter_map(|&idx| self.rows.get(idx))
+            .map(|row| {
+                let vals: Vec<String> = row.iter().map(|v| escape_sql_value(v)).collect();
+                format!("({})", vals.join(", "))
+            })
+            .collect();
+
+        if values.is_empty() {
+            return format!("-- INSERT INTO {}: no valid rows", table);
+        }
+
+        format!(
+            "INSERT INTO {} ({}) VALUES\n{};",
+            table,
+            columns.join(", "),
+            values.join(",\n")
+        )
+    }
+}
+
+/// Quote a SQL identifier (column/table name).
+fn quote_identifier(s: &str) -> String {
+    // If it contains special chars or is a reserved word, quote it
+    if s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !s.chars().next().map_or(true, |c| c.is_ascii_digit())
+    {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+}
+
+/// Escape a SQL value for use in a statement.
+fn escape_sql_value(s: &str) -> String {
+    // Handle NULL
+    if s.is_empty() || s.eq_ignore_ascii_case("null") {
+        return "NULL".to_string();
+    }
+
+    // Check if it looks like a number
+    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+        return s.to_string();
+    }
+
+    // Check for boolean
+    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
+        return s.to_uppercase();
+    }
+
+    // Otherwise, quote as string
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Escape a string for CSV output.
@@ -1443,6 +1719,127 @@ mod tests {
             model.col_widths[1],
             18,
             "autofit_column should size to longest content (header in this case)"
+        );
+    }
+
+    #[test]
+    fn test_generate_update_sql_with_key_column() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string(), "age".to_string()],
+            vec![
+                vec!["1".to_string(), "Alice".to_string(), "30".to_string()],
+                vec!["2".to_string(), "Bob".to_string(), "25".to_string()],
+            ],
+        );
+
+        let sql = model.generate_update_sql("users", &[0], Some(&["id"]));
+
+        assert!(sql.contains("UPDATE users SET"), "Should have UPDATE clause");
+        assert!(sql.contains("name = 'Alice'"), "Should set name column");
+        assert!(sql.contains("age = 30"), "Should set age column (numeric)");
+        assert!(sql.contains("WHERE id = 1"), "Should have WHERE with id");
+    }
+
+    #[test]
+    fn test_generate_update_sql_multiple_rows() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+            ],
+        );
+
+        let sql = model.generate_update_sql("users", &[0, 1], Some(&["id"]));
+        let lines: Vec<&str> = sql.lines().collect();
+
+        assert_eq!(lines.len(), 2, "Should generate 2 UPDATE statements");
+        assert!(lines[0].contains("WHERE id = 1"));
+        assert!(lines[1].contains("WHERE id = 2"));
+    }
+
+    #[test]
+    fn test_generate_delete_sql_with_all_columns() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        );
+
+        // No key columns specified = use all columns
+        let sql = model.generate_delete_sql("users", &[0], None);
+
+        assert!(sql.contains("DELETE FROM users WHERE"), "Should have DELETE clause");
+        assert!(sql.contains("id = 1"), "Should have id in WHERE");
+        assert!(sql.contains("name = 'Alice'"), "Should have name in WHERE");
+    }
+
+    #[test]
+    fn test_generate_delete_sql_with_key_column() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        );
+
+        let sql = model.generate_delete_sql("users", &[0], Some(&["id"]));
+
+        assert!(sql.contains("DELETE FROM users WHERE id = 1;"));
+        assert!(!sql.contains("name"), "Should not include name in WHERE when id is the key");
+    }
+
+    #[test]
+    fn test_generate_insert_sql() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+            ],
+        );
+
+        let sql = model.generate_insert_sql("users", &[0, 1]);
+
+        assert!(sql.contains("INSERT INTO users (id, name) VALUES"));
+        assert!(sql.contains("(1, 'Alice')"));
+        assert!(sql.contains("(2, 'Bob')"));
+    }
+
+    #[test]
+    fn test_generate_sql_handles_special_chars() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "comment".to_string()],
+            vec![vec!["1".to_string(), "It's a test".to_string()]],
+        );
+
+        let sql = model.generate_insert_sql("posts", &[0]);
+
+        // Single quotes should be escaped
+        assert!(sql.contains("'It''s a test'"), "Should escape single quotes");
+    }
+
+    #[test]
+    fn test_generate_sql_handles_null() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "optional".to_string()],
+            vec![vec!["1".to_string(), "".to_string()]],
+        );
+
+        let sql = model.generate_insert_sql("items", &[0]);
+
+        assert!(sql.contains("NULL"), "Empty string should become NULL");
+    }
+
+    #[test]
+    fn test_generate_sql_quotes_special_identifiers() {
+        let model = GridModel::new(
+            vec!["user-id".to_string(), "First Name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        );
+
+        let sql = model.generate_insert_sql("users", &[0]);
+
+        assert!(
+            sql.contains("\"user-id\"") || sql.contains("\"First Name\""),
+            "Should quote identifiers with special characters"
         );
     }
 }

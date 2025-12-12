@@ -1,0 +1,91 @@
+# tsql Configuration File
+# Copy this file to ~/.config/tsql/config.toml and customize as needed
+
+# Display settings
+[display]
+# Show row numbers in the results grid
+show_row_numbers = true
+
+# Default column width in characters
+default_column_width = 20
+
+# Minimum column width
+min_column_width = 4
+
+# Maximum column width
+max_column_width = 100
+
+# Truncate long cell values with ellipsis
+truncate_cells = true
+
+# Show NULL values with a distinct indicator
+show_null_indicator = true
+
+# Text to display for NULL values
+null_indicator = "NULL"
+
+# Show borders around grid cells
+show_borders = true
+
+# Theme name (reserved for future use)
+theme = "default"
+
+# Editor settings
+[editor]
+# Tab size in spaces
+tab_size = 4
+
+# Use spaces instead of tabs
+expand_tabs = true
+
+# Enable auto-indent
+auto_indent = true
+
+# Show line numbers in the query editor
+line_numbers = true
+
+# Enable syntax highlighting
+syntax_highlighting = true
+
+# Enable auto-completion
+auto_completion = true
+
+# Completion trigger delay in milliseconds
+completion_delay_ms = 100
+
+# Maximum history entries to keep
+max_history = 1000
+
+# Connection settings
+[connection]
+# Default database URL (can be overridden by DATABASE_URL env var or CLI arg)
+# default_url = "postgres://user:password@localhost:5432/database"
+
+# Connection timeout in seconds
+connect_timeout_secs = 10
+
+# Query timeout in seconds (0 = no timeout)
+query_timeout_secs = 0
+
+# Maximum rows to fetch (0 = no limit)
+max_rows = 0
+
+# Auto-reconnect on connection loss
+auto_reconnect = true
+
+# Keymap settings
+[keymap]
+# Use vim-style keybindings
+vim_mode = true
+
+# Custom keybindings for normal mode
+# [[keymap.normal]]
+# key = "ctrl+s"
+# action = "execute_query"
+# description = "Execute the current query"
+
+# Custom keybindings for grid navigation
+# [[keymap.grid]]
+# key = "ctrl+e"
+# action = "export_csv"
+# description = "Export results to CSV"
