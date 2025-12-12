@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// All possible actions that can be triggered by keybindings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -149,6 +150,97 @@ impl Action {
             Action::Connect => "Connect to database",
             Action::Disconnect => "Disconnect from database",
             Action::Reconnect => "Reconnect to database",
+        }
+    }
+}
+
+impl FromStr for Action {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Convert to snake_case for matching
+        let normalized = s.trim().to_lowercase().replace('-', "_");
+
+        match normalized.as_str() {
+            // Navigation
+            "move_up" => Ok(Action::MoveUp),
+            "move_down" => Ok(Action::MoveDown),
+            "move_left" => Ok(Action::MoveLeft),
+            "move_right" => Ok(Action::MoveRight),
+            "move_to_top" => Ok(Action::MoveToTop),
+            "move_to_bottom" => Ok(Action::MoveToBottom),
+            "move_to_start" => Ok(Action::MoveToStart),
+            "move_to_end" => Ok(Action::MoveToEnd),
+            "page_up" => Ok(Action::PageUp),
+            "page_down" => Ok(Action::PageDown),
+            "half_page_up" => Ok(Action::HalfPageUp),
+            "half_page_down" => Ok(Action::HalfPageDown),
+
+            // Mode switching
+            "enter_insert_mode" => Ok(Action::EnterInsertMode),
+            "enter_normal_mode" => Ok(Action::EnterNormalMode),
+            "enter_visual_mode" => Ok(Action::EnterVisualMode),
+            "enter_command_mode" => Ok(Action::EnterCommandMode),
+
+            // Focus
+            "focus_query" => Ok(Action::FocusQuery),
+            "focus_grid" => Ok(Action::FocusGrid),
+            "toggle_focus" => Ok(Action::ToggleFocus),
+
+            // Editor actions
+            "delete_char" => Ok(Action::DeleteChar),
+            "delete_word" => Ok(Action::DeleteWord),
+            "delete_line" => Ok(Action::DeleteLine),
+            "undo" => Ok(Action::Undo),
+            "redo" => Ok(Action::Redo),
+            "copy" => Ok(Action::Copy),
+            "paste" => Ok(Action::Paste),
+            "cut" => Ok(Action::Cut),
+            "select_all" => Ok(Action::SelectAll),
+
+            // Query execution
+            "execute_query" => Ok(Action::ExecuteQuery),
+            "cancel_query" => Ok(Action::CancelQuery),
+
+            // Grid actions
+            "select_row" => Ok(Action::SelectRow),
+            "grid_select_all" => Ok(Action::GridSelectAll),
+            "clear_selection" => Ok(Action::ClearSelection),
+            "copy_selection" => Ok(Action::CopySelection),
+            "copy_csv" => Ok(Action::CopyCsv),
+            "copy_json" => Ok(Action::CopyJson),
+            "copy_tsv" => Ok(Action::CopyTsv),
+            "export_csv" => Ok(Action::ExportCsv),
+            "export_json" => Ok(Action::ExportJson),
+            "edit_cell" => Ok(Action::EditCell),
+            "generate_update" => Ok(Action::GenerateUpdate),
+            "generate_delete" => Ok(Action::GenerateDelete),
+            "generate_insert" => Ok(Action::GenerateInsert),
+
+            // Search
+            "start_search" => Ok(Action::StartSearch),
+            "next_match" => Ok(Action::NextMatch),
+            "prev_match" => Ok(Action::PrevMatch),
+            "clear_search" => Ok(Action::ClearSearch),
+
+            // Column operations
+            "resize_column_left" => Ok(Action::ResizeColumnLeft),
+            "resize_column_right" => Ok(Action::ResizeColumnRight),
+            "auto_fit_column" => Ok(Action::AutoFitColumn),
+
+            // Application
+            "quit" => Ok(Action::Quit),
+            "force_quit" => Ok(Action::ForceQuit),
+            "help" => Ok(Action::Help),
+            "show_history" => Ok(Action::ShowHistory),
+            "refresh" => Ok(Action::Refresh),
+
+            // Connection
+            "connect" => Ok(Action::Connect),
+            "disconnect" => Ok(Action::Disconnect),
+            "reconnect" => Ok(Action::Reconnect),
+
+            _ => Err(format!("Unknown action: {}", s)),
         }
     }
 }
@@ -734,5 +826,78 @@ mod tests {
         // Check search
         let slash = KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE);
         assert_eq!(km.get(&slash), Some(&Action::StartSearch));
+    }
+
+    #[test]
+    fn test_action_from_str() {
+        assert_eq!("move_up".parse::<Action>().unwrap(), Action::MoveUp);
+        assert_eq!("move_down".parse::<Action>().unwrap(), Action::MoveDown);
+        assert_eq!("execute_query".parse::<Action>().unwrap(), Action::ExecuteQuery);
+        assert_eq!("enter_insert_mode".parse::<Action>().unwrap(), Action::EnterInsertMode);
+        assert_eq!("copy_selection".parse::<Action>().unwrap(), Action::CopySelection);
+
+        // Test with dashes (should normalize to underscores)
+        assert_eq!("move-up".parse::<Action>().unwrap(), Action::MoveUp);
+
+        // Test case insensitivity
+        assert_eq!("MOVE_UP".parse::<Action>().unwrap(), Action::MoveUp);
+        assert_eq!("Move_Up".parse::<Action>().unwrap(), Action::MoveUp);
+    }
+
+    #[test]
+    fn test_action_from_str_invalid() {
+        assert!("invalid_action".parse::<Action>().is_err());
+        assert!("".parse::<Action>().is_err());
+        assert!("not_an_action".parse::<Action>().is_err());
+    }
+
+    #[test]
+    fn test_keymap_override() {
+        let mut km = Keymap::default_grid_keymap();
+
+        // Verify default binding
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(km.get(&j), Some(&Action::MoveDown));
+
+        // Override j to do something else
+        km.bind(j, Action::PageDown);
+        assert_eq!(km.get(&j), Some(&Action::PageDown));
+    }
+
+    #[test]
+    fn test_keymap_custom_binding() {
+        let mut km = Keymap::new();
+
+        // Add a custom binding
+        let ctrl_enter = KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        km.bind(ctrl_enter, Action::ExecuteQuery);
+
+        assert_eq!(km.get(&ctrl_enter), Some(&Action::ExecuteQuery));
+    }
+
+    #[test]
+    fn test_keymap_get_action_from_key_event() {
+        let mut km = Keymap::new();
+        let binding = KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        km.bind(binding, Action::ExecuteQuery);
+
+        // Create a KeyEvent that matches
+        let key_event = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(km.get_action(&key_event), Some(Action::ExecuteQuery));
+
+        // Create a KeyEvent that doesn't match
+        let key_event2 = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(km.get_action(&key_event2), None);
+    }
+
+    #[test]
+    fn test_keymap_unbind() {
+        let mut km = Keymap::default_grid_keymap();
+
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(km.get(&j).is_some());
+
+        km.unbind(&j);
+        assert!(km.get(&j).is_none());
     }
 }

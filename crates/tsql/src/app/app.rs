@@ -16,7 +16,7 @@ use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
 use super::state::{DbStatus, Focus, Mode, SearchTarget};
-use crate::config::Config;
+use crate::config::{Action, Config, KeyBinding, Keymap};
 use crate::ui::{
     ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, DataGrid, GridKeyResult,
     GridModel, GridState, HighlightedTextArea, QueryEditor, ResizeAction, SchemaCache,
@@ -432,6 +432,13 @@ pub struct App {
     /// Application configuration
     pub config: Config,
 
+    /// Keymap for grid navigation
+    pub grid_keymap: Keymap,
+    /// Keymap for editor in normal mode
+    pub editor_normal_keymap: Keymap,
+    /// Keymap for editor in insert mode
+    pub editor_insert_keymap: Keymap,
+
     pub editor: QueryEditor,
     pub highlighter: Highlighter,
     pub search: SearchPrompt,
@@ -490,11 +497,20 @@ impl App {
         // Determine connection string: CLI arg > config > env var
         let effective_conn_str = conn_str.or_else(|| config.connection.default_url.clone());
 
+        // Build keymaps from defaults + config overrides
+        let grid_keymap = Self::build_grid_keymap(&config);
+        let editor_normal_keymap = Self::build_editor_normal_keymap(&config);
+        let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
+
         let mut app = Self {
             focus: Focus::Query,
             mode: Mode::Normal,
 
             config,
+
+            grid_keymap,
+            editor_normal_keymap,
+            editor_insert_keymap,
 
             editor,
             highlighter: create_sql_highlighter(),
@@ -527,6 +543,54 @@ impl App {
         }
 
         app
+    }
+
+    /// Build the grid keymap from defaults + config overrides
+    fn build_grid_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_grid_keymap();
+
+        // Apply custom bindings from config
+        for binding in &config.keymap.grid {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
+    }
+
+    /// Build the editor normal mode keymap from defaults + config overrides
+    fn build_editor_normal_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_editor_normal_keymap();
+
+        // Apply custom bindings from config
+        for binding in &config.keymap.normal {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
+    }
+
+    /// Build the editor insert mode keymap from defaults + config overrides
+    fn build_editor_insert_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_editor_insert_keymap();
+
+        // Apply custom bindings from config
+        for binding in &config.keymap.insert {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
@@ -1018,7 +1082,36 @@ impl App {
         match self.focus {
             Focus::Grid => {
                 if self.mode == Mode::Normal {
-                    let result = self.grid_state.handle_key(key, &self.grid);
+                    // First, try to look up action in keymap
+                    let result = if let Some(action) = self.grid_keymap.get_action(&key) {
+                        // Handle special actions at the App level
+                        match action {
+                            Action::ToggleFocus => {
+                                self.focus = Focus::Query;
+                                GridKeyResult::None
+                            }
+                            Action::FocusQuery => {
+                                self.focus = Focus::Query;
+                                self.mode = Mode::Insert;
+                                GridKeyResult::None
+                            }
+                            Action::Quit => {
+                                return true;
+                            }
+                            Action::Help => {
+                                self.show_help = true;
+                                GridKeyResult::None
+                            }
+                            _ => {
+                                // Delegate to grid state
+                                self.grid_state.handle_action(action, &self.grid)
+                            }
+                        }
+                    } else {
+                        // Fall back to legacy key handling for unmapped keys
+                        self.grid_state.handle_key(key, &self.grid)
+                    };
+
                     match result {
                         GridKeyResult::OpenSearch => {
                             self.search_target = SearchTarget::Grid;
@@ -1671,6 +1764,150 @@ impl App {
         ));
     }
 
+    /// Handle an editor action from the keymap. Returns true if the action was handled.
+    fn handle_editor_action(&mut self, action: Action) -> bool {
+        match action {
+            // Navigation
+            Action::MoveUp => {
+                self.editor.textarea.move_cursor(CursorMove::Up);
+            }
+            Action::MoveDown => {
+                self.editor.textarea.move_cursor(CursorMove::Down);
+            }
+            Action::MoveLeft => {
+                self.editor.textarea.move_cursor(CursorMove::Back);
+            }
+            Action::MoveRight => {
+                self.editor.textarea.move_cursor(CursorMove::Forward);
+            }
+            Action::MoveToTop => {
+                self.editor.textarea.move_cursor(CursorMove::Top);
+            }
+            Action::MoveToBottom => {
+                self.editor.textarea.move_cursor(CursorMove::Bottom);
+            }
+            Action::MoveToStart => {
+                self.editor.textarea.move_cursor(CursorMove::Head);
+            }
+            Action::MoveToEnd => {
+                self.editor.textarea.move_cursor(CursorMove::End);
+            }
+            Action::PageUp => {
+                for _ in 0..10 {
+                    self.editor.textarea.move_cursor(CursorMove::Up);
+                }
+            }
+            Action::PageDown => {
+                for _ in 0..10 {
+                    self.editor.textarea.move_cursor(CursorMove::Down);
+                }
+            }
+            Action::HalfPageUp => {
+                for _ in 0..5 {
+                    self.editor.textarea.move_cursor(CursorMove::Up);
+                }
+            }
+            Action::HalfPageDown => {
+                for _ in 0..5 {
+                    self.editor.textarea.move_cursor(CursorMove::Down);
+                }
+            }
+
+            // Mode switching
+            Action::EnterInsertMode => {
+                self.mode = Mode::Insert;
+            }
+            Action::EnterNormalMode => {
+                self.mode = Mode::Normal;
+            }
+            Action::EnterVisualMode => {
+                self.editor.textarea.start_selection();
+                self.mode = Mode::Visual;
+            }
+            Action::EnterCommandMode => {
+                self.command.open();
+            }
+
+            // Focus
+            Action::ToggleFocus => {
+                self.focus = Focus::Grid;
+            }
+            Action::FocusGrid => {
+                self.focus = Focus::Grid;
+            }
+
+            // Editor actions
+            Action::DeleteChar => {
+                self.editor.textarea.delete_next_char();
+            }
+            Action::DeleteLine => {
+                self.editor.delete_line();
+            }
+            Action::Undo => {
+                self.editor.textarea.undo();
+            }
+            Action::Redo => {
+                self.editor.textarea.redo();
+            }
+            Action::Copy => {
+                self.editor.textarea.copy();
+                self.last_status = Some("Copied".to_string());
+            }
+            Action::Paste => {
+                self.editor.textarea.paste();
+            }
+            Action::Cut => {
+                self.editor.textarea.cut();
+            }
+            Action::SelectAll => {
+                self.editor.textarea.select_all();
+            }
+
+            // Query execution
+            Action::ExecuteQuery => {
+                self.execute_query();
+            }
+
+            // Search
+            Action::StartSearch => {
+                self.search_target = SearchTarget::Editor;
+                self.search.open();
+            }
+            Action::NextMatch => {
+                if let Some(p) = self.search.last_applied.clone() {
+                    let found = self.editor.textarea.search_forward(false);
+                    if found {
+                        self.last_status = Some(format!("Search next: /{}", p));
+                    } else {
+                        self.last_status = Some(format!("Search next: /{} (no match)", p));
+                    }
+                }
+            }
+            Action::PrevMatch => {
+                if let Some(p) = self.search.last_applied.clone() {
+                    let found = self.editor.textarea.search_back(false);
+                    if found {
+                        self.last_status = Some(format!("Search prev: /{}", p));
+                    } else {
+                        self.last_status = Some(format!("Search prev: /{} (no match)", p));
+                    }
+                }
+            }
+
+            // Application
+            Action::Help => {
+                self.show_help = true;
+            }
+            Action::ShowHistory => {
+                self.editor.history_prev();
+            }
+
+            // Actions not applicable to editor
+            _ => return false,
+        }
+        true
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::Normal => {
@@ -1762,6 +1999,15 @@ impl App {
                     }
                 }
 
+                // Try keymap first for normal mode actions
+                if let Some(action) = self.editor_normal_keymap.get_action(&key) {
+                    self.pending_key = None;
+                    if self.handle_editor_action(action) {
+                        return;
+                    }
+                }
+
+                // Fall back to vim-specific keys that need special handling
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('g'), KeyModifiers::NONE) => {
                         self.pending_key = Some('g');
@@ -1981,6 +2227,51 @@ impl App {
                     self.trigger_completion();
                     return;
                 }
+
+                // Check keymap for insert mode actions (e.g., Ctrl+Enter to execute)
+                if let Some(action) = self.editor_insert_keymap.get_action(&key) {
+                    match action {
+                        Action::EnterNormalMode => {
+                            self.mode = Mode::Normal;
+                            return;
+                        }
+                        Action::ExecuteQuery => {
+                            self.execute_query();
+                            return;
+                        }
+                        Action::ToggleFocus => {
+                            self.focus = Focus::Grid;
+                            return;
+                        }
+                        Action::Undo => {
+                            self.editor.textarea.undo();
+                            return;
+                        }
+                        Action::Redo => {
+                            self.editor.textarea.redo();
+                            return;
+                        }
+                        Action::Copy => {
+                            self.editor.textarea.copy();
+                            self.last_status = Some("Copied".to_string());
+                            return;
+                        }
+                        Action::Paste => {
+                            self.editor.textarea.paste();
+                            return;
+                        }
+                        Action::Cut => {
+                            self.editor.textarea.cut();
+                            return;
+                        }
+                        Action::SelectAll => {
+                            self.editor.textarea.select_all();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Forward nearly everything to the textarea.
                 self.editor.input(key);
             }
@@ -3023,5 +3314,131 @@ mod tests {
             extract_table_from_query("UPDATE users SET name = 'Bob'"),
             None
         );
+    }
+
+    // ========== Config Integration Tests ==========
+
+    #[test]
+    fn test_app_uses_default_keymaps() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Verify default grid keymap has vim keys
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
+
+        let k = KeyBinding::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.grid_keymap.get(&k), Some(&Action::MoveUp));
+    }
+
+    #[test]
+    fn test_app_with_custom_config_keybindings() {
+        use crate::config::CustomKeyBinding;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create config with custom grid keybinding
+        let mut config = Config::default();
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+j".to_string(),
+            action: "page_down".to_string(),
+            description: Some("Page down with Ctrl+J".to_string()),
+        });
+
+        let app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        // Verify custom keybinding was added
+        let ctrl_j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_j), Some(&Action::PageDown));
+
+        // Verify default bindings still work
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
+    }
+
+    #[test]
+    fn test_app_custom_config_overrides_default() {
+        use crate::config::CustomKeyBinding;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create config that overrides j to do page_down instead of move_down
+        let mut config = Config::default();
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "j".to_string(),
+            action: "page_down".to_string(),
+            description: None,
+        });
+
+        let app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        // Verify j was overridden
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.grid_keymap.get(&j), Some(&Action::PageDown));
+    }
+
+    #[test]
+    fn test_build_keymap_ignores_invalid_bindings() {
+        use crate::config::CustomKeyBinding;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create config with invalid keybindings
+        let mut config = Config::default();
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "invalid_key_combo!!!".to_string(),
+            action: "move_down".to_string(),
+            description: None,
+        });
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+x".to_string(),
+            action: "invalid_action_name".to_string(),
+            description: None,
+        });
+
+        // This should not panic - invalid bindings are silently ignored
+        let app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        // Default bindings should still work
+        let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
     }
 }

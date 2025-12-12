@@ -10,7 +10,7 @@ mod keymap;
 mod schema;
 
 pub use keymap::{Action, KeyBinding, Keymap};
-pub use schema::{Config, DisplayConfig, EditorConfig};
+pub use schema::{Config, ConnectionConfig, CustomKeyBinding, DisplayConfig, EditorConfig, KeymapConfig};
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

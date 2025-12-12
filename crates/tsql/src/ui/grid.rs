@@ -7,6 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::Action;
+
 /// Action for column resize operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeAction {
@@ -356,6 +358,188 @@ impl GridState {
                 }
             }
 
+            _ => {}
+        }
+
+        GridKeyResult::None
+    }
+
+    /// Handle an action (from keymap lookup). Returns a GridKeyResult for actions
+    /// that need to be handled by the App (like clipboard operations).
+    pub fn handle_action(&mut self, action: Action, model: &GridModel) -> GridKeyResult {
+        let row_count = model.rows.len();
+        let col_count = model.headers.len();
+
+        match action {
+            // Navigation
+            Action::MoveUp => {
+                if self.cursor_row > 0 {
+                    self.cursor_row -= 1;
+                }
+            }
+            Action::MoveDown => {
+                if row_count > 0 {
+                    self.cursor_row = (self.cursor_row + 1).min(row_count - 1);
+                }
+            }
+            Action::MoveLeft => {
+                self.cursor_col = self.cursor_col.saturating_sub(1);
+            }
+            Action::MoveRight => {
+                if col_count > 0 {
+                    self.cursor_col = (self.cursor_col + 1).min(col_count - 1);
+                }
+            }
+            Action::MoveToTop => {
+                self.cursor_row = 0;
+            }
+            Action::MoveToBottom => {
+                if row_count > 0 {
+                    self.cursor_row = row_count - 1;
+                }
+            }
+            Action::MoveToStart => {
+                self.cursor_col = 0;
+            }
+            Action::MoveToEnd => {
+                if col_count > 0 {
+                    self.cursor_col = col_count - 1;
+                }
+            }
+            Action::PageUp => {
+                self.cursor_row = self.cursor_row.saturating_sub(10);
+            }
+            Action::PageDown => {
+                if row_count > 0 {
+                    self.cursor_row = (self.cursor_row + 10).min(row_count - 1);
+                }
+            }
+            Action::HalfPageUp => {
+                self.cursor_row = self.cursor_row.saturating_sub(5);
+            }
+            Action::HalfPageDown => {
+                if row_count > 0 {
+                    self.cursor_row = (self.cursor_row + 5).min(row_count - 1);
+                }
+            }
+
+            // Selection
+            Action::SelectRow => {
+                if row_count == 0 {
+                    return GridKeyResult::None;
+                }
+                if self.selected_rows.contains(&self.cursor_row) {
+                    self.selected_rows.remove(&self.cursor_row);
+                } else {
+                    self.selected_rows.insert(self.cursor_row);
+                }
+            }
+            Action::GridSelectAll => {
+                self.selected_rows.clear();
+                for i in 0..row_count {
+                    self.selected_rows.insert(i);
+                }
+            }
+            Action::ClearSelection => {
+                if !self.search.pattern.is_empty() {
+                    self.search.clear();
+                } else {
+                    self.selected_rows.clear();
+                }
+            }
+
+            // Search
+            Action::StartSearch => {
+                return GridKeyResult::OpenSearch;
+            }
+            Action::NextMatch => {
+                if let Some(m) = self.search.next_match() {
+                    self.cursor_row = m.row;
+                    self.cursor_col = m.col;
+                    self.col_offset = m.col;
+                }
+            }
+            Action::PrevMatch => {
+                if let Some(m) = self.search.prev_match() {
+                    self.cursor_row = m.row;
+                    self.cursor_col = m.col;
+                    self.col_offset = m.col;
+                }
+            }
+            Action::ClearSearch => {
+                self.search.clear();
+            }
+
+            // Copy
+            Action::CopySelection => {
+                if row_count == 0 {
+                    return GridKeyResult::None;
+                }
+                let text = if self.selected_rows.is_empty() {
+                    model.row_as_tsv(self.cursor_row).unwrap_or_default()
+                } else {
+                    let indices: Vec<usize> = self.selected_rows.iter().copied().collect();
+                    model.rows_as_tsv(&indices, false)
+                };
+                return GridKeyResult::CopyToClipboard(text);
+            }
+            Action::Copy => {
+                // Copy current cell
+                if row_count == 0 || col_count == 0 {
+                    return GridKeyResult::None;
+                }
+                if let Some(cell) = model.cell(self.cursor_row, self.cursor_col) {
+                    return GridKeyResult::CopyToClipboard(cell.to_string());
+                }
+            }
+
+            // Column resize
+            Action::ResizeColumnLeft => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::Narrow,
+                    };
+                }
+            }
+            Action::ResizeColumnRight => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::Widen,
+                    };
+                }
+            }
+            Action::AutoFitColumn => {
+                if col_count > 0 {
+                    return GridKeyResult::ResizeColumn {
+                        col: self.cursor_col,
+                        action: ResizeAction::AutoFit,
+                    };
+                }
+            }
+
+            // Edit
+            Action::EditCell => {
+                if row_count > 0 && col_count > 0 {
+                    return GridKeyResult::EditCell {
+                        row: self.cursor_row,
+                        col: self.cursor_col,
+                    };
+                }
+            }
+
+            // Command mode
+            Action::EnterCommandMode => {
+                return GridKeyResult::OpenCommand;
+            }
+
+            // Focus (handled by App, but we can signal intent)
+            Action::ToggleFocus | Action::FocusQuery => {
+                // These are handled at the App level
+            }
+
+            // Other actions not applicable to grid
             _ => {}
         }
 
