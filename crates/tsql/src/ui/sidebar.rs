@@ -225,31 +225,49 @@ impl Sidebar {
         frame.render_stateful_widget(tree, area, &mut self.schema_state);
     }
 
-    /// Move selection up in connections list
-    pub fn connections_up(&mut self, count: usize) {
+    /// Move selection up in connections list by the specified amount.
+    ///
+    /// # Arguments
+    /// * `total_count` - Total number of connections (for bounds checking)
+    /// * `amount` - Number of items to move up (default 1)
+    pub fn connections_up_by(&mut self, total_count: usize, amount: usize) {
         if let Some(selected) = self.connections_state.selected() {
-            let new_selected = selected.saturating_sub(1);
+            let new_selected = selected.saturating_sub(amount);
             self.connections_state.select(Some(new_selected));
             self.selected_connection = Some(new_selected);
-        } else if count > 0 {
+        } else if total_count > 0 {
             self.connections_state.select(Some(0));
             self.selected_connection = Some(0);
         }
     }
 
-    /// Move selection down in connections list
-    pub fn connections_down(&mut self, count: usize) {
-        if count == 0 {
+    /// Move selection up in connections list by 1.
+    pub fn connections_up(&mut self, total_count: usize) {
+        self.connections_up_by(total_count, 1);
+    }
+
+    /// Move selection down in connections list by the specified amount.
+    ///
+    /// # Arguments
+    /// * `total_count` - Total number of connections (for bounds checking)
+    /// * `amount` - Number of items to move down (default 1)
+    pub fn connections_down_by(&mut self, total_count: usize, amount: usize) {
+        if total_count == 0 {
             return;
         }
         if let Some(selected) = self.connections_state.selected() {
-            let new_selected = (selected + 1).min(count - 1);
+            let new_selected = (selected + amount).min(total_count - 1);
             self.connections_state.select(Some(new_selected));
             self.selected_connection = Some(new_selected);
         } else {
             self.connections_state.select(Some(0));
             self.selected_connection = Some(0);
         }
+    }
+
+    /// Move selection down in connections list by 1.
+    pub fn connections_down(&mut self, total_count: usize) {
+        self.connections_down_by(total_count, 1);
     }
 
     /// Get selected connection name
@@ -329,23 +347,27 @@ impl Sidebar {
             }
             MouseEventKind::ScrollUp => {
                 if self.is_over_connections(x, y) {
-                    let count = connections.sorted().len();
-                    self.connections_up(count);
+                    let total_count = connections.sorted().len();
+                    self.connections_up_by(total_count, 3);
                     return (None, Some(SidebarSection::Connections));
                 }
                 if self.is_over_schema(x, y) {
-                    self.schema_up();
+                    for _ in 0..3 {
+                        self.schema_up();
+                    }
                     return (None, Some(SidebarSection::Schema));
                 }
             }
             MouseEventKind::ScrollDown => {
                 if self.is_over_connections(x, y) {
-                    let count = connections.sorted().len();
-                    self.connections_down(count);
+                    let total_count = connections.sorted().len();
+                    self.connections_down_by(total_count, 3);
                     return (None, Some(SidebarSection::Connections));
                 }
                 if self.is_over_schema(x, y) {
-                    self.schema_down();
+                    for _ in 0..3 {
+                        self.schema_down();
+                    }
                     return (None, Some(SidebarSection::Schema));
                 }
             }
