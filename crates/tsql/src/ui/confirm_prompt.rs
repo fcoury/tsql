@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn test_confirm_y_lowercase_returns_confirmed() {
         let prompt = ConfirmPrompt::new("Test?", ConfirmContext::QuitApp);
-        assert_eq!(prompt.handle_key(key(KeyCode::Char('y'))), ConfirmResult::Confirmed);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Char('y'))),
+            ConfirmResult::Confirmed
+        );
     }
 
     #[test]
@@ -180,7 +183,10 @@ mod tests {
     #[test]
     fn test_confirm_n_lowercase_returns_cancelled() {
         let prompt = ConfirmPrompt::new("Test?", ConfirmContext::QuitApp);
-        assert_eq!(prompt.handle_key(key(KeyCode::Char('n'))), ConfirmResult::Cancelled);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Char('n'))),
+            ConfirmResult::Cancelled
+        );
     }
 
     #[test]
@@ -195,7 +201,10 @@ mod tests {
     #[test]
     fn test_confirm_esc_returns_cancelled() {
         let prompt = ConfirmPrompt::new("Test?", ConfirmContext::QuitApp);
-        assert_eq!(prompt.handle_key(key(KeyCode::Esc)), ConfirmResult::Cancelled);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Esc)),
+            ConfirmResult::Cancelled
+        );
     }
 
     #[test]
@@ -203,9 +212,18 @@ mod tests {
         let prompt = ConfirmPrompt::new("Test?", ConfirmContext::QuitApp);
 
         // Random keys should return Pending
-        assert_eq!(prompt.handle_key(key(KeyCode::Char('a'))), ConfirmResult::Pending);
-        assert_eq!(prompt.handle_key(key(KeyCode::Char('x'))), ConfirmResult::Pending);
-        assert_eq!(prompt.handle_key(key(KeyCode::Enter)), ConfirmResult::Pending);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Char('a'))),
+            ConfirmResult::Pending
+        );
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Char('x'))),
+            ConfirmResult::Pending
+        );
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            ConfirmResult::Pending
+        );
         assert_eq!(prompt.handle_key(key(KeyCode::Tab)), ConfirmResult::Pending);
     }
 

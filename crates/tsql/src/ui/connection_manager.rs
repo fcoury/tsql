@@ -71,7 +71,8 @@ impl ConnectionManagerModal {
     /// Create a new connection manager modal.
     pub fn new(connections_file: &ConnectionsFile, connected_name: Option<String>) -> Self {
         // Get connections sorted by favorite first, then alphabetically
-        let connections: Vec<ConnectionEntry> = connections_file.sorted().into_iter().cloned().collect();
+        let connections: Vec<ConnectionEntry> =
+            connections_file.sorted().into_iter().cloned().collect();
 
         Self {
             connections,
@@ -85,21 +86,21 @@ impl ConnectionManagerModal {
     /// Update the connections list (e.g., after add/edit/delete).
     pub fn update_connections(&mut self, connections_file: &ConnectionsFile) {
         let old_selected_name = self.connections.get(self.selected).map(|c| c.name.clone());
-        
+
         self.connections = connections_file.sorted().into_iter().cloned().collect();
-        
+
         // Try to preserve selection by name
         if let Some(name) = old_selected_name {
             if let Some(idx) = self.connections.iter().position(|c| c.name == name) {
                 self.selected = idx;
             }
         }
-        
+
         // Ensure selection is valid
         if self.selected >= self.connections.len() && !self.connections.is_empty() {
             self.selected = self.connections.len() - 1;
         }
-        
+
         self.ensure_selected_visible();
     }
 
@@ -216,7 +217,8 @@ impl ConnectionManagerModal {
             }
 
             // Full page down
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) | (KeyCode::PageDown, KeyModifiers::NONE) => {
+            (KeyCode::Char('f'), KeyModifiers::CONTROL)
+            | (KeyCode::PageDown, KeyModifiers::NONE) => {
                 let amount = self.visible_height.saturating_sub(2);
                 for _ in 0..amount {
                     self.move_down();
@@ -241,7 +243,8 @@ impl ConnectionManagerModal {
             }
 
             // Go to bottom (G)
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
+            (KeyCode::Char('G'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                 if !self.connections.is_empty() {
                     self.selected = self.connections.len() - 1;
                     self.ensure_selected_visible();
@@ -305,7 +308,11 @@ impl ConnectionManagerModal {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
             .border_style(Style::default().fg(Color::Cyan));
 
         let inner = block.inner(modal_area);
@@ -394,14 +401,17 @@ impl ConnectionManagerModal {
                     .track_symbol(Some("│"))
             };
 
-            let mut scrollbar_state =
-                ScrollbarState::new(total_items).position(self.scroll_offset);
+            let mut scrollbar_state = ScrollbarState::new(total_items).position(self.scroll_offset);
 
             frame.render_stateful_widget(scrollbar, sb_area, &mut scrollbar_state);
         }
     }
 
-    fn render_connection_item(&self, conn: &ConnectionEntry, is_selected: bool) -> ListItem<'static> {
+    fn render_connection_item(
+        &self,
+        conn: &ConnectionEntry,
+        is_selected: bool,
+    ) -> ListItem<'static> {
         let mut spans = Vec::new();
 
         // Favorite indicator (1-9 or space)
@@ -439,10 +449,7 @@ impl ConnectionManagerModal {
 
         // Connection details
         let details = conn.short_display();
-        spans.push(Span::styled(
-            details,
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(details, Style::default().fg(Color::DarkGray)));
 
         let line = Line::from(spans);
 
@@ -471,8 +478,8 @@ impl ConnectionManagerModal {
             Span::raw(" close"),
         ];
 
-        let help = Paragraph::new(Line::from(help_spans))
-            .alignment(ratatui::layout::Alignment::Center);
+        let help =
+            Paragraph::new(Line::from(help_spans)).alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(help, area);
     }
 }

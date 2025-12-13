@@ -141,9 +141,7 @@ impl VimHandler {
             }
 
             // === Insert mode entry ===
-            (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                VimCommand::ChangeMode(VimMode::Insert)
-            }
+            (KeyCode::Char('i'), KeyModifiers::NONE) => VimCommand::ChangeMode(VimMode::Insert),
             (KeyCode::Char('a'), KeyModifiers::NONE) => VimCommand::EnterInsertAt {
                 motion: Some(Motion::right()),
                 mode: VimMode::Insert,
@@ -174,20 +172,12 @@ impl VimHandler {
             }
 
             // === Word movement ===
-            (KeyCode::Char('w'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_forward())
-            }
-            (KeyCode::Char('b'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_back())
-            }
-            (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_end())
-            }
+            (KeyCode::Char('w'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_forward()),
+            (KeyCode::Char('b'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_back()),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_end()),
 
             // === Line movement ===
-            (KeyCode::Char('0'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::line_start())
-            }
+            (KeyCode::Char('0'), KeyModifiers::NONE) => VimCommand::Move(Motion::line_start()),
             (KeyCode::Char('$'), KeyModifiers::NONE) | (KeyCode::End, _) => {
                 VimCommand::Move(Motion::line_end())
             }
@@ -201,9 +191,7 @@ impl VimHandler {
                 self.pending = PendingOp::G;
                 VimCommand::None
             }
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
-                VimCommand::Move(Motion::document_end())
-            }
+            (KeyCode::Char('G'), KeyModifiers::SHIFT) => VimCommand::Move(Motion::document_end()),
 
             // === Page movement ===
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -288,9 +276,7 @@ impl VimHandler {
             }
 
             // === dd - delete line ===
-            (PendingOp::Delete, KeyCode::Char('d'), KeyModifiers::NONE) => {
-                VimCommand::DeleteLine
-            }
+            (PendingOp::Delete, KeyCode::Char('d'), KeyModifiers::NONE) => VimCommand::DeleteLine,
             // === dw, de, db, d$, d0 ===
             (PendingOp::Delete, KeyCode::Char('w'), KeyModifiers::NONE) => {
                 VimCommand::DeleteMotion(Motion::word_forward())
@@ -301,17 +287,13 @@ impl VimHandler {
             (PendingOp::Delete, KeyCode::Char('b'), KeyModifiers::NONE) => {
                 VimCommand::DeleteMotion(Motion::word_back())
             }
-            (PendingOp::Delete, KeyCode::Char('$'), KeyModifiers::NONE) => {
-                VimCommand::DeleteToEnd
-            }
+            (PendingOp::Delete, KeyCode::Char('$'), KeyModifiers::NONE) => VimCommand::DeleteToEnd,
             (PendingOp::Delete, KeyCode::Char('0'), KeyModifiers::NONE) => {
                 VimCommand::DeleteMotion(Motion::line_start())
             }
 
             // === cc - change line ===
-            (PendingOp::Change, KeyCode::Char('c'), KeyModifiers::NONE) => {
-                VimCommand::ChangeLine
-            }
+            (PendingOp::Change, KeyCode::Char('c'), KeyModifiers::NONE) => VimCommand::ChangeLine,
             // === cw, ce, cb, c$, c0 ===
             (PendingOp::Change, KeyCode::Char('w'), KeyModifiers::NONE) => {
                 VimCommand::ChangeMotion(Motion::word_forward())
@@ -322,17 +304,13 @@ impl VimHandler {
             (PendingOp::Change, KeyCode::Char('b'), KeyModifiers::NONE) => {
                 VimCommand::ChangeMotion(Motion::word_back())
             }
-            (PendingOp::Change, KeyCode::Char('$'), KeyModifiers::NONE) => {
-                VimCommand::ChangeToEnd
-            }
+            (PendingOp::Change, KeyCode::Char('$'), KeyModifiers::NONE) => VimCommand::ChangeToEnd,
             (PendingOp::Change, KeyCode::Char('0'), KeyModifiers::NONE) => {
                 VimCommand::ChangeMotion(Motion::line_start())
             }
 
             // === yy - yank line ===
-            (PendingOp::Yank, KeyCode::Char('y'), KeyModifiers::NONE) => {
-                VimCommand::YankLine
-            }
+            (PendingOp::Yank, KeyCode::Char('y'), KeyModifiers::NONE) => VimCommand::YankLine,
             // === yw, ye, yb, y$, y0 ===
             (PendingOp::Yank, KeyCode::Char('w'), KeyModifiers::NONE) => {
                 VimCommand::YankMotion(Motion::word_forward())
@@ -359,9 +337,7 @@ impl VimHandler {
     fn handle_insert_mode(&mut self, key: KeyEvent) -> VimCommand {
         match (key.code, key.modifiers) {
             // Exit insert mode
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                VimCommand::ChangeMode(VimMode::Normal)
-            }
+            (KeyCode::Esc, KeyModifiers::NONE) => VimCommand::ChangeMode(VimMode::Normal),
 
             // Page movement works in insert mode too
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
@@ -402,37 +378,26 @@ impl VimHandler {
             }
 
             // Word movement
-            (KeyCode::Char('w'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_forward())
-            }
-            (KeyCode::Char('b'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_back())
-            }
-            (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::word_end())
-            }
+            (KeyCode::Char('w'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_forward()),
+            (KeyCode::Char('b'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_back()),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => VimCommand::Move(Motion::word_end()),
 
             // Line movement
-            (KeyCode::Char('0'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::line_start())
-            }
-            (KeyCode::Char('$'), KeyModifiers::NONE) => {
-                VimCommand::Move(Motion::line_end())
-            }
+            (KeyCode::Char('0'), KeyModifiers::NONE) => VimCommand::Move(Motion::line_start()),
+            (KeyCode::Char('$'), KeyModifiers::NONE) => VimCommand::Move(Motion::line_end()),
 
             // Document movement
             (KeyCode::Char('g'), KeyModifiers::NONE) => {
                 // In visual mode, 'g' alone goes to top (simplified)
                 VimCommand::Move(Motion::document_start())
             }
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
-                VimCommand::Move(Motion::document_end())
-            }
+            (KeyCode::Char('G'), KeyModifiers::SHIFT) => VimCommand::Move(Motion::document_end()),
 
             // Operations on selection
             (KeyCode::Char('y'), KeyModifiers::NONE) => VimCommand::VisualYank,
-            (KeyCode::Char('d'), KeyModifiers::NONE)
-            | (KeyCode::Char('x'), KeyModifiers::NONE) => VimCommand::VisualDelete,
+            (KeyCode::Char('d'), KeyModifiers::NONE) | (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                VimCommand::VisualDelete
+            }
             (KeyCode::Char('c'), KeyModifiers::NONE) => VimCommand::VisualChange,
 
             _ => VimCommand::None,

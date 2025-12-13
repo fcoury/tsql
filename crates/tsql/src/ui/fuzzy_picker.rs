@@ -12,7 +12,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
+    },
     Frame,
 };
 
@@ -315,11 +318,8 @@ impl<T: Clone> FuzzyPicker<T> {
 
         // Reserve space for scrollbar if needed
         let (list_area, scrollbar_area) = if needs_scrollbar {
-            let chunks = Layout::horizontal([
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
+            let chunks =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(area);
             (chunks[0], Some(chunks[1]))
         } else {
             (area, None)
@@ -383,8 +383,7 @@ impl<T: Clone> FuzzyPicker<T> {
                     .track_symbol(Some("│"))
             };
 
-            let mut scrollbar_state = ScrollbarState::new(total_items)
-                .position(self.scroll_offset);
+            let mut scrollbar_state = ScrollbarState::new(total_items).position(self.scroll_offset);
 
             frame.render_stateful_widget(scrollbar, sb_area, &mut scrollbar_state);
         }

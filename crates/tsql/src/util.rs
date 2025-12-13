@@ -353,10 +353,7 @@ mod tests {
         );
 
         // SQL detection
-        assert_eq!(
-            detect_content_type("SELECT * FROM users"),
-            ContentType::Sql
-        );
+        assert_eq!(detect_content_type("SELECT * FROM users"), ContentType::Sql);
 
         // Plain text
         assert_eq!(detect_content_type("hello world"), ContentType::Plain);

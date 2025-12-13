@@ -3,12 +3,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -310,7 +315,10 @@ pub enum DbEvent {
         value: String,
     },
     /// Result of a connection test (from connection form).
-    TestConnectionResult { success: bool, message: String },
+    TestConnectionResult {
+        success: bool,
+        message: String,
+    },
 }
 
 pub struct DbSession {
@@ -846,16 +854,29 @@ impl App {
                 };
 
                 // Build query title with [+] indicator if modified
-                let modified_indicator = if self.editor.is_modified() { " [+]" } else { "" };
+                let modified_indicator = if self.editor.is_modified() {
+                    " [+]"
+                } else {
+                    ""
+                };
                 let query_title = match (self.focus, self.mode) {
                     (Focus::Query, Mode::Normal) => {
-                        format!("Query [NORMAL]{} (i insert, Enter run, Ctrl-r history, Tab to grid)", modified_indicator)
+                        format!(
+                            "Query [NORMAL]{} (i insert, Enter run, Ctrl-r history, Tab to grid)",
+                            modified_indicator
+                        )
                     }
                     (Focus::Query, Mode::Insert) => {
-                        format!("Query [INSERT]{} (Esc normal, Ctrl-r history)", modified_indicator)
+                        format!(
+                            "Query [INSERT]{} (Esc normal, Ctrl-r history)",
+                            modified_indicator
+                        )
                     }
                     (Focus::Query, Mode::Visual) => {
-                        format!("Query [VISUAL]{} (y yank, d delete, Esc cancel)", modified_indicator)
+                        format!(
+                            "Query [VISUAL]{} (y yank, d delete, Esc cancel)",
+                            modified_indicator
+                        )
                     }
                     (Focus::Grid, _) => "Query (Tab to focus)".to_string(),
                 };
@@ -910,8 +931,8 @@ impl App {
                             .track_symbol(Some("│"))
                     };
 
-                    let mut scrollbar_state = ScrollbarState::new(total_lines)
-                        .position(self.editor_scroll.0 as usize);
+                    let mut scrollbar_state =
+                        ScrollbarState::new(total_lines).position(self.editor_scroll.0 as usize);
 
                     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
                 }
@@ -1125,10 +1146,14 @@ impl App {
                             };
 
                             let scroll_offset = self.completion.scroll_offset(max_visible);
-                            let mut scrollbar_state = ScrollbarState::new(total_items)
-                                .position(scroll_offset);
+                            let mut scrollbar_state =
+                                ScrollbarState::new(total_items).position(scroll_offset);
 
-                            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+                            frame.render_stateful_widget(
+                                scrollbar,
+                                scrollbar_area,
+                                &mut scrollbar_state,
+                            );
                         }
                     }
                 }
@@ -1170,8 +1195,15 @@ impl App {
                     // Update scroll offset based on cursor position
                     self.cell_editor.update_scroll(inner_width);
 
-                    let modified_indicator = if self.cell_editor.is_modified() { " [+]" } else { "" };
-                    let title = format!("Edit: {}{} (Enter confirm, Esc cancel)", col_name, modified_indicator);
+                    let modified_indicator = if self.cell_editor.is_modified() {
+                        " [+]"
+                    } else {
+                        ""
+                    };
+                    let title = format!(
+                        "Edit: {}{} (Enter confirm, Esc cancel)",
+                        col_name, modified_indicator
+                    );
                     let edit_block = Block::default()
                         .borders(Borders::ALL)
                         .title(title)
@@ -3378,20 +3410,17 @@ impl App {
 
         // Get sorted connections (favorites first, then alphabetical)
         // Clone them since FuzzyPicker needs owned values
-        let entries: Vec<ConnectionEntry> = self.connections.sorted().into_iter().cloned().collect();
+        let entries: Vec<ConnectionEntry> =
+            self.connections.sorted().into_iter().cloned().collect();
 
-        let picker = FuzzyPicker::with_display(
-            entries,
-            "Connect (Ctrl+O: manage)",
-            |entry| {
-                // Display: "[fav] name - user@host/db"
-                let fav = entry
-                    .favorite
-                    .map(|f| format!("[{}] ", f))
-                    .unwrap_or_default();
-                format!("{}{} - {}", fav, entry.name, entry.short_display())
-            },
-        );
+        let picker = FuzzyPicker::with_display(entries, "Connect (Ctrl+O: manage)", |entry| {
+            // Display: "[fav] name - user@host/db"
+            let fav = entry
+                .favorite
+                .map(|f| format!("[{}] ", f))
+                .unwrap_or_default();
+            format!("{}{} - {}", fav, entry.name, entry.short_display())
+        });
 
         self.connection_picker = Some(picker);
     }
@@ -3455,8 +3484,9 @@ impl App {
                 self.connect_to_entry(entry);
             }
             ConnectionManagerAction::Add => {
-                self.connection_form =
-                    Some(ConnectionFormModal::with_keymap(self.connection_form_keymap.clone()));
+                self.connection_form = Some(ConnectionFormModal::with_keymap(
+                    self.connection_form_keymap.clone(),
+                ));
             }
             ConnectionManagerAction::Edit { entry } => {
                 // Try to get existing password for editing
@@ -5160,13 +5190,10 @@ mod tests {
         app.connections.add(entry.clone()).unwrap();
 
         // Manually create the picker without reloading from disk
-        let entries: Vec<ConnectionEntry> =
-            app.connections.sorted().into_iter().cloned().collect();
-        app.connection_picker = Some(FuzzyPicker::with_display(
-            entries,
-            "Connect",
-            |entry| entry.name.clone(),
-        ));
+        let entries: Vec<ConnectionEntry> = app.connections.sorted().into_iter().cloned().collect();
+        app.connection_picker = Some(FuzzyPicker::with_display(entries, "Connect", |entry| {
+            entry.name.clone()
+        }));
 
         assert!(
             app.connection_picker.is_some(),
@@ -5227,13 +5254,10 @@ mod tests {
         app.connections.add(entry.clone()).unwrap();
 
         // Manually create the picker
-        let entries: Vec<ConnectionEntry> =
-            app.connections.sorted().into_iter().cloned().collect();
-        app.connection_picker = Some(FuzzyPicker::with_display(
-            entries,
-            "Connect",
-            |entry| entry.name.clone(),
-        ));
+        let entries: Vec<ConnectionEntry> = app.connections.sorted().into_iter().cloned().collect();
+        app.connection_picker = Some(FuzzyPicker::with_display(entries, "Connect", |entry| {
+            entry.name.clone()
+        }));
 
         // ALSO set an error (simulating "Unknown connection" scenario)
         app.last_error = Some("Unknown connection: badname".to_string());
