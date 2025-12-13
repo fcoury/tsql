@@ -1801,17 +1801,71 @@ impl App {
 
     /// Handle mouse events
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        // Don't process mouse events when modals are open
+        // Route mouse events to modals in priority order
+
+        // Help popup has mouse support
+        if let Some(ref mut help_popup) = self.help_popup {
+            let action = help_popup.handle_mouse(mouse);
+            match action {
+                HelpAction::Close => {
+                    self.help_popup = None;
+                }
+                HelpAction::Continue => {}
+            }
+            return;
+        }
+
+        // History picker has mouse support
+        if let Some(ref mut picker) = self.history_picker {
+            let action = picker.handle_mouse(mouse);
+            match action {
+                PickerAction::Selected(entry) => {
+                    self.history_picker = None;
+                    self.editor.textarea.select_all();
+                    self.editor.textarea.cut();
+                    self.editor.textarea.insert_str(&entry.query);
+                }
+                PickerAction::Cancelled => {
+                    self.history_picker = None;
+                }
+                PickerAction::Continue => {}
+            }
+            return;
+        }
+
+        // Connection picker has mouse support
+        if let Some(ref mut picker) = self.connection_picker {
+            let action = picker.handle_mouse(mouse);
+            match action {
+                PickerAction::Selected(entry) => {
+                    self.connection_picker = None;
+                    self.connect_to_entry(entry);
+                }
+                PickerAction::Cancelled => {
+                    self.connection_picker = None;
+                }
+                PickerAction::Continue => {}
+            }
+            return;
+        }
+
+        // Connection manager has mouse support
+        if let Some(ref mut manager) = self.connection_manager {
+            let action = manager.handle_mouse(mouse);
+            // Handle action (the method already exists)
+            self.handle_connection_manager_action(action);
+            return;
+        }
+
+        // Don't process mouse events for other modals without mouse support
         if self.confirm_prompt.is_some()
             || self.json_editor.is_some()
             || self.row_detail.is_some()
-            || self.help_popup.is_some()
-            || self.history_picker.is_some()
-            || self.connection_picker.is_some()
         {
             return;
         }
 
+        // Handle mouse for main UI (query editor / grid)
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_mouse_click(mouse.column, mouse.row);

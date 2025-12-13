@@ -1,6 +1,6 @@
 //! A styled help popup widget with sections, keybinding highlighting, and scrolling.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -58,6 +58,8 @@ pub struct HelpPopup {
     total_lines: usize,
     /// Visible height (set during render).
     visible_height: usize,
+    /// Popup area (set during render, used for mouse hit testing).
+    popup_area: Option<Rect>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +236,7 @@ impl HelpPopup {
             scroll_offset: 0,
             total_lines,
             visible_height: 0,
+            popup_area: None,
         }
     }
 
@@ -335,6 +338,50 @@ impl HelpPopup {
         }
     }
 
+    /// Handle a mouse event, returning the action to take.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> HelpAction {
+        let (x, y) = (mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check if click is outside popup - close if so
+                if let Some(popup) = self.popup_area {
+                    if !Self::is_inside(x, y, popup) {
+                        return HelpAction::Close;
+                    }
+                }
+                HelpAction::Continue
+            }
+            MouseEventKind::ScrollUp => {
+                // Only scroll if mouse is inside popup
+                if self.is_mouse_inside(x, y) {
+                    self.scroll_up(3);
+                }
+                HelpAction::Continue
+            }
+            MouseEventKind::ScrollDown => {
+                // Only scroll if mouse is inside popup
+                if self.is_mouse_inside(x, y) {
+                    self.scroll_down(3);
+                }
+                HelpAction::Continue
+            }
+            _ => HelpAction::Continue,
+        }
+    }
+
+    /// Check if coordinates are inside a rect.
+    fn is_inside(x: u16, y: u16, rect: Rect) -> bool {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    }
+
+    /// Check if mouse coordinates are inside the popup.
+    fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
+        self.popup_area
+            .map(|popup| Self::is_inside(x, y, popup))
+            .unwrap_or(false)
+    }
+
     fn scroll_down(&mut self, amount: usize) {
         let max_scroll = self.total_lines.saturating_sub(self.visible_height);
         self.scroll_offset = (self.scroll_offset + amount).min(max_scroll);
@@ -356,6 +403,9 @@ impl HelpPopup {
         let height = (area.height * 85 / 100).clamp(20, 50);
 
         let popup = centered_rect(width, height, area);
+
+        // Store popup area for mouse hit testing
+        self.popup_area = Some(popup);
 
         // Clear background
         frame.render_widget(Clear, popup);

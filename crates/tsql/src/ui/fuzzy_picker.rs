@@ -3,7 +3,7 @@
 //! Provides an interactive popup for selecting items from a list with
 //! fuzzy matching and highlighted results.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
@@ -68,6 +68,10 @@ pub struct FuzzyPicker<T> {
     matcher: Matcher,
     /// Function to get display text from item.
     display_fn: fn(&T) -> String,
+    /// Popup area (set during render, used for mouse hit testing).
+    popup_area: Option<Rect>,
+    /// List area (set during render, used for mouse item selection).
+    list_area: Option<Rect>,
 }
 
 impl<T: Clone + AsRef<str>> FuzzyPicker<T> {
@@ -94,6 +98,8 @@ impl<T: Clone> FuzzyPicker<T> {
             title: title.into(),
             matcher: Matcher::new(Config::DEFAULT),
             display_fn,
+            popup_area: None,
+            list_area: None,
         };
         picker.update_filtered();
         picker
@@ -234,6 +240,70 @@ impl<T: Clone> FuzzyPicker<T> {
         }
     }
 
+    /// Handle a mouse event.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> PickerAction<T> {
+        let (x, y) = (mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check if click is outside popup - cancel if so
+                if let Some(popup) = self.popup_area {
+                    if !Self::is_inside(x, y, popup) {
+                        return PickerAction::Cancelled;
+                    }
+                }
+
+                // Check if click is in list area - select item
+                if let Some(list_area) = self.list_area {
+                    if Self::is_inside(x, y, list_area) {
+                        // Calculate which row was clicked
+                        let row_in_list = (y - list_area.y) as usize;
+                        let clicked_index = self.scroll_offset + row_in_list;
+
+                        if clicked_index < self.filtered.len() {
+                            // Select and return the item
+                            self.selected = clicked_index;
+                            return PickerAction::Selected(self.filtered[clicked_index].item.clone());
+                        }
+                    }
+                }
+
+                PickerAction::Continue
+            }
+            MouseEventKind::ScrollUp => {
+                // Only scroll if mouse is inside popup
+                if self.is_mouse_inside(x, y) {
+                    for _ in 0..3 {
+                        self.move_up();
+                    }
+                }
+                PickerAction::Continue
+            }
+            MouseEventKind::ScrollDown => {
+                // Only scroll if mouse is inside popup
+                if self.is_mouse_inside(x, y) {
+                    for _ in 0..3 {
+                        self.move_down();
+                    }
+                }
+                PickerAction::Continue
+            }
+            _ => PickerAction::Continue,
+        }
+    }
+
+    /// Check if coordinates are inside a rect.
+    fn is_inside(x: u16, y: u16, rect: Rect) -> bool {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    }
+
+    /// Check if mouse coordinates are inside the popup.
+    fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
+        self.popup_area
+            .map(|popup| Self::is_inside(x, y, popup))
+            .unwrap_or(false)
+    }
+
     /// Render the picker as a centered popup.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Calculate popup size based on content.
@@ -256,6 +326,9 @@ impl<T: Clone> FuzzyPicker<T> {
 
         let popup = centered_rect(width, height, area);
 
+        // Store popup area for mouse hit testing
+        self.popup_area = Some(popup);
+
         // Clear the background.
         frame.render_widget(Clear, popup);
 
@@ -276,6 +349,9 @@ impl<T: Clone> FuzzyPicker<T> {
             Constraint::Length(1), // Status.
         ])
         .split(inner);
+
+        // Store list area for mouse item selection
+        self.list_area = Some(chunks[2]);
 
         // Render input line.
         self.render_input(frame, chunks[0]);
