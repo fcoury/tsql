@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Root configuration structure
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     /// Display settings
     pub display: DisplayConfig,
@@ -14,17 +15,6 @@ pub struct Config {
     pub connection: ConnectionConfig,
     /// Keymap customizations
     pub keymap: KeymapConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            display: DisplayConfig::default(),
-            editor: EditorConfig::default(),
-            connection: ConnectionConfig::default(),
-            keymap: KeymapConfig::default(),
-        }
-    }
 }
 
 /// Display-related settings

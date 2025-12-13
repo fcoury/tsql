@@ -268,15 +268,15 @@ impl StatusLineBuilder {
         self
     }
 
-    pub fn add(mut self, segment: StatusSegment) -> Self {
+    pub fn segment(mut self, segment: StatusSegment) -> Self {
         self.segments.push(segment);
         self
     }
 
     /// Add a segment only if the condition is true
-    pub fn add_if(self, condition: bool, segment: StatusSegment) -> Self {
+    pub fn segment_if(self, condition: bool, segment: StatusSegment) -> Self {
         if condition {
-            self.add(segment)
+            self.segment(segment)
         } else {
             self
         }
@@ -288,7 +288,7 @@ impl StatusLineBuilder {
         F: FnOnce(&str) -> StatusSegment,
     {
         if let Some(value) = option {
-            self.add(f(value.as_ref()))
+            self.segment(f(value.as_ref()))
         } else {
             self
         }
@@ -488,8 +488,8 @@ mod tests {
     #[test]
     fn test_status_line_builder_basic() {
         let line = StatusLineBuilder::new()
-            .add(StatusSegment::new("NORMAL", Priority::Critical))
-            .add(StatusSegment::new("localhost/db", Priority::High))
+            .segment(StatusSegment::new("NORMAL", Priority::Critical))
+            .segment(StatusSegment::new("localhost/db", Priority::High))
             .build(50);
 
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -500,8 +500,8 @@ mod tests {
     #[test]
     fn test_status_line_builder_priority_filtering() {
         let line = StatusLineBuilder::new()
-            .add(StatusSegment::new("CRITICAL", Priority::Critical))
-            .add(StatusSegment::new("LOW_PRIORITY_LONG_TEXT", Priority::Low))
+            .segment(StatusSegment::new("CRITICAL", Priority::Critical))
+            .segment(StatusSegment::new("LOW_PRIORITY_LONG_TEXT", Priority::Low))
             .build(20); // Not enough space for both
 
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -512,8 +512,8 @@ mod tests {
     #[test]
     fn test_status_line_builder_right_align() {
         let line = StatusLineBuilder::new()
-            .add(StatusSegment::new("LEFT", Priority::Critical))
-            .add(StatusSegment::new("RIGHT", Priority::Critical).right_align())
+            .segment(StatusSegment::new("LEFT", Priority::Critical))
+            .segment(StatusSegment::new("RIGHT", Priority::Critical).right_align())
             .build(30);
 
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -526,8 +526,8 @@ mod tests {
     #[test]
     fn test_status_line_builder_min_width() {
         let line = StatusLineBuilder::new()
-            .add(StatusSegment::new("ALWAYS", Priority::Critical))
-            .add(StatusSegment::new("WIDE_ONLY", Priority::Critical).min_width(100))
+            .segment(StatusSegment::new("ALWAYS", Priority::Critical))
+            .segment(StatusSegment::new("WIDE_ONLY", Priority::Critical).min_width(100))
             .build(50);
 
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();

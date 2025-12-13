@@ -230,8 +230,8 @@ impl<T: Clone> FuzzyPicker<T> {
     /// Render the picker as a centered popup.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Calculate popup size based on content.
-        let max_width = (area.width as usize * 80 / 100).max(40).min(100) as u16;
-        let max_height = (area.height as usize * 70 / 100).max(10).min(30) as u16;
+        let max_width = (area.width as usize * 80 / 100).clamp(40, 100) as u16;
+        let max_height = (area.height as usize * 70 / 100).clamp(10, 30) as u16;
 
         // Calculate actual width needed.
         let content_width = self

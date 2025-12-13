@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(cursor_col, 0, "cursor should be at column 0");
 
         // Highlighted lines might only have one line if the second is empty
-        let highlighted_lines = vec![Line::from("SELECT")];
+        let highlighted_lines = [Line::from("SELECT")];
 
         // The number of highlighted lines (1) is less than cursor_row + 1 (2)
         // This is the bug condition

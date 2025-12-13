@@ -37,18 +37,13 @@ pub enum JsonEditorAction {
 }
 
 /// Editor mode for vim-like keybindings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
     /// Normal mode - navigation and commands
     Normal,
     /// Insert mode - text input
+    #[default]
     Insert,
-}
-
-impl Default for EditorMode {
-    fn default() -> Self {
-        EditorMode::Insert // Start in insert mode as per user preference
-    }
 }
 
 /// A modal editor for JSON values with syntax highlighting and vim keybindings.

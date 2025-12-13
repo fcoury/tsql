@@ -234,6 +234,7 @@ pub struct QueryResult {
 /// - SELECT * FROM users
 /// - SELECT id, name FROM public.users
 /// - select * from "My Table"
+///
 /// Returns None for complex queries (JOINs, subqueries, etc.)
 fn extract_table_from_query(query: &str) -> Option<String> {
     let query = query.trim().to_lowercase();
@@ -1107,11 +1108,12 @@ impl App {
         }
 
         // Ctrl-c: cancel running query.
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            if self.db.running {
-                self.cancel_query();
-                return false;
-            }
+        if key.code == KeyCode::Char('c')
+            && key.modifiers == KeyModifiers::CONTROL
+            && self.db.running
+        {
+            self.cancel_query();
+            return false;
         }
 
         // Esc: cancel running query, or return to Normal, close help, dismiss errors.
@@ -1920,9 +1922,9 @@ impl App {
         };
 
         // Expand ~ to home directory
-        let expanded_path = if path.starts_with("~/") {
+        let expanded_path = if let Some(stripped) = path.strip_prefix("~/") {
             if let Some(home) = std::env::var_os("HOME") {
-                std::path::PathBuf::from(home).join(&path[2..])
+                std::path::PathBuf::from(home).join(stripped)
             } else {
                 std::path::PathBuf::from(path)
             }
@@ -3183,37 +3185,37 @@ impl App {
         // Build status line with priority-based segments
         let line = StatusLineBuilder::new()
             // Critical: Mode (always shown)
-            .add(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
+            .segment(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
             // Critical: Connection info
-            .add(
+            .segment(
                 StatusSegment::new(conn_segment, Priority::Critical)
                     .style(conn_style)
                     .min_width(40),
             )
             // High: Running indicator (if running)
-            .add_if(
+            .segment_if(
                 running_indicator.is_some(),
                 StatusSegment::new(running_indicator.unwrap_or_default(), Priority::High)
                     .style(Style::default().fg(Color::Yellow)),
             )
             // Medium: Row info
-            .add(StatusSegment::new(row_info, Priority::Medium).min_width(50))
+            .segment(StatusSegment::new(row_info, Priority::Medium).min_width(50))
             // Medium: Selection (if any selected)
-            .add_if(
+            .segment_if(
                 selection_info.is_some(),
                 StatusSegment::new(selection_info.unwrap_or_default(), Priority::Medium)
                     .style(Style::default().fg(Color::Cyan))
                     .min_width(60),
             )
             // Low: Query timing
-            .add_if(
+            .segment_if(
                 timing_info.is_some(),
                 StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
                     .style(Style::default().fg(Color::DarkGray))
                     .min_width(80),
             )
             // Right-aligned: Status message
-            .add(
+            .segment(
                 StatusSegment::new(status, Priority::Critical)
                     .style(status_style)
                     .right_align(),

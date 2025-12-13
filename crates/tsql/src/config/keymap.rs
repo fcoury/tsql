@@ -263,10 +263,8 @@ impl KeyBinding {
         let parts: Vec<&str> = s.split('+').collect();
 
         let mut modifiers = KeyModifiers::NONE;
-        let key_part;
-
-        if parts.len() == 1 {
-            key_part = parts[0];
+        let key_part = if parts.len() == 1 {
+            parts[0]
         } else {
             // Parse modifiers
             for part in &parts[..parts.len() - 1] {
@@ -277,8 +275,8 @@ impl KeyBinding {
                     _ => return None, // Unknown modifier
                 }
             }
-            key_part = parts[parts.len() - 1];
-        }
+            parts[parts.len() - 1]
+        };
 
         // Parse the key code
         let code = match key_part {
@@ -318,10 +316,11 @@ impl KeyBinding {
 
         Some(Self { code, modifiers })
     }
+}
 
-    /// Convert this key binding to a display string
-    pub fn to_string(&self) -> String {
-        let mut parts = Vec::new();
+impl std::fmt::Display for KeyBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts: Vec<&str> = Vec::new();
 
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             parts.push("Ctrl");
@@ -354,21 +353,10 @@ impl KeyBinding {
             _ => "?".to_string(),
         };
 
-        parts.push(&key);
-        // Avoid lifetime issue by collecting into a new string
-        let key_owned = key;
-        let mut result_parts: Vec<&str> = Vec::new();
-        if self.modifiers.contains(KeyModifiers::CONTROL) {
-            result_parts.push("Ctrl");
-        }
-        if self.modifiers.contains(KeyModifiers::ALT) {
-            result_parts.push("Alt");
-        }
-        if self.modifiers.contains(KeyModifiers::SHIFT) {
-            result_parts.push("Shift");
-        }
-        result_parts.push(&key_owned);
-        result_parts.join("+")
+        // Build the final string
+        let mut result_parts: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+        result_parts.push(key);
+        write!(f, "{}", result_parts.join("+"))
     }
 }
 

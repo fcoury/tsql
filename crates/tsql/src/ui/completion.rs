@@ -128,9 +128,7 @@ impl CompletionPopup {
             return Vec::new();
         }
 
-        let start = if total <= max_items {
-            0
-        } else if self.selected < max_items / 2 {
+        let start = if total <= max_items || self.selected < max_items / 2 {
             0
         } else if self.selected > total - max_items / 2 {
             total - max_items
@@ -191,11 +189,7 @@ impl SchemaCache {
         match context {
             CompletionContext::General => {
                 // Keywords + tables
-                items.extend(
-                    sql_keywords()
-                        .into_iter()
-                        .map(|k| CompletionItem::keyword(k)),
-                );
+                items.extend(sql_keywords().into_iter().map(CompletionItem::keyword));
                 for table in &self.tables {
                     items.push(CompletionItem::table(
                         table.name.clone(),
@@ -222,11 +216,7 @@ impl SchemaCache {
                         ));
                     }
                 }
-                items.extend(
-                    sql_keywords()
-                        .into_iter()
-                        .map(|k| CompletionItem::keyword(k)),
-                );
+                items.extend(sql_keywords().into_iter().map(CompletionItem::keyword));
             }
         }
 

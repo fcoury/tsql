@@ -138,8 +138,7 @@ impl GridSearch {
 
     /// Check if a cell is the current match.
     pub fn is_current_match(&self, row: usize, col: usize) -> bool {
-        self.current()
-            .map_or(false, |m| m.row == row && m.col == col)
+        self.current().is_some_and(|m| m.row == row && m.col == col)
     }
 
     /// Get match count info string.
@@ -871,7 +870,7 @@ impl GridModel {
             .max()
             .unwrap_or(0);
 
-        let optimal_width = header_width.max(max_data_width).max(3).min(100); // Between 3 and 100
+        let optimal_width = header_width.max(max_data_width).clamp(3, 100); // Between 3 and 100
 
         if let Some(width) = self.col_widths.get_mut(col) {
             *width = optimal_width;
@@ -884,7 +883,7 @@ impl GridModel {
     /// * `table` - The table name to use in the UPDATE statement
     /// * `row_indices` - The row indices to generate UPDATE statements for
     /// * `key_columns` - Optional list of column names to use in WHERE clause.
-    ///                   If None, all columns are used.
+    ///   If None, all columns are used.
     ///
     /// # Returns
     /// A string containing one UPDATE statement per row, separated by newlines.
@@ -985,7 +984,7 @@ impl GridModel {
     /// * `table` - The table name to use in the DELETE statement
     /// * `row_indices` - The row indices to generate DELETE statements for
     /// * `key_columns` - Optional list of column names to use in WHERE clause.
-    ///                   If None, all columns are used.
+    ///   If None, all columns are used.
     ///
     /// # Returns
     /// A string containing one DELETE statement per row, separated by newlines.
@@ -1308,6 +1307,7 @@ fn render_marker_cell(
     buf.set_string(x, y, s, style);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row_cells(
     mut x: u16,
     y: u16,
@@ -1360,6 +1360,7 @@ fn render_row_cells(
 }
 
 /// Render row cells with search highlighting and cursor column.
+#[allow(clippy::too_many_arguments)]
 fn render_row_cells_with_search(
     mut x: u16,
     y: u16,
@@ -1727,9 +1728,11 @@ mod tests {
 
         // Create state with cursor at rightmost column but col_offset at 0
         // This simulates the bug: cursor moved right but header hasn't scrolled
-        let mut state = GridState::default();
-        state.cursor_col = 4; // Last column
-        state.col_offset = 0; // Header would use this if not updated
+        let state = GridState {
+            cursor_col: 4, // Last column
+            col_offset: 0, // Header would use this if not updated
+            ..Default::default()
+        };
 
         let grid = DataGrid {
             model: &model,
@@ -1766,17 +1769,11 @@ mod tests {
         // The first column shown in header should match the first column shown in body
         // Extract first word from each
         let header_first_col: String = header_row
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or("")
             .to_string();
-        let body_first_col: String = body_row
-            .trim()
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let body_first_col: String = body_row.split_whitespace().next().unwrap_or("").to_string();
 
         // Get the column index from header (col1 -> 1, col2 -> 2, etc)
         let header_col_num: Option<u32> = header_first_col
@@ -1823,8 +1820,10 @@ mod tests {
 
     #[test]
     fn test_greater_than_key_widens_column() {
-        let mut state = GridState::default();
-        state.cursor_col = 1; // Move to second column
+        let mut state = GridState {
+            cursor_col: 1, // Move to second column
+            ..Default::default()
+        };
         let model = create_test_model();
 
         // Press '>' to widen the current column
@@ -2124,9 +2123,11 @@ mod tests {
 
     #[test]
     fn test_enter_key_opens_cell_editor() {
-        let mut state = GridState::default();
-        state.cursor_row = 1;
-        state.cursor_col = 1;
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
         let model = create_test_model();
 
         // Press Enter to edit the current cell

@@ -329,8 +329,8 @@ impl HelpPopup {
     /// Render the help popup centered on the screen.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Calculate popup size (80% width, 80% height, with min/max)
-        let width = (area.width * 80 / 100).max(60).min(100);
-        let height = (area.height * 85 / 100).max(20).min(50);
+        let width = (area.width * 80 / 100).clamp(60, 100);
+        let height = (area.height * 85 / 100).clamp(20, 50);
 
         let popup = centered_rect(width, height, area);
 
