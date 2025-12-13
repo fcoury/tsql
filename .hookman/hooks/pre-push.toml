@@ -1,0 +1,5 @@
+hook_type = "pre-push"
+
+[[commands]]
+id = "check-clippy"
+command = "./scripts/check-clippy.sh"

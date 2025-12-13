@@ -1,0 +1,6 @@
+hook_type = "pre-commit"
+
+[[commands]]
+id = "check-cargo-format"
+command = "./scripts/check-format.sh"
+

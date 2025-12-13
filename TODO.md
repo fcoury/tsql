@@ -4,13 +4,16 @@
 
 ### Big tasks
 
-- Connection picker vs. connection management: when we open the app with no connection as param, instead of showing the connection manager, we want to show a connection picker, reusing the picker we already have for queries.
-
 ### Minor tasks / fixes
+
+- The dw should only delete the next word (or from where we are to the end of the current word) but it's deleting the whole line. Deleting the whole line should be dd.
+- Add mouse support to the help popup and all the pickers
+
+## Done
 
 - The uuid fields look great but they should take less space when condensed by default (8 chars + the unicode ... instead of the literal one).
 
-## Done
+- Connection picker vs. connection management: when we open the app with no connection as param, instead of showing the connection manager, we want to show a connection picker, reusing the picker we already have for queries.
 
 - Ctrl+Enter while on the INSERT mode on the query editor should return to normal mode and run the query, instead nothing happens.
 - After adding the new connection I tried pressing a to create a new one, it didn't work
