@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "A modern, keyboard-first PostgreSQL CLI"
+keywords = ["postgresql", "postgres", "database", "cli", "tui"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "tsql"

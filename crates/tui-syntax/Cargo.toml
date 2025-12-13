@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Tree-sitter based syntax highlighting for TUI applications"
 keywords = ["syntax", "highlighting", "tree-sitter", "tui", "ratatui"]
 categories = ["text-processing", "command-line-interface"]
