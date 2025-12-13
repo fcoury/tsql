@@ -2809,6 +2809,56 @@ impl App {
                             self.editor.textarea.delete_line_by_head();
                             return;
                         }
+                        // dh - delete character left (like X)
+                        ('d', KeyCode::Char('h'), KeyModifiers::NONE) => {
+                            self.editor.textarea.delete_char();
+                            return;
+                        }
+                        // dl - delete character right (like x)
+                        ('d', KeyCode::Char('l'), KeyModifiers::NONE) => {
+                            self.editor.textarea.delete_next_char();
+                            return;
+                        }
+                        // dj - delete current line and line below
+                        ('d', KeyCode::Char('j'), KeyModifiers::NONE) => {
+                            self.editor.delete_line();
+                            self.editor.delete_line();
+                            return;
+                        }
+                        // dk - delete current line and line above
+                        ('d', KeyCode::Char('k'), KeyModifiers::NONE) => {
+                            self.editor.delete_line();
+                            self.editor.textarea.move_cursor(CursorMove::Up);
+                            self.editor.delete_line();
+                            return;
+                        }
+                        // dG - delete to end of file
+                        ('d', KeyCode::Char('G'), KeyModifiers::SHIFT)
+                        | ('d', KeyCode::Char('G'), KeyModifiers::NONE) => {
+                            // Delete from current line to end of file
+                            loop {
+                                let (row, _) = self.editor.textarea.cursor();
+                                let line_count = self.editor.textarea.lines().len();
+                                if line_count <= 1 {
+                                    // Clear the last line
+                                    self.editor.textarea.move_cursor(CursorMove::Head);
+                                    self.editor.textarea.delete_line_by_end();
+                                    break;
+                                }
+                                self.editor.delete_line();
+                                // Check if we're at the last line
+                                let new_row = self.editor.textarea.cursor().0;
+                                if new_row >= self.editor.textarea.lines().len().saturating_sub(1) {
+                                    self.editor.textarea.move_cursor(CursorMove::Head);
+                                    self.editor.textarea.delete_line_by_end();
+                                    break;
+                                }
+                                if row == new_row && row == 0 {
+                                    break;
+                                }
+                            }
+                            return;
+                        }
                         // cc - change line
                         ('c', KeyCode::Char('c'), KeyModifiers::NONE) => {
                             self.editor.change_line();
@@ -2842,6 +2892,33 @@ impl App {
                         // c0 - change to start of line
                         ('c', KeyCode::Char('0'), KeyModifiers::NONE) => {
                             self.editor.textarea.delete_line_by_head();
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        // ch - change character left
+                        ('c', KeyCode::Char('h'), KeyModifiers::NONE) => {
+                            self.editor.textarea.delete_char();
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        // cl - change character right (like s)
+                        ('c', KeyCode::Char('l'), KeyModifiers::NONE) => {
+                            self.editor.textarea.delete_next_char();
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        // cj - change current line and line below
+                        ('c', KeyCode::Char('j'), KeyModifiers::NONE) => {
+                            self.editor.delete_line();
+                            self.editor.change_line();
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        // ck - change current line and line above
+                        ('c', KeyCode::Char('k'), KeyModifiers::NONE) => {
+                            self.editor.delete_line();
+                            self.editor.textarea.move_cursor(CursorMove::Up);
+                            self.editor.change_line();
                             self.mode = Mode::Insert;
                             return;
                         }
