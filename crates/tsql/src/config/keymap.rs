@@ -98,6 +98,13 @@ pub enum Action {
 
     // Sidebar
     ToggleSidebar,
+
+    // Goto sequences (triggered by g + key)
+    GotoFirst,
+    GotoEditor,
+    GotoConnections,
+    GotoTables,
+    GotoResults,
 }
 
 impl Action {
@@ -168,6 +175,11 @@ impl Action {
             Action::TestConnection => "Test connection",
             Action::ClearField => "Clear current field",
             Action::ToggleSidebar => "Toggle sidebar",
+            Action::GotoFirst => "Go to first row/document start",
+            Action::GotoEditor => "Go to query editor",
+            Action::GotoConnections => "Go to connections sidebar",
+            Action::GotoTables => "Go to tables/schema sidebar",
+            Action::GotoResults => "Go to results grid",
         }
     }
 }
@@ -269,6 +281,13 @@ impl FromStr for Action {
 
             // Sidebar
             "toggle_sidebar" => Ok(Action::ToggleSidebar),
+
+            // Goto sequences
+            "goto_first" => Ok(Action::GotoFirst),
+            "goto_editor" => Ok(Action::GotoEditor),
+            "goto_connections" => Ok(Action::GotoConnections),
+            "goto_tables" => Ok(Action::GotoTables),
+            "goto_results" => Ok(Action::GotoResults),
 
             _ => Err(format!("Unknown action: {}", s)),
         }

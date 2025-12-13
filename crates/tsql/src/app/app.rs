@@ -32,9 +32,10 @@ use crate::ui::{
     ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
     ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker,
     GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
-    JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction,
-    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
-    StatusLineBuilder, StatusSegment, TableInfo,
+    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceHandler,
+    KeySequenceResult, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
+    RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder,
+    StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -558,6 +559,8 @@ pub struct App {
     pub completion: CompletionPopup,
     pub schema_cache: SchemaCache,
     pub pending_key: Option<char>,
+    /// Key sequence handler for multi-key commands like `gg`, `gc`, etc.
+    pub key_sequence: KeySequenceHandler,
     /// Editor scroll offset (row, col) for horizontal scrolling support.
     pub editor_scroll: (u16, u16),
 
@@ -663,6 +666,7 @@ impl App {
         let editor_normal_keymap = Self::build_editor_normal_keymap(&config);
         let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
         let connection_form_keymap = Self::build_connection_form_keymap(&config);
+        let key_sequence_timeout_ms = config.keymap.key_sequence_timeout_ms;
 
         let mut app = Self {
             focus: Focus::Query,
@@ -683,6 +687,7 @@ impl App {
             completion: CompletionPopup::new(),
             schema_cache: SchemaCache::new(),
             pending_key: None,
+            key_sequence: KeySequenceHandler::new(key_sequence_timeout_ms),
             editor_scroll: (0, 0),
 
             rt,
@@ -1362,6 +1367,14 @@ impl App {
                     form.render(frame, size);
                 }
 
+                // Render key hint popup if active (shows after timeout when 'g' is pending)
+                if self.key_sequence.should_show_hint() {
+                    if let Some(pending_key) = self.key_sequence.pending() {
+                        let hint_popup = KeyHintPopup::new(pending_key);
+                        hint_popup.render(frame, size);
+                    }
+                }
+
                 // Render confirmation prompt if active (topmost layer)
                 if let Some(ref prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
@@ -1567,6 +1580,51 @@ impl App {
             }
         }
 
+        // Handle key sequences (e.g., gg, gc, gt, ge, gr) in Normal mode
+        if self.mode == Mode::Normal {
+            // If there's a pending key sequence, process the second key
+            if self.key_sequence.is_waiting() {
+                if let KeyCode::Char(c) = key.code {
+                    if key.modifiers == KeyModifiers::NONE {
+                        let result = self.key_sequence.process_second_key(c);
+                        match result {
+                            KeySequenceResult::Completed(action) => {
+                                self.execute_key_sequence_action(action);
+                                return false;
+                            }
+                            KeySequenceResult::Cancelled => {
+                                // Invalid second key - cancel and let it fall through
+                                // (but it was already cancelled by process_second_key)
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Modifier key pressed - cancel sequence
+                        self.key_sequence.cancel();
+                    }
+                } else if key.code == KeyCode::Esc {
+                    // Esc cancels the pending sequence
+                    self.key_sequence.cancel();
+                    return false;
+                } else {
+                    // Non-char key pressed - cancel sequence
+                    self.key_sequence.cancel();
+                }
+            }
+
+            // Start a new key sequence for 'g' key (only when no sequence is pending)
+            if !self.key_sequence.is_waiting() {
+                if let KeyCode::Char('g') = key.code {
+                    if key.modifiers == KeyModifiers::NONE {
+                        let result = self.key_sequence.process_first_key('g');
+                        if matches!(result, KeySequenceResult::Started(_)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
@@ -1722,6 +1780,11 @@ impl App {
                         }
                         GridKeyResult::StatusMessage(msg) => {
                             self.last_status = Some(msg);
+                        }
+                        GridKeyResult::GotoFirstRow => {
+                            // This shouldn't happen anymore since we handle 'g' at the app level,
+                            // but handle it for completeness
+                            self.grid_state.cursor_row = 0;
                         }
                         GridKeyResult::None => {}
                     }
@@ -3776,6 +3839,47 @@ impl App {
             PickerAction::Cancelled => {
                 self.connection_picker = None;
                 false
+            }
+        }
+    }
+
+    /// Execute an action from a completed key sequence.
+    fn execute_key_sequence_action(&mut self, action: KeySequenceAction) {
+        match action {
+            KeySequenceAction::GotoFirst => {
+                // Go to first row in grid, or document start in editor
+                match self.focus {
+                    Focus::Grid => {
+                        self.grid_state.cursor_row = 0;
+                    }
+                    Focus::Query => {
+                        // Move to document start
+                        self.editor.textarea.move_cursor(CursorMove::Top);
+                        self.editor.textarea.move_cursor(CursorMove::Head);
+                    }
+                    Focus::Sidebar(_) => {
+                        // In sidebar, just go to first item (connections section)
+                        self.sidebar_focus = SidebarSection::Connections;
+                        self.focus = Focus::Sidebar(SidebarSection::Connections);
+                        self.sidebar.select_first_connection();
+                    }
+                }
+            }
+            KeySequenceAction::GotoEditor => {
+                self.focus = Focus::Query;
+            }
+            KeySequenceAction::GotoConnections => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Connections;
+                self.focus = Focus::Sidebar(SidebarSection::Connections);
+            }
+            KeySequenceAction::GotoTables => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Schema;
+                self.focus = Focus::Sidebar(SidebarSection::Schema);
+            }
+            KeySequenceAction::GotoResults => {
+                self.focus = Focus::Grid;
             }
         }
     }
