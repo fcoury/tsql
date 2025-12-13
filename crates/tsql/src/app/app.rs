@@ -593,6 +593,8 @@ pub struct App {
     pub connections: ConnectionsFile,
     /// Name of the currently connected connection (if from saved connections).
     pub current_connection_name: Option<String>,
+    /// Connection picker (fuzzy picker for quick connection selection).
+    pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
     pub connection_manager: Option<ConnectionManagerModal>,
     /// Connection form modal (when open, for add/edit).
@@ -690,6 +692,7 @@ impl App {
 
             connections: ConnectionsFile::new(),
             current_connection_name: None,
+            connection_picker: None,
             connection_manager: None,
             connection_form: None,
         };
@@ -709,16 +712,16 @@ impl App {
                     app.connect_to_entry(entry.clone());
                 } else {
                     app.last_error = Some(format!("Unknown connection: {}", url));
-                    // Open connection manager so user can add/select
-                    app.open_connection_manager();
+                    // Open connection picker so user can select (falls back to manager if empty)
+                    app.open_connection_picker();
                 }
             } else {
                 // It's a URL, connect directly
                 app.start_connect(url);
             }
         } else {
-            // No URL specified - open connection manager (works for both empty and populated lists)
-            app.open_connection_manager();
+            // No URL specified - open connection picker (falls back to manager if empty)
+            app.open_connection_picker();
         }
 
         app
@@ -968,6 +971,11 @@ impl App {
 
                 // Render history picker if open
                 if let Some(ref mut picker) = self.history_picker {
+                    picker.render(frame, size);
+                }
+
+                // Render connection picker if open
+                if let Some(ref mut picker) = self.connection_picker {
                     picker.render(frame, size);
                 }
 
@@ -1383,6 +1391,11 @@ impl App {
             return self.handle_history_picker_key(key);
         }
 
+        // Handle connection picker when open
+        if self.connection_picker.is_some() {
+            return self.handle_connection_picker_key(key);
+        }
+
         if self.search.active {
             self.handle_search_key(key);
             return false;
@@ -1593,6 +1606,7 @@ impl App {
             || self.row_detail.is_some()
             || self.help_popup.is_some()
             || self.history_picker.is_some()
+            || self.connection_picker.is_some()
         {
             return;
         }
@@ -3255,6 +3269,67 @@ impl App {
         self.start_connect(url);
     }
 
+    /// Open the connection picker (fuzzy finder for quick connection selection).
+    fn open_connection_picker(&mut self) {
+        // Reload connections from disk to pick up changes from other instances
+        if let Ok(connections) = load_connections() {
+            self.connections = connections;
+        }
+
+        // If no connections, open the full manager instead
+        if self.connections.connections.is_empty() {
+            self.open_connection_manager();
+            return;
+        }
+
+        // Get sorted connections (favorites first, then alphabetical)
+        // Clone them since FuzzyPicker needs owned values
+        let entries: Vec<ConnectionEntry> = self.connections.sorted().into_iter().cloned().collect();
+
+        let picker = FuzzyPicker::with_display(
+            entries,
+            "Connect (Ctrl+O: manage)",
+            |entry| {
+                // Display: "[fav] name - user@host/db"
+                let fav = entry
+                    .favorite
+                    .map(|f| format!("[{}] ", f))
+                    .unwrap_or_default();
+                format!("{}{} - {}", fav, entry.name, entry.short_display())
+            },
+        );
+
+        self.connection_picker = Some(picker);
+    }
+
+    /// Handle key events when connection picker is open.
+    fn handle_connection_picker_key(&mut self, key: KeyEvent) -> bool {
+        // Check for Ctrl+O to open connection manager
+        if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
+            self.connection_picker = None;
+            self.open_connection_manager();
+            return false;
+        }
+
+        let picker = match self.connection_picker.as_mut() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        match picker.handle_key(key) {
+            PickerAction::Continue => false,
+            PickerAction::Selected(entry) => {
+                self.connection_picker = None;
+                self.connect_to_entry(entry);
+                false
+            }
+            PickerAction::Cancelled => {
+                self.connection_picker = None;
+                false
+            }
+        }
+    }
+
     /// Open the connection manager modal.
     fn open_connection_manager(&mut self) {
         // Reload connections from disk to pick up changes from other instances
@@ -4736,16 +4811,18 @@ mod tests {
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
-        // Clear any existing connections to avoid conflicts
+        // Clear any existing connections and pickers to set up clean state
         app.connections = ConnectionsFile::new();
-        if let Some(ref mut manager) = app.connection_manager {
-            manager.update_connections(&app.connections);
-        }
+        app.connection_picker = None;
+        app.connection_manager = None;
 
-        // App starts with connection manager open (no connection provided)
+        // Open connection manager (since we have no connections)
+        app.open_connection_manager();
+
+        // App should now have connection manager open
         assert!(
             app.connection_manager.is_some(),
-            "Connection manager should be open on startup"
+            "Connection manager should be open"
         );
         assert!(
             app.connection_form.is_none(),
@@ -4817,6 +4894,10 @@ mod tests {
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
+        // Clear any pickers
+        app.connection_picker = None;
+        app.connection_manager = None;
+
         // Add a connection to edit
         let entry = ConnectionEntry {
             name: "editme".to_string(),
@@ -4829,10 +4910,11 @@ mod tests {
         app.connections = ConnectionsFile::new();
         app.connections.add(entry.clone()).unwrap();
 
-        // Update the manager with the new connection
-        if let Some(ref mut manager) = app.connection_manager {
-            manager.update_connections(&app.connections);
-        }
+        // Create manager directly without reload from disk
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
 
         // Press 'e' to edit the selected connection
         let key_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
@@ -4878,6 +4960,11 @@ mod tests {
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
+        // Clear any existing state and explicitly open the manager
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.open_connection_manager();
+
         // Connection manager is open
         assert!(app.connection_manager.is_some());
 
@@ -4902,6 +4989,11 @@ mod tests {
             .unwrap();
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Clear any existing state and open the manager
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.open_connection_manager();
 
         // Open the add form
         let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -4947,6 +5039,11 @@ mod tests {
             .unwrap();
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Clear any existing state and open the manager
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.open_connection_manager();
 
         // Open the add form
         let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
