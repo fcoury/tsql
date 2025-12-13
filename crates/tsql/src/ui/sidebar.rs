@@ -53,6 +53,7 @@ impl Sidebar {
     }
 
     /// Render the sidebar with both connections and schema sections
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         frame: &mut Frame,
