@@ -7,6 +7,7 @@ A modern, keyboard-first PostgreSQL CLI with a TUI interface.
 [![License](https://img.shields.io/crates/l/tsql.svg)](LICENSE)
 
 ![tsql screenshot](assets/screenshot.png)
+![tsql json editor](assets/screenshot2.png)
 
 ## Features
 
@@ -65,58 +66,58 @@ Once connected:
 
 ### Global
 
-| Key | Action |
-|-----|--------|
+| Key   | Action                                             |
+| ----- | -------------------------------------------------- |
 | `Tab` | Switch focus between query editor and results grid |
-| `?` | Toggle help popup |
-| `q` | Quit application |
-| `Esc` | Return to normal mode / close popups |
+| `?`   | Toggle help popup                                  |
+| `q`   | Quit application                                   |
+| `Esc` | Return to normal mode / close popups               |
 
 ### Query Editor (Normal Mode)
 
-| Key | Action |
-|-----|--------|
-| `h/j/k/l` | Move cursor |
-| `i/a/I/A` | Enter insert mode |
-| `o/O` | Open line below/above |
-| `dd` | Delete line |
-| `yy` | Yank (copy) line |
-| `p/P` | Paste after/before |
-| `u` | Undo |
-| `Ctrl-r` | Redo |
-| `/` | Search |
-| `Enter` | Execute query |
-| `:` | Command mode |
+| Key       | Action                |
+| --------- | --------------------- |
+| `h/j/k/l` | Move cursor           |
+| `i/a/I/A` | Enter insert mode     |
+| `o/O`     | Open line below/above |
+| `dd`      | Delete line           |
+| `yy`      | Yank (copy) line      |
+| `p/P`     | Paste after/before    |
+| `u`       | Undo                  |
+| `Ctrl-r`  | Redo                  |
+| `/`       | Search                |
+| `Enter`   | Execute query         |
+| `:`       | Command mode          |
 
 ### Results Grid
 
-| Key | Action |
-|-----|--------|
-| `h/j/k/l` | Navigate cells |
-| `H/L` | Scroll horizontally |
-| `gg/G` | First/last row |
-| `Space` | Toggle row selection |
-| `y` | Copy row |
-| `c` | Copy cell |
-| `e` | Edit cell |
-| `/` | Search in results |
-| `+/-` | Widen/narrow column |
-| `=` | Auto-fit column |
+| Key       | Action               |
+| --------- | -------------------- |
+| `h/j/k/l` | Navigate cells       |
+| `H/L`     | Scroll horizontally  |
+| `gg/G`    | First/last row       |
+| `Space`   | Toggle row selection |
+| `y`       | Copy row             |
+| `c`       | Copy cell            |
+| `e`       | Edit cell            |
+| `/`       | Search in results    |
+| `+/-`     | Widen/narrow column  |
+| `=`       | Auto-fit column      |
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `:connect <url>` | Connect to database |
-| `:disconnect` | Disconnect |
-| `:export csv\|json\|tsv <path>` | Export results |
-| `:q` / `:quit` | Quit |
-| `:\dt` | List tables |
-| `:\d <table>` | Describe table |
-| `:\dn` | List schemas |
-| `:\di` | List indexes |
-| `:\l` | List databases |
-| `:\du` | List roles |
+| Command                         | Description         |
+| ------------------------------- | ------------------- |
+| `:connect <url>`                | Connect to database |
+| `:disconnect`                   | Disconnect          |
+| `:export csv\|json\|tsv <path>` | Export results      |
+| `:q` / `:quit`                  | Quit                |
+| `:\dt`                          | List tables         |
+| `:\d <table>`                   | Describe table      |
+| `:\dn`                          | List schemas        |
+| `:\di`                          | List indexes        |
+| `:\l`                           | List databases      |
+| `:\du`                          | List roles          |
 
 ## Configuration
 
