@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
@@ -1154,6 +1154,7 @@ pub struct DataGrid<'a> {
     pub state: &'a GridState,
     pub focused: bool,
     pub show_row_numbers: bool,
+    pub show_scrollbar: bool,
 }
 
 impl<'a> Widget for DataGrid<'a> {
@@ -1313,6 +1314,29 @@ impl<'a> Widget for DataGrid<'a> {
                 &self.state.search,
                 buf,
             );
+        }
+
+        // Render scrollbar if enabled and there are rows to scroll
+        if self.show_scrollbar && self.model.rows.len() > body_area.height as usize {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("░"));
+
+            let mut scrollbar_state = ScrollbarState::new(self.model.rows.len())
+                .position(self.state.cursor_row)
+                .viewport_content_length(body_area.height as usize);
+
+            // Render scrollbar on the right edge of the body area
+            let scrollbar_area = Rect {
+                x: body_area.x + body_area.width.saturating_sub(1),
+                y: body_area.y,
+                width: 1,
+                height: body_area.height,
+            };
+
+            scrollbar.render(scrollbar_area, buf, &mut scrollbar_state);
         }
     }
 }
@@ -1834,6 +1858,7 @@ mod tests {
             state: &state,
             focused: true,
             show_row_numbers: false,
+            show_scrollbar: false,
         };
 
         // Render to a small buffer (narrow viewport)

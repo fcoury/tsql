@@ -832,6 +832,7 @@ impl App {
                     state: &self.grid_state,
                     focused: self.focus == Focus::Grid,
                     show_row_numbers: self.config.display.show_row_numbers,
+                    show_scrollbar: true,
                 };
                 frame.render_widget(grid_widget, grid_area);
 

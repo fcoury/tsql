@@ -1,0 +1,3 @@
+- Fix the coloring of the # column on the selected line: the foreground is the same color as the background, making it invisible.
+- Use Ctrl+Enter to run the current query regardless of which state vim editor is on and which panel is focused.
+- When we use y (yank) in the editor, we should copy the selected text to the system clipboard so that it can be pasted outside the application.
