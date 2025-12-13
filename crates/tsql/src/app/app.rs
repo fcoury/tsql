@@ -1608,6 +1608,20 @@ impl App {
                     };
                     return false;
                 }
+                (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                    self.focus = match self.focus {
+                        Focus::Query => {
+                            if self.sidebar_visible {
+                                Focus::Sidebar(SidebarSection::Schema)
+                            } else {
+                                Focus::Grid
+                            }
+                        }
+                        Focus::Grid => Focus::Query,
+                        Focus::Sidebar(_) => Focus::Grid,
+                    };
+                    return false;
+                }
                 // Ctrl+B: Toggle sidebar
                 (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                     self.sidebar_visible = !self.sidebar_visible;
