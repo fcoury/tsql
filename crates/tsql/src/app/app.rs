@@ -16,15 +16,19 @@ use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
 use super::state::{DbStatus, Focus, Mode, SearchTarget};
-use crate::config::{Action, Config, KeyBinding, Keymap};
+use crate::config::{
+    load_connections, save_connections, Action, Config, ConnectionEntry, ConnectionsFile,
+    KeyBinding, Keymap,
+};
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
     quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
-    ConfirmPrompt, ConfirmResult, ConnectionInfo, DataGrid, FuzzyPicker, GridKeyResult, GridModel,
-    GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction, JsonEditorModal,
-    PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
-    SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
+    ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
+    ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
+    GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
+    JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
+    RowDetailModal, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -305,6 +309,8 @@ pub enum DbEvent {
         col: usize,
         value: String,
     },
+    /// Result of a connection test (from connection form).
+    TestConnectionResult { success: bool, message: String },
 }
 
 pub struct DbSession {
@@ -580,6 +586,15 @@ pub struct App {
     render_query_area: Option<Rect>,
     /// Last rendered area for results grid (for mouse click handling).
     render_grid_area: Option<Rect>,
+
+    /// Saved database connections.
+    pub connections: ConnectionsFile,
+    /// Name of the currently connected connection (if from saved connections).
+    pub current_connection_name: Option<String>,
+    /// Connection manager modal (when open).
+    pub connection_manager: Option<ConnectionManagerModal>,
+    /// Connection form modal (when open, for add/edit).
+    pub connection_form: Option<ConnectionFormModal>,
 }
 
 impl App {
@@ -668,11 +683,38 @@ impl App {
 
             render_query_area: None,
             render_grid_area: None,
+
+            connections: ConnectionsFile::new(),
+            current_connection_name: None,
+            connection_manager: None,
+            connection_form: None,
         };
 
-        // Auto-connect if connection string provided
+        // Load saved connections
+        app.connections = load_connections().unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to load connections: {}", e);
+            ConnectionsFile::new()
+        });
+
+        // Handle connection on startup
         if let Some(url) = effective_conn_str {
-            app.start_connect(url);
+            // Check if this looks like a connection name (no :// scheme)
+            if !url.contains("://") {
+                // Try to find a connection by name
+                if let Some(entry) = app.connections.find_by_name(&url) {
+                    app.connect_to_entry(entry.clone());
+                } else {
+                    app.last_error = Some(format!("Unknown connection: {}", url));
+                    // Open connection manager so user can add/select
+                    app.open_connection_manager();
+                }
+            } else {
+                // It's a URL, connect directly
+                app.start_connect(url);
+            }
+        } else {
+            // No URL specified - open connection manager (works for both empty and populated lists)
+            app.open_connection_manager();
         }
 
         app
@@ -1191,6 +1233,16 @@ impl App {
                     row_detail.render(frame, size);
                 }
 
+                // Render connection manager modal if active
+                if let Some(ref mut manager) = self.connection_manager {
+                    manager.render(frame, size);
+                }
+
+                // Render connection form modal if active (on top of manager)
+                if let Some(ref form) = self.connection_form {
+                    form.render(frame, size);
+                }
+
                 // Render confirmation prompt if active (topmost layer)
                 if let Some(ref prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
@@ -1246,6 +1298,20 @@ impl App {
         // Handle JSON editor when active - it captures all input
         if self.json_editor.is_some() {
             return self.handle_json_editor_key(key);
+        }
+
+        // Handle connection form when active - it captures all input
+        if self.connection_form.is_some() {
+            let action = self.connection_form.as_mut().unwrap().handle_key(key);
+            self.handle_connection_form_action(action);
+            return false;
+        }
+
+        // Handle connection manager when active - it captures all input
+        if self.connection_manager.is_some() {
+            let action = self.connection_manager.as_mut().unwrap().handle_key(key);
+            self.handle_connection_manager_action(action);
+            return false;
         }
 
         // Ctrl-c: cancel running query.
@@ -1377,6 +1443,12 @@ impl App {
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
+                // Ctrl+Shift+C: Open connection manager
+                (KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                | (KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                    self.open_connection_manager();
+                    return false;
+                }
                 (KeyCode::Char('q'), KeyModifiers::NONE) => {
                     // Always show confirmation prompt, with different message based on unsaved changes
                     if self.editor.is_modified() {
@@ -1714,6 +1786,33 @@ impl App {
             ConfirmContext::QuitApp | ConfirmContext::QuitAppClean => {
                 true // Quit the application
             }
+            ConfirmContext::DeleteConnection { name } => {
+                // Delete the connection
+                if let Err(e) = self.connections.remove(&name) {
+                    self.last_error = Some(format!("Failed to delete: {}", e));
+                } else {
+                    // Also try to delete password from keychain
+                    if let Some(entry) = self.connections.find_by_name(&name) {
+                        let _ = entry.delete_password_from_keychain();
+                    }
+                    if let Err(e) = save_connections(&self.connections) {
+                        self.last_error = Some(format!("Failed to save: {}", e));
+                    } else {
+                        self.last_status = Some(format!("Connection '{}' deleted", name));
+                    }
+                    // Update manager if open
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.update_connections(&self.connections);
+                    }
+                }
+                false
+            }
+            ConfirmContext::CloseConnectionForm => {
+                // Close the connection form without saving
+                self.connection_form = None;
+                self.last_status = Some("Changes discarded".to_string());
+                false
+            }
         }
     }
 
@@ -1731,6 +1830,14 @@ impl App {
             ConfirmContext::QuitApp | ConfirmContext::QuitAppClean => {
                 // Stay in the app
                 self.last_status = Some("Quit cancelled".to_string());
+            }
+            ConfirmContext::DeleteConnection { .. } => {
+                // Cancelled delete, nothing to do
+                self.last_status = Some("Delete cancelled".to_string());
+            }
+            ConfirmContext::CloseConnectionForm => {
+                // Keep the form open
+                self.last_status = Some("Continuing edit".to_string());
             }
         }
     }
@@ -2177,6 +2284,9 @@ impl App {
             }
             "history" => {
                 self.open_history_picker();
+            }
+            "connections" | "conn" => {
+                self.open_connection_manager();
             }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
@@ -3107,6 +3217,179 @@ impl App {
         });
     }
 
+    /// Connect to a saved connection entry.
+    fn connect_to_entry(&mut self, entry: ConnectionEntry) {
+        // Try to get the password
+        let password = match entry.get_password() {
+            Ok(Some(pwd)) => Some(pwd),
+            Ok(None) => None,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to get password: {}", e));
+                None
+            }
+        };
+
+        // Build the connection URL
+        let url = entry.to_url(password.as_deref());
+        self.current_connection_name = Some(entry.name.clone());
+        self.start_connect(url);
+    }
+
+    /// Open the connection manager modal.
+    fn open_connection_manager(&mut self) {
+        self.connection_manager = Some(ConnectionManagerModal::new(
+            &self.connections,
+            self.current_connection_name.clone(),
+        ));
+    }
+
+    /// Handle connection manager actions.
+    fn handle_connection_manager_action(&mut self, action: ConnectionManagerAction) {
+        match action {
+            ConnectionManagerAction::Continue => {}
+            ConnectionManagerAction::Close => {
+                self.connection_manager = None;
+            }
+            ConnectionManagerAction::Connect { entry } => {
+                self.connection_manager = None;
+                self.connect_to_entry(entry);
+            }
+            ConnectionManagerAction::Add => {
+                self.connection_form = Some(ConnectionFormModal::new());
+            }
+            ConnectionManagerAction::Edit { entry } => {
+                // Try to get existing password for editing
+                let password = entry.get_password().ok().flatten();
+                self.connection_form = Some(ConnectionFormModal::edit(&entry, password));
+            }
+            ConnectionManagerAction::Delete { name } => {
+                // Show confirmation for delete
+                self.confirm_prompt = Some(ConfirmPrompt::new(
+                    format!("Delete connection '{}'?", name),
+                    ConfirmContext::DeleteConnection { name },
+                ));
+            }
+            ConnectionManagerAction::SetFavorite { name, current } => {
+                // For now, just toggle or cycle favorites
+                // TODO: Could show a picker for 1-9
+                let new_favorite = match current {
+                    Some(f) if f < 9 => Some(f + 1),
+                    Some(_) => None, // Was 9, clear it
+                    None => Some(1),
+                };
+                if let Err(e) = self.connections.set_favorite(&name, new_favorite) {
+                    self.last_error = Some(format!("Failed to set favorite: {}", e));
+                } else {
+                    // Save and update the manager
+                    if let Err(e) = save_connections(&self.connections) {
+                        self.last_error = Some(format!("Failed to save connections: {}", e));
+                    }
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.update_connections(&self.connections);
+                    }
+                }
+            }
+            ConnectionManagerAction::StatusMessage(msg) => {
+                self.last_status = Some(msg);
+            }
+        }
+    }
+
+    /// Handle connection form actions.
+    fn handle_connection_form_action(&mut self, action: ConnectionFormAction) {
+        match action {
+            ConnectionFormAction::Continue => {}
+            ConnectionFormAction::Cancel => {
+                self.connection_form = None;
+            }
+            ConnectionFormAction::Save {
+                entry,
+                password,
+                save_password,
+                original_name,
+            } => {
+                // Handle add vs edit
+                let result = if let Some(ref orig) = original_name {
+                    self.connections.update(orig, entry.clone())
+                } else {
+                    self.connections.add(entry.clone())
+                };
+
+                match result {
+                    Ok(()) => {
+                        // Save password to keychain if requested
+                        if save_password {
+                            if let Some(ref pwd) = password {
+                                if let Err(e) = entry.set_password_in_keychain(pwd) {
+                                    self.last_error =
+                                        Some(format!("Failed to save password: {}", e));
+                                }
+                            }
+                        }
+
+                        // Save connections file
+                        if let Err(e) = save_connections(&self.connections) {
+                            self.last_error = Some(format!("Failed to save connections: {}", e));
+                        } else {
+                            self.last_status = Some(format!(
+                                "Connection '{}' {}",
+                                entry.name,
+                                if original_name.is_some() {
+                                    "updated"
+                                } else {
+                                    "added"
+                                }
+                            ));
+                        }
+
+                        // Close form and update manager
+                        self.connection_form = None;
+                        if let Some(ref mut manager) = self.connection_manager {
+                            manager.update_connections(&self.connections);
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to save connection: {}", e));
+                    }
+                }
+            }
+            ConnectionFormAction::TestConnection { entry, password } => {
+                // Build URL and test
+                let url = entry.to_url(password.as_deref());
+                self.last_status = Some(format!("Testing connection to {}...", entry.host));
+
+                let tx = self.db_events_tx.clone();
+                self.rt.spawn(async move {
+                    match tokio_postgres::connect(&url, NoTls).await {
+                        Ok((client, _)) => {
+                            drop(client);
+                            let _ = tx.send(DbEvent::TestConnectionResult {
+                                success: true,
+                                message: "Connection successful!".to_string(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::TestConnectionResult {
+                                success: false,
+                                message: format!("Connection failed: {}", format_pg_error(&e)),
+                            });
+                        }
+                    }
+                });
+            }
+            ConnectionFormAction::StatusMessage(msg) => {
+                self.last_status = Some(msg);
+            }
+            ConnectionFormAction::RequestClose => {
+                // Show confirmation prompt for unsaved changes
+                self.confirm_prompt = Some(ConfirmPrompt::new(
+                    "You have unsaved changes. Discard them?",
+                    ConfirmContext::CloseConnectionForm,
+                ));
+            }
+        }
+    }
+
     fn load_schema(&mut self) {
         let Some(client) = self.db.client.clone() else {
             return;
@@ -3501,6 +3784,14 @@ impl App {
                     }
                 }
                 self.last_status = Some("Cell updated successfully".to_string());
+            }
+            DbEvent::TestConnectionResult { success, message } => {
+                if success {
+                    self.last_status = Some(message);
+                    self.last_error = None;
+                } else {
+                    self.last_error = Some(message);
+                }
             }
         }
     }
@@ -4327,6 +4618,9 @@ mod tests {
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
+        // Close connection manager that auto-opens when no connection provided
+        app.connection_manager = None;
+
         // Set focus to Grid and mode to Normal
         app.focus = Focus::Grid;
         app.mode = Mode::Normal;
@@ -4370,6 +4664,9 @@ mod tests {
         .with_source_table(Some("users".to_string()));
 
         let mut app = App::new(grid, rt.handle().clone(), tx, rx, None);
+
+        // Close connection manager that auto-opens when no connection provided
+        app.connection_manager = None;
 
         // Set focus to Grid and mode to Normal
         app.focus = Focus::Grid;

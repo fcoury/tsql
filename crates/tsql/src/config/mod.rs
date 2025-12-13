@@ -6,9 +6,14 @@
 //! - Environment variables
 //! - Command-line arguments (future)
 
+mod connections;
 mod keymap;
 mod schema;
 
+pub use connections::{
+    connections_path, load_connections, save_connections, ConnectionColor, ConnectionEntry,
+    ConnectionsFile,
+};
 pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{
     Config, ConnectionConfig, CustomKeyBinding, DisplayConfig, EditorConfig, KeymapConfig,

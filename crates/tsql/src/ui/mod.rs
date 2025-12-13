@@ -1,5 +1,7 @@
 mod completion;
 mod confirm_prompt;
+mod connection_form;
+mod connection_manager;
 mod editor;
 pub mod fuzzy_picker;
 mod grid;
@@ -14,6 +16,8 @@ pub use completion::{
     CompletionKind, CompletionPopup, SchemaCache, TableInfo,
 };
 pub use confirm_prompt::{ConfirmContext, ConfirmPrompt, ConfirmResult};
+pub use connection_form::{ConnectionFormAction, ConnectionFormModal, FormField};
+pub use connection_manager::{ConnectionManagerAction, ConnectionManagerModal};
 pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
 pub use fuzzy_picker::{FilteredItem, FuzzyPicker, PickerAction};
 pub use grid::{

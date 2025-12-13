@@ -35,6 +35,10 @@ pub enum ConfirmContext {
     QuitApp,
     /// Quitting application without unsaved changes (clean quit).
     QuitAppClean,
+    /// Deleting a saved connection.
+    DeleteConnection { name: String },
+    /// Closing connection form with unsaved changes.
+    CloseConnectionForm,
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -83,8 +87,10 @@ impl ConfirmPrompt {
         match self.context {
             ConfirmContext::CloseJsonEditor { .. }
             | ConfirmContext::CloseCellEditor { .. }
-            | ConfirmContext::QuitApp => " Unsaved Changes ",
+            | ConfirmContext::QuitApp
+            | ConfirmContext::CloseConnectionForm => " Unsaved Changes ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
+            ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
         }
     }
 

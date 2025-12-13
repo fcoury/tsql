@@ -39,6 +39,12 @@ nucleo-matcher = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 
+# Secure password storage
+keyring = "3"
+
+# URL parsing
+url = "2"
+
 # Dev dependencies
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }

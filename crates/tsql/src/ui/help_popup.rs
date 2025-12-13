@@ -71,6 +71,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help"),
+        KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
     ],
 );
 

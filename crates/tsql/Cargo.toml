@@ -33,6 +33,12 @@ nucleo-matcher.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 
+# Secure password storage
+keyring.workspace = true
+
+# URL parsing
+url.workspace = true
+
 # Internal crate
 tui-syntax = { path = "../tui-syntax", version = "0.1.0" }
 
