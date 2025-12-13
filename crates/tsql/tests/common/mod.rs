@@ -73,7 +73,6 @@ impl TestDatabase {
 
         Ok(client)
     }
-
 }
 
 impl Drop for TestDatabase {
@@ -81,9 +80,9 @@ impl Drop for TestDatabase {
         let admin_client = self.admin_client.clone();
         let db_name = self.db_name.clone();
 
-        // Use block_on to run the cleanup synchronously in Drop
-        // This ensures the database is dropped even if the test panics
-        let _ = self.rt.block_on(async move {
+        // Spawn the cleanup as a background task
+        // We can't use block_on inside an async runtime, so we spawn and detach
+        self.rt.spawn(async move {
             let client = admin_client.lock().await;
 
             // Terminate connections
@@ -178,10 +177,7 @@ mod tests {
         });
 
         let result = admin_client
-            .query(
-                "SELECT 1 FROM pg_database WHERE datname = $1",
-                &[&db_name],
-            )
+            .query("SELECT 1 FROM pg_database WHERE datname = $1", &[&db_name])
             .await
             .unwrap();
 

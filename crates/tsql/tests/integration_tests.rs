@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{TestDatabase, get_test_database_url};
+use common::{get_test_database_url, TestDatabase};
 
 /// Test that we can connect to a PostgreSQL database successfully.
 #[tokio::test]
@@ -47,7 +47,9 @@ async fn test_query_error_message() {
     let client = test_db.connect().await.unwrap();
 
     // Execute an invalid query
-    let result = client.simple_query("SELECT * FROM nonexistent_table_xyz").await;
+    let result = client
+        .simple_query("SELECT * FROM nonexistent_table_xyz")
+        .await;
 
     assert!(result.is_err(), "Query should fail");
 
