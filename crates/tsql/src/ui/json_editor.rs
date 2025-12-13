@@ -7,7 +7,7 @@
 //! - Auto-formatting on open
 //! - Virtual scrolling for large JSON
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -62,6 +62,10 @@ pub struct JsonEditorModal<'a> {
     mode: VimMode,
     /// Vim key handler
     vim_handler: VimHandler,
+    /// Command mode active
+    command_active: bool,
+    /// Command buffer
+    command_buffer: String,
 }
 
 impl<'a> JsonEditorModal<'a> {
@@ -111,6 +115,8 @@ impl<'a> JsonEditorModal<'a> {
             scroll_offset: (0, 0),
             mode: VimMode::Normal, // Start in normal mode (vim default)
             vim_handler,
+            command_active: false,
+            command_buffer: String::new(),
         }
     }
 
@@ -149,8 +155,77 @@ impl<'a> JsonEditorModal<'a> {
 
     /// Handle a key event and return the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> JsonEditorAction {
+        // Handle command mode separately
+        if self.command_active {
+            return self.handle_command_mode_key(key);
+        }
+
         let command = self.vim_handler.handle_key(key, self.mode);
         self.execute_command(command, key)
+    }
+
+    /// Handle key events in command mode (after pressing ':').
+    fn handle_command_mode_key(&mut self, key: KeyEvent) -> JsonEditorAction {
+        match (key.code, key.modifiers) {
+            // Escape cancels command mode
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.command_active = false;
+                self.command_buffer.clear();
+                JsonEditorAction::Continue
+            }
+            // Enter executes command
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let result = self.execute_ex_command();
+                self.command_active = false;
+                self.command_buffer.clear();
+                result
+            }
+            // Backspace
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                if self.command_buffer.is_empty() {
+                    self.command_active = false;
+                } else {
+                    self.command_buffer.pop();
+                }
+                JsonEditorAction::Continue
+            }
+            // Character input
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.command_buffer.push(c);
+                JsonEditorAction::Continue
+            }
+            _ => JsonEditorAction::Continue,
+        }
+    }
+
+    /// Execute an ex command (like :format, :w, :q).
+    fn execute_ex_command(&mut self) -> JsonEditorAction {
+        let cmd = self.command_buffer.trim().to_lowercase();
+
+        match cmd.as_str() {
+            // Format JSON
+            "format" | "fmt" => {
+                self.format_json();
+                JsonEditorAction::Continue
+            }
+            // Save (write)
+            "w" | "write" => self.try_save(),
+            // Quit (cancel)
+            "q" | "quit" => JsonEditorAction::Cancel,
+            // Save and quit
+            "wq" | "x" => {
+                match self.try_save() {
+                    JsonEditorAction::Error(e) => JsonEditorAction::Error(e),
+                    _ => JsonEditorAction::Save {
+                        value: self.content(),
+                        row: self.row,
+                        col: self.col,
+                    },
+                }
+            }
+            // Unknown command
+            _ => JsonEditorAction::Error(format!("Unknown command: {}", cmd)),
+        }
     }
 
     /// Execute a vim command and return the appropriate action.
@@ -324,6 +399,11 @@ impl<'a> JsonEditorModal<'a> {
                 "cancel" => JsonEditorAction::Cancel,
                 "format" => {
                     self.format_json();
+                    JsonEditorAction::Continue
+                }
+                "command" => {
+                    self.command_active = true;
+                    self.command_buffer.clear();
                     JsonEditorAction::Continue
                 }
                 _ => JsonEditorAction::Continue,
@@ -514,26 +594,37 @@ impl<'a> JsonEditorModal<'a> {
             cursor_col + 1
         ));
 
-        let help_span = match self.mode {
-            VimMode::Normal => Span::styled(
-                " i:insert  v:visual  Ctrl+S:save  Esc×2:cancel ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            VimMode::Insert => Span::styled(
-                " Esc:normal  Ctrl+Enter:save ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            VimMode::Visual => Span::styled(
-                " y:yank  d:delete  c:change  Esc:cancel ",
-                Style::default().fg(Color::DarkGray),
-            ),
-        };
+        // If command mode is active, show command prompt instead of help
+        if self.command_active {
+            let command_line = Line::from(vec![
+                Span::styled(":", Style::default().fg(Color::Yellow)),
+                Span::raw(&self.command_buffer),
+                Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            ]);
+            let status = Paragraph::new(command_line).style(Style::default().bg(Color::DarkGray));
+            frame.render_widget(status, status_area);
+        } else {
+            let help_span = match self.mode {
+                VimMode::Normal => Span::styled(
+                    " i:insert  v:visual  :format  Ctrl+S:save  Esc×2:cancel ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                VimMode::Insert => Span::styled(
+                    " Esc:normal  Ctrl+Enter:save ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                VimMode::Visual => Span::styled(
+                    " y:yank  d:delete  c:change  Esc:cancel ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            };
 
-        let status_line = Line::from(vec![mode_span, validity_span, pos_span, help_span]);
+            let status_line = Line::from(vec![mode_span, validity_span, pos_span, help_span]);
 
-        let status = Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray));
+            let status = Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray));
 
-        frame.render_widget(status, status_area);
+            frame.render_widget(status, status_area);
+        }
     }
 
     /// Check if syntax highlighting should be applied.
@@ -652,5 +743,72 @@ mod tests {
             0,
         );
         assert_eq!(editor.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn test_json_editor_command_mode_format() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = JsonEditorModal::new(
+            r#"{"key":"value"}"#.to_string(), // Not formatted
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // Press ':' to enter command mode
+        let colon = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE);
+        editor.handle_key(colon);
+        assert!(editor.command_active);
+
+        // Type "format"
+        for c in "format".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            editor.handle_key(key);
+        }
+        assert_eq!(editor.command_buffer, "format");
+
+        // Press Enter to execute
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        editor.handle_key(enter);
+
+        // Command mode should be closed
+        assert!(!editor.command_active);
+        assert!(editor.command_buffer.is_empty());
+
+        // Content should be formatted (multi-line)
+        let content = editor.content();
+        assert!(content.contains('\n'), "Content should be formatted with newlines");
+    }
+
+    #[test]
+    fn test_json_editor_command_mode_escape() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = JsonEditorModal::new(
+            r#"{"key": "value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // Press ':' to enter command mode
+        let colon = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE);
+        editor.handle_key(colon);
+        assert!(editor.command_active);
+
+        // Type something
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        editor.handle_key(key);
+
+        // Press Escape to cancel
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        editor.handle_key(esc);
+
+        // Command mode should be closed and buffer cleared
+        assert!(!editor.command_active);
+        assert!(editor.command_buffer.is_empty());
     }
 }
