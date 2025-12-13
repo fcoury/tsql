@@ -40,9 +40,9 @@ pub enum JsonEditorAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
     /// Normal mode - navigation and commands
+    #[default]
     Normal,
     /// Insert mode - text input
-    #[default]
     Insert,
 }
 
@@ -115,7 +115,7 @@ impl<'a> JsonEditorModal<'a> {
             col,
             is_valid_json: is_valid,
             scroll_offset: (0, 0),
-            mode: EditorMode::Insert, // Start in insert mode
+            mode: EditorMode::Normal, // Start in normal mode (vim default)
             esc_pressed: false,
         }
     }
@@ -238,16 +238,30 @@ impl<'a> JsonEditorModal<'a> {
                 JsonEditorAction::Continue
             }
 
-            // Page movement
-            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            // Half page movement (Ctrl-u/d)
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 // Move up half a page (approximate with multiple up moves)
                 for _ in 0..10 {
                     self.textarea.move_cursor(CursorMove::Up);
                 }
                 JsonEditorAction::Continue
             }
-            (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 for _ in 0..10 {
+                    self.textarea.move_cursor(CursorMove::Down);
+                }
+                JsonEditorAction::Continue
+            }
+
+            // Full page movement (Ctrl-f/b or PageUp/Down)
+            (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                for _ in 0..20 {
+                    self.textarea.move_cursor(CursorMove::Up);
+                }
+                JsonEditorAction::Continue
+            }
+            (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                for _ in 0..20 {
                     self.textarea.move_cursor(CursorMove::Down);
                 }
                 JsonEditorAction::Continue
@@ -304,12 +318,6 @@ impl<'a> JsonEditorModal<'a> {
                 JsonEditorAction::Continue
             }
 
-            // Format JSON
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.format_json();
-                JsonEditorAction::Continue
-            }
-
             // Undo (if supported)
             (KeyCode::Char('u'), KeyModifiers::NONE) => {
                 self.textarea.undo();
@@ -342,9 +350,17 @@ impl<'a> JsonEditorModal<'a> {
             (KeyCode::Enter, KeyModifiers::CONTROL)
             | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.try_save(),
 
-            // Format JSON: Ctrl+F
+            // Full page movement (Ctrl+F/B) - consistent with vim and other views
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.format_json();
+                for _ in 0..20 {
+                    self.textarea.move_cursor(CursorMove::Down);
+                }
+                JsonEditorAction::Continue
+            }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                for _ in 0..20 {
+                    self.textarea.move_cursor(CursorMove::Up);
+                }
                 JsonEditorAction::Continue
             }
 
@@ -493,12 +509,12 @@ impl<'a> JsonEditorModal<'a> {
 
         let help_span = if self.mode == EditorMode::Normal {
             Span::styled(
-                " i:insert  Ctrl+S:save  Esc×2:cancel  Ctrl+F:format ",
+                " i:insert  Ctrl+S:save  Esc×2:cancel  Ctrl+F/B:scroll ",
                 Style::default().fg(Color::DarkGray),
             )
         } else {
             Span::styled(
-                " Esc:normal  Ctrl+Enter:save  Ctrl+F:format ",
+                " Esc:normal  Ctrl+Enter:save  Ctrl+F/B:scroll ",
                 Style::default().fg(Color::DarkGray),
             )
         };

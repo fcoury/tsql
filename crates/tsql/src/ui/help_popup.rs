@@ -268,7 +268,7 @@ impl HelpPopup {
                 HelpAction::Continue
             }
 
-            // Page down
+            // Half page down (Ctrl-d)
             KeyCode::Char('d')
                 if key
                     .modifiers
@@ -277,18 +277,38 @@ impl HelpPopup {
                 self.scroll_down(self.visible_height / 2);
                 HelpAction::Continue
             }
+
+            // Full page down (Ctrl-f or PageDown)
+            KeyCode::Char('f')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                self.scroll_down(self.visible_height.saturating_sub(2));
+                HelpAction::Continue
+            }
             KeyCode::PageDown => {
                 self.scroll_down(self.visible_height.saturating_sub(2));
                 HelpAction::Continue
             }
 
-            // Page up
+            // Half page up (Ctrl-u)
             KeyCode::Char('u')
                 if key
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
                 self.scroll_up(self.visible_height / 2);
+                HelpAction::Continue
+            }
+
+            // Full page up (Ctrl-b or PageUp)
+            KeyCode::Char('b')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                self.scroll_up(self.visible_height.saturating_sub(2));
                 HelpAction::Continue
             }
             KeyCode::PageUp => {

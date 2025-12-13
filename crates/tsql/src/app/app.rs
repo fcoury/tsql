@@ -1171,17 +1171,28 @@ impl App {
         // Handle completion popup when active
         if self.completion.active {
             match (key.code, key.modifiers) {
-                (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                // Enter accepts the completion
+                (KeyCode::Enter, KeyModifiers::NONE) => {
                     self.apply_completion();
                     return false;
                 }
-                (KeyCode::Down, KeyModifiers::NONE)
+                // Tab cycles to next item (wraps around)
+                (KeyCode::Tab, KeyModifiers::NONE)
+                | (KeyCode::Down, KeyModifiers::NONE)
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                     self.completion.select_next();
                     return false;
                 }
-                (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                // Shift+Tab cycles to previous item (wraps around)
+                (KeyCode::Tab, KeyModifiers::SHIFT)
+                | (KeyCode::Up, KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                     self.completion.select_prev();
+                    return false;
+                }
+                // Escape closes completion without accepting
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.completion.close();
                     return false;
                 }
                 (KeyCode::Char(c), KeyModifiers::NONE) if c.is_alphanumeric() || c == '_' => {
@@ -1698,7 +1709,7 @@ impl App {
         self.grid_state.apply_search(&pattern, &self.grid);
         self.search.close();
 
-        let match_count = self.grid_state.search.matches.len();
+        let match_count = self.grid_state.search.match_count();
         if match_count > 0 {
             self.last_status = Some(format!("Grid: /{} ({} matches)", pattern, match_count));
         } else {

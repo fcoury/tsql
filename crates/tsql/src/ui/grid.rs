@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -50,8 +52,10 @@ pub struct GridMatch {
 pub struct GridSearch {
     /// The current search pattern (empty = no search).
     pub pattern: String,
-    /// All matches found in the grid.
-    pub matches: Vec<GridMatch>,
+    /// All matches found in the grid (ordered for navigation).
+    matches: Vec<GridMatch>,
+    /// Set of match positions for O(1) lookup during rendering.
+    match_set: HashSet<(usize, usize)>,
     /// Index of the current match in `matches` (None if no matches or search inactive).
     pub current_match: Option<usize>,
 }
@@ -61,6 +65,7 @@ impl GridSearch {
     pub fn clear(&mut self) {
         self.pattern.clear();
         self.matches.clear();
+        self.match_set.clear();
         self.current_match = None;
     }
 
@@ -68,6 +73,7 @@ impl GridSearch {
     pub fn search(&mut self, pattern: &str, model: &GridModel) {
         self.pattern = pattern.to_lowercase();
         self.matches.clear();
+        self.match_set.clear();
         self.current_match = None;
 
         if self.pattern.is_empty() {
@@ -82,6 +88,7 @@ impl GridSearch {
                         row: row_idx,
                         col: col_idx,
                     });
+                    self.match_set.insert((row_idx, col_idx));
                 }
             }
         }
@@ -131,9 +138,14 @@ impl GridSearch {
         self.current_match.map(|idx| self.matches[idx])
     }
 
-    /// Check if a cell is a match.
+    /// Check if a cell is a match (O(1) lookup).
     pub fn is_match(&self, row: usize, col: usize) -> bool {
-        self.matches.iter().any(|m| m.row == row && m.col == col)
+        self.match_set.contains(&(row, col))
+    }
+
+    /// Get the number of matches.
+    pub fn match_count(&self) -> usize {
+        self.matches.len()
     }
 
     /// Check if a cell is the current match.
