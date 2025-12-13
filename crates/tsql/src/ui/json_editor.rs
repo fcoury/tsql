@@ -2,12 +2,12 @@
 //!
 //! This modal provides:
 //! - Syntax-highlighted JSON editing
-//! - Vim-like keybindings (Normal/Insert modes)
+//! - Vim-like keybindings (Normal/Insert/Visual modes) via unified VimHandler
 //! - JSON validation with error display
 //! - Auto-formatting on open
 //! - Virtual scrolling for large JSON
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,6 +19,7 @@ use tui_syntax::{json, themes, Highlighter};
 
 use crate::ui::HighlightedTextArea;
 use crate::util::{is_json_column_type, is_valid_json, try_format_json};
+use crate::vim::{Motion, VimCommand, VimConfig, VimHandler, VimMode};
 
 /// The result of handling a key event in the JSON editor.
 pub enum JsonEditorAction {
@@ -34,16 +35,6 @@ pub enum JsonEditorAction {
     Cancel,
     /// Show an error message (e.g., invalid JSON for jsonb column).
     Error(String),
-}
-
-/// Editor mode for vim-like keybindings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EditorMode {
-    /// Normal mode - navigation and commands
-    #[default]
-    Normal,
-    /// Insert mode - text input
-    Insert,
 }
 
 /// A modal editor for JSON values with syntax highlighting and vim keybindings.
@@ -67,10 +58,10 @@ pub struct JsonEditorModal<'a> {
     is_valid_json: bool,
     /// Scroll offset for HighlightedTextArea
     scroll_offset: (u16, u16),
-    /// Editor mode (Normal/Insert for vim bindings)
-    mode: EditorMode,
-    /// Whether ESC was pressed in normal mode (for double-ESC to quit)
-    esc_pressed: bool,
+    /// Current vim mode
+    mode: VimMode,
+    /// Vim key handler
+    vim_handler: VimHandler,
 }
 
 impl<'a> JsonEditorModal<'a> {
@@ -105,6 +96,9 @@ impl<'a> JsonEditorModal<'a> {
         let mut highlighter = Highlighter::new(themes::one_dark());
         let _ = highlighter.register_language(json());
 
+        // Create vim handler with JSON editor config (double-Esc to cancel, no search)
+        let vim_handler = VimHandler::new(VimConfig::json_editor());
+
         Self {
             textarea,
             highlighter,
@@ -115,8 +109,8 @@ impl<'a> JsonEditorModal<'a> {
             col,
             is_valid_json: is_valid,
             scroll_offset: (0, 0),
-            mode: EditorMode::Normal, // Start in normal mode (vim default)
-            esc_pressed: false,
+            mode: VimMode::Normal, // Start in normal mode (vim default)
+            vim_handler,
         }
     }
 
@@ -155,221 +149,246 @@ impl<'a> JsonEditorModal<'a> {
 
     /// Handle a key event and return the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> JsonEditorAction {
-        match self.mode {
-            EditorMode::Normal => self.handle_normal_mode_key(key),
-            EditorMode::Insert => self.handle_insert_mode_key(key),
-        }
+        let command = self.vim_handler.handle_key(key, self.mode);
+        self.execute_command(command, key)
     }
 
-    /// Handle key events in normal mode (vim navigation).
-    fn handle_normal_mode_key(&mut self, key: KeyEvent) -> JsonEditorAction {
-        // Reset esc_pressed flag unless we're processing Esc
-        if key.code != KeyCode::Esc {
-            self.esc_pressed = false;
-        }
+    /// Execute a vim command and return the appropriate action.
+    fn execute_command(&mut self, command: VimCommand, key: KeyEvent) -> JsonEditorAction {
+        match command {
+            VimCommand::None => JsonEditorAction::Continue,
 
-        match (key.code, key.modifiers) {
-            // Exit: Esc twice or :q
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                if self.esc_pressed {
-                    return JsonEditorAction::Cancel;
+            // Mode changes
+            VimCommand::ChangeMode(new_mode) => {
+                self.mode = new_mode;
+                JsonEditorAction::Continue
+            }
+
+            // Movement
+            VimCommand::Move(motion) => {
+                self.apply_motion(motion);
+                JsonEditorAction::Continue
+            }
+
+            // Enter insert mode at position
+            VimCommand::EnterInsertAt { motion, mode } => {
+                if let Some(m) = motion {
+                    self.apply_motion(m);
                 }
-                self.esc_pressed = true;
+                self.mode = mode;
                 JsonEditorAction::Continue
             }
 
-            // Save: Ctrl+S or :w
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.try_save(),
-
-            // Movement: hjkl
-            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
-                self.textarea.move_cursor(CursorMove::Back);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                self.textarea.move_cursor(CursorMove::Down);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                self.textarea.move_cursor(CursorMove::Up);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
-                self.textarea.move_cursor(CursorMove::Forward);
-                JsonEditorAction::Continue
-            }
-
-            // Word movement
-            (KeyCode::Char('w'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::WordForward);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('b'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::WordBack);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::WordForward);
-                JsonEditorAction::Continue
-            }
-
-            // Line movement
-            (KeyCode::Char('0'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::Head);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('$'), KeyModifiers::NONE) | (KeyCode::End, _) => {
-                self.textarea.move_cursor(CursorMove::End);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('^'), KeyModifiers::NONE) | (KeyCode::Home, _) => {
-                self.textarea.move_cursor(CursorMove::Head);
-                JsonEditorAction::Continue
-            }
-
-            // Document movement
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                // gg - go to start (simplified: just g goes to start)
-                self.textarea.move_cursor(CursorMove::Top);
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
-                self.textarea.move_cursor(CursorMove::Bottom);
-                JsonEditorAction::Continue
-            }
-
-            // Half page movement (Ctrl-u/d)
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                // Move up half a page (approximate with multiple up moves)
-                for _ in 0..10 {
+            // Open new line
+            VimCommand::OpenLine { above } => {
+                if above {
+                    self.textarea.move_cursor(CursorMove::Head);
+                    self.textarea.insert_newline();
                     self.textarea.move_cursor(CursorMove::Up);
+                } else {
+                    self.textarea.move_cursor(CursorMove::End);
+                    self.textarea.insert_newline();
                 }
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                for _ in 0..10 {
-                    self.textarea.move_cursor(CursorMove::Down);
-                }
-                JsonEditorAction::Continue
-            }
-
-            // Full page movement (Ctrl-f/b or PageUp/Down)
-            (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                for _ in 0..20 {
-                    self.textarea.move_cursor(CursorMove::Up);
-                }
-                JsonEditorAction::Continue
-            }
-            (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                for _ in 0..20 {
-                    self.textarea.move_cursor(CursorMove::Down);
-                }
-                JsonEditorAction::Continue
-            }
-
-            // Enter insert mode
-            (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                self.mode = EditorMode::Insert;
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::Forward);
-                self.mode = EditorMode::Insert;
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('I'), KeyModifiers::SHIFT) => {
-                self.textarea.move_cursor(CursorMove::Head);
-                self.mode = EditorMode::Insert;
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('A'), KeyModifiers::SHIFT) => {
-                self.textarea.move_cursor(CursorMove::End);
-                self.mode = EditorMode::Insert;
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                self.textarea.move_cursor(CursorMove::End);
-                self.textarea.insert_newline();
-                self.mode = EditorMode::Insert;
-                self.update_validity();
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('O'), KeyModifiers::SHIFT) => {
-                self.textarea.move_cursor(CursorMove::Head);
-                self.textarea.insert_newline();
-                self.textarea.move_cursor(CursorMove::Up);
-                self.mode = EditorMode::Insert;
+                self.mode = VimMode::Insert;
                 self.update_validity();
                 JsonEditorAction::Continue
             }
 
-            // Delete
-            (KeyCode::Char('x'), KeyModifiers::NONE) => {
+            // Delete operations
+            VimCommand::DeleteChar => {
                 self.textarea.delete_char();
                 self.update_validity();
                 JsonEditorAction::Continue
             }
-            (KeyCode::Char('d'), KeyModifiers::NONE) => {
-                // dd - delete line (simplified: just d deletes line)
-                self.textarea.move_cursor(CursorMove::Head);
+            VimCommand::DeleteCharBefore => {
+                self.textarea.delete_next_char();
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::DeleteToEnd => {
                 self.textarea.delete_line_by_end();
-                self.textarea.delete_char(); // Delete the newline
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::DeleteLine => {
+                self.delete_line();
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::DeleteMotion(motion) => {
+                self.delete_by_motion(motion);
                 self.update_validity();
                 JsonEditorAction::Continue
             }
 
-            // Undo (if supported)
-            (KeyCode::Char('u'), KeyModifiers::NONE) => {
+            // Change operations (delete + enter insert)
+            VimCommand::ChangeToEnd => {
+                self.textarea.delete_line_by_end();
+                self.mode = VimMode::Insert;
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::ChangeLine => {
+                self.textarea.move_cursor(CursorMove::Head);
+                self.textarea.delete_line_by_end();
+                self.mode = VimMode::Insert;
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::ChangeMotion(motion) => {
+                self.delete_by_motion(motion);
+                self.mode = VimMode::Insert;
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+
+            // Yank operations
+            VimCommand::YankLine => {
+                self.yank_line();
+                JsonEditorAction::Continue
+            }
+            VimCommand::YankMotion(_motion) => {
+                // TODO: Implement yank by motion
+                // For now, just yank the whole line
+                self.yank_line();
+                JsonEditorAction::Continue
+            }
+
+            // Paste operations
+            VimCommand::PasteAfter => {
+                self.textarea.paste();
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::PasteBefore => {
+                // Move back one char, paste, then adjust
+                self.textarea.paste();
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+
+            // Undo/redo
+            VimCommand::Undo => {
                 self.textarea.undo();
                 self.update_validity();
                 JsonEditorAction::Continue
             }
-
-            // Redo
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            VimCommand::Redo => {
                 self.textarea.redo();
                 self.update_validity();
                 JsonEditorAction::Continue
             }
 
-            _ => JsonEditorAction::Continue,
-        }
-    }
-
-    /// Handle key events in insert mode.
-    fn handle_insert_mode_key(&mut self, key: KeyEvent) -> JsonEditorAction {
-        match (key.code, key.modifiers) {
-            // Exit insert mode
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.mode = EditorMode::Normal;
-                self.esc_pressed = false;
+            // Visual mode
+            VimCommand::StartVisual => {
+                self.textarea.start_selection();
+                self.mode = VimMode::Visual;
+                JsonEditorAction::Continue
+            }
+            VimCommand::CancelVisual => {
+                self.textarea.cancel_selection();
+                self.mode = VimMode::Normal;
+                JsonEditorAction::Continue
+            }
+            VimCommand::VisualYank => {
+                self.textarea.copy();
+                self.textarea.cancel_selection();
+                self.mode = VimMode::Normal;
+                JsonEditorAction::Continue
+            }
+            VimCommand::VisualDelete => {
+                self.textarea.cut();
+                self.textarea.cancel_selection();
+                self.mode = VimMode::Normal;
+                self.update_validity();
+                JsonEditorAction::Continue
+            }
+            VimCommand::VisualChange => {
+                self.textarea.cut();
+                self.textarea.cancel_selection();
+                self.mode = VimMode::Insert;
+                self.update_validity();
                 JsonEditorAction::Continue
             }
 
-            // Save: Ctrl+Enter or Ctrl+S
-            (KeyCode::Enter, KeyModifiers::CONTROL)
-            | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.try_save(),
-
-            // Full page movement (Ctrl+F/B) - consistent with vim and other views
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                for _ in 0..20 {
-                    self.textarea.move_cursor(CursorMove::Down);
-                }
-                JsonEditorAction::Continue
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                for _ in 0..20 {
-                    self.textarea.move_cursor(CursorMove::Up);
-                }
-                JsonEditorAction::Continue
-            }
-
-            // Regular text input - pass to textarea
-            _ => {
+            // Pass through (insert mode typing)
+            VimCommand::PassThrough => {
                 self.textarea.input(key);
                 self.update_validity();
                 JsonEditorAction::Continue
             }
+
+            // Custom commands
+            VimCommand::Custom(cmd) => match cmd.as_str() {
+                "save" => self.try_save(),
+                "cancel" => JsonEditorAction::Cancel,
+                "format" => {
+                    self.format_json();
+                    JsonEditorAction::Continue
+                }
+                _ => JsonEditorAction::Continue,
+            },
+        }
+    }
+
+    /// Apply a motion to the textarea.
+    fn apply_motion(&mut self, motion: Motion) {
+        match motion {
+            Motion::Cursor(cm) => {
+                self.textarea.move_cursor(cm);
+            }
+            Motion::Up(n) => {
+                for _ in 0..n {
+                    self.textarea.move_cursor(CursorMove::Up);
+                }
+            }
+            Motion::Down(n) => {
+                for _ in 0..n {
+                    self.textarea.move_cursor(CursorMove::Down);
+                }
+            }
+        }
+    }
+
+    /// Delete the current line.
+    fn delete_line(&mut self) {
+        self.textarea.move_cursor(CursorMove::Head);
+        self.textarea.delete_line_by_end();
+        self.textarea.delete_char(); // Delete the newline
+    }
+
+    /// Delete text by motion.
+    fn delete_by_motion(&mut self, motion: Motion) {
+        match motion {
+            Motion::Cursor(CursorMove::WordForward) => {
+                self.textarea.delete_next_word();
+            }
+            Motion::Cursor(CursorMove::WordEnd) => {
+                self.textarea.delete_next_word();
+            }
+            Motion::Cursor(CursorMove::WordBack) => {
+                self.textarea.delete_word();
+            }
+            Motion::Cursor(CursorMove::End) => {
+                self.textarea.delete_line_by_end();
+            }
+            Motion::Cursor(CursorMove::Head) => {
+                self.textarea.delete_line_by_head();
+            }
+            _ => {
+                // For other motions, select and delete
+                self.textarea.start_selection();
+                self.apply_motion(motion);
+                self.textarea.cut();
+            }
+        }
+    }
+
+    /// Yank the current line.
+    fn yank_line(&mut self) {
+        let (row, _) = self.textarea.cursor();
+        if let Some(line) = self.textarea.lines().get(row) {
+            self.textarea.set_yank_text(line.clone() + "\n");
         }
     }
 
@@ -425,13 +444,7 @@ impl<'a> JsonEditorModal<'a> {
         // Build title
         let title = format!(
             " Edit: {} ({}) - {} ",
-            self.column_name,
-            self.column_type,
-            if self.mode == EditorMode::Normal {
-                "NORMAL"
-            } else {
-                "INSERT"
-            }
+            self.column_name, self.column_type, self.mode.label()
         );
 
         // Build block with border color based on validity
@@ -484,21 +497,15 @@ impl<'a> JsonEditorModal<'a> {
             Span::styled(" ✗ Invalid JSON ", Style::default().fg(Color::Red))
         };
 
-        let mode_span = if self.mode == EditorMode::Normal {
-            Span::styled(
-                " NORMAL ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " INSERT ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mode_color = match self.mode {
+            VimMode::Normal => Color::Cyan,
+            VimMode::Insert => Color::Green,
+            VimMode::Visual => Color::Magenta,
         };
+        let mode_span = Span::styled(
+            format!(" {} ", self.mode.label()),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        );
 
         let pos_span = Span::raw(format!(
             " Ln {}/{}, Col {} ",
@@ -507,16 +514,19 @@ impl<'a> JsonEditorModal<'a> {
             cursor_col + 1
         ));
 
-        let help_span = if self.mode == EditorMode::Normal {
-            Span::styled(
-                " i:insert  Ctrl+S:save  Esc×2:cancel  Ctrl+F/B:scroll ",
+        let help_span = match self.mode {
+            VimMode::Normal => Span::styled(
+                " i:insert  v:visual  Ctrl+S:save  Esc×2:cancel ",
                 Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::styled(
-                " Esc:normal  Ctrl+Enter:save  Ctrl+F/B:scroll ",
+            ),
+            VimMode::Insert => Span::styled(
+                " Esc:normal  Ctrl+Enter:save ",
                 Style::default().fg(Color::DarkGray),
-            )
+            ),
+            VimMode::Visual => Span::styled(
+                " y:yank  d:delete  c:change  Esc:cancel ",
+                Style::default().fg(Color::DarkGray),
+            ),
         };
 
         let status_line = Line::from(vec![mode_span, validity_span, pos_span, help_span]);
@@ -630,5 +640,17 @@ mod tests {
         let content = editor.content();
         assert!(content.contains("\"name\""));
         assert!(content.contains("\"test\""));
+    }
+
+    #[test]
+    fn test_json_editor_starts_in_normal_mode() {
+        let editor = JsonEditorModal::new(
+            r#"{"key": "value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+        assert_eq!(editor.mode, VimMode::Normal);
     }
 }

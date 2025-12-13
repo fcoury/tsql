@@ -19,5 +19,5 @@ pub use grid::{
 };
 pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, HighlightedTextArea};
-pub use json_editor::{EditorMode, JsonEditorAction, JsonEditorModal};
+pub use json_editor::{JsonEditorAction, JsonEditorModal};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};
