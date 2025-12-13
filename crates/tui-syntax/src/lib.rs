@@ -36,5 +36,5 @@ mod theme;
 pub mod themes;
 
 pub use highlighter::{HighlightError, Highlighter};
-pub use languages::{json, sql, Language, LanguageError};
+pub use languages::{html, json, sql, Language, LanguageError};
 pub use theme::{Style as ThemeStyle, StyleModifier, Theme, ThemeError};

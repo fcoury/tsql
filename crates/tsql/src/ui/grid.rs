@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
-use crate::util::looks_like_json;
+use crate::util::{is_uuid, looks_like_json};
 
 /// Action for column resize operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1541,8 +1541,27 @@ fn display_width(s: &str) -> usize {
 }
 
 /// Format a cell value for display, with special handling for JSON values.
-/// If the value looks like JSON and is long, show a condensed preview.
+/// Format cell value for display in the grid.
+///
+/// Special handling for:
+/// - UUIDs: truncated to first 8 chars + "..." to save space
+/// - JSON: condensed to single line if multi-line
 fn format_cell_for_display(s: &str, width: u16) -> String {
+    // For UUIDs, truncate to show first 8 chars + "..."
+    // This saves significant space in the grid (36 chars -> 11 chars)
+    if is_uuid(s) {
+        let truncated = if width >= 11 {
+            // Show first 8 hex chars + "..."
+            format!("{}...", &s[..8])
+        } else if width >= 4 {
+            // Very narrow column - show what we can
+            format!("{}...", &s[..(width as usize).saturating_sub(3)])
+        } else {
+            s[..width as usize].to_string()
+        };
+        return fit_to_width(&truncated, width);
+    }
+
     // For JSON-like values, show a condensed single-line representation
     if looks_like_json(s) && s.contains('\n') {
         // Multi-line JSON - condense to single line
@@ -1554,7 +1573,7 @@ fn format_cell_for_display(s: &str, width: u16) -> String {
         return fit_to_width(&condensed, width);
     }
 
-    // For other JSON-like values or regular values
+    // For other values
     fit_to_width(s, width)
 }
 
@@ -2367,5 +2386,22 @@ mod tests {
         // unless cursor_col < col_offset
         // In this case, cursor_col (2) might still be >= col_offset
         // depending on the exact scroll that happened
+    }
+
+    #[test]
+    fn test_uuid_truncation_in_display() {
+        // Test that UUIDs are truncated in display
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = format_cell_for_display(uuid, 20);
+        assert_eq!(result, "550e8400...         ", "UUID should be truncated to 8 chars + ...");
+
+        // With exact width for truncated UUID
+        let result = format_cell_for_display(uuid, 11);
+        assert_eq!(result, "550e8400...", "UUID should fit exactly in 11 chars");
+
+        // Non-UUID should not be truncated
+        let normal = "hello world";
+        let result = format_cell_for_display(normal, 20);
+        assert_eq!(result, "hello world         ", "Non-UUID should not be truncated");
     }
 }

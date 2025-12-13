@@ -1,11 +1,11 @@
-//! JSON editor modal for editing JSON/JSONB cell values.
+//! Text editor modal for editing cell values with syntax highlighting.
 //!
 //! This modal provides:
-//! - Syntax-highlighted JSON editing
+//! - Auto-detected syntax highlighting (JSON, HTML, SQL, plain text)
 //! - Vim-like keybindings (Normal/Insert/Visual modes) via unified VimHandler
 //! - JSON validation with error display
-//! - Auto-formatting on open
-//! - Virtual scrolling for large JSON
+//! - Auto-formatting on open for JSON content
+//! - Virtual scrolling for large content
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,10 +15,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
-use tui_syntax::{json, themes, Highlighter};
+use tui_syntax::{html, json, themes, Highlighter};
 
 use crate::ui::HighlightedTextArea;
-use crate::util::{is_json_column_type, is_valid_json, try_format_json};
+use crate::util::{detect_content_type, is_json_column_type, is_valid_json, try_format_json, ContentType};
 use crate::vim::{Motion, VimCommand, VimConfig, VimHandler, VimMode};
 
 /// The result of handling a key event in the JSON editor.
@@ -96,9 +96,10 @@ impl<'a> JsonEditorModal<'a> {
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
-        // Create highlighter with JSON support
+        // Create highlighter with JSON and HTML support
         let mut highlighter = Highlighter::new(themes::one_dark());
         let _ = highlighter.register_language(json());
+        let _ = highlighter.register_language(html());
 
         // Create vim handler with JSON editor config (double-Esc to cancel, no search)
         let vim_handler = VimHandler::new(VimConfig::json_editor());
@@ -527,11 +528,25 @@ impl<'a> JsonEditorModal<'a> {
             self.column_name, self.column_type, self.mode.label()
         );
 
-        // Build block with border color based on validity
-        let border_color = if self.is_valid_json {
-            Color::Green
+        // Detect content type and determine border color
+        let content = self.content();
+        let content_type = detect_content_type(&content);
+
+        // Border color: green for valid JSON (if JSON column), yellow otherwise, red for invalid JSON in JSON column
+        let border_color = if self.is_json_column() {
+            if self.is_valid_json {
+                Color::Green
+            } else {
+                Color::Red
+            }
         } else {
-            Color::Red
+            // Non-JSON column: show detected type in title color
+            match content_type {
+                ContentType::Json => Color::Green,
+                ContentType::Html => Color::Cyan,
+                ContentType::Sql => Color::Yellow,
+                ContentType::Plain => Color::White,
+            }
         };
 
         let block = Block::default()
@@ -539,15 +554,13 @@ impl<'a> JsonEditorModal<'a> {
             .title(title)
             .border_style(Style::default().fg(border_color));
 
-        // Highlight the content only if it's valid JSON
-        // This avoids performance issues with large non-JSON content (like HTML)
-        let content = self.content();
-        let highlighted_lines = if self.should_highlight() {
+        // Apply syntax highlighting based on detected content type
+        let highlighted_lines = if let Some(lang) = content_type.language_name() {
             self.highlighter
-                .highlight("json", &content)
+                .highlight(lang, &content)
                 .unwrap_or_else(|_| content.lines().map(|l| Line::from(l.to_string())).collect())
         } else {
-            // For non-JSON content, just return plain lines without syntax highlighting
+            // Plain text - no highlighting
             content.lines().map(|l| Line::from(l.to_string())).collect()
         };
 
@@ -571,10 +584,28 @@ impl<'a> JsonEditorModal<'a> {
         let (cursor_row, cursor_col) = self.textarea.cursor();
         let line_count = self.textarea.lines().len();
 
-        let validity_span = if self.is_valid_json {
-            Span::styled(" ✓ Valid JSON ", Style::default().fg(Color::Green))
+        // Show content type indicator
+        let type_span = match content_type {
+            ContentType::Json => {
+                if self.is_valid_json {
+                    Span::styled(" ✓ JSON ", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled(" ✗ JSON ", Style::default().fg(Color::Red))
+                }
+            }
+            ContentType::Html => Span::styled(" HTML ", Style::default().fg(Color::Cyan)),
+            ContentType::Sql => Span::styled(" SQL ", Style::default().fg(Color::Yellow)),
+            ContentType::Plain => Span::styled(" TEXT ", Style::default().fg(Color::White)),
+        };
+
+        // For JSON columns, also show validation status
+        let validity_span = if self.is_json_column() && !self.is_valid_json {
+            Some(Span::styled(
+                " (invalid for JSONB) ",
+                Style::default().fg(Color::Red),
+            ))
         } else {
-            Span::styled(" ✗ Invalid JSON ", Style::default().fg(Color::Red))
+            None
         };
 
         let mode_color = match self.mode {
@@ -619,19 +650,19 @@ impl<'a> JsonEditorModal<'a> {
                 ),
             };
 
-            let status_line = Line::from(vec![mode_span, validity_span, pos_span, help_span]);
+            let mut spans = vec![mode_span, type_span];
+            if let Some(v) = validity_span {
+                spans.push(v);
+            }
+            spans.push(pos_span);
+            spans.push(help_span);
+
+            let status_line = Line::from(spans);
 
             let status = Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray));
 
             frame.render_widget(status, status_area);
         }
-    }
-
-    /// Check if syntax highlighting should be applied.
-    /// Only highlight if the content is valid JSON to avoid performance issues
-    /// with large non-JSON content (like HTML).
-    fn should_highlight(&self) -> bool {
-        self.is_valid_json
     }
 }
 
@@ -650,7 +681,9 @@ mod tests {
             0,
         );
         assert!(editor.is_valid_json);
-        assert!(editor.should_highlight());
+        // JSON content should be detected as JSON type
+        let content_type = detect_content_type(&editor.content());
+        assert_eq!(content_type, ContentType::Json);
     }
 
     #[test]
@@ -663,12 +696,14 @@ mod tests {
             0,
         );
         assert!(!editor.is_valid_json);
-        assert!(!editor.should_highlight());
+        // Plain text should be detected as Plain type
+        let content_type = detect_content_type(&editor.content());
+        assert_eq!(content_type, ContentType::Plain);
     }
 
     #[test]
     fn test_json_editor_with_html_content() {
-        // HTML content should not be treated as JSON
+        // HTML content should be detected as HTML type
         let html = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
         let editor = JsonEditorModal::new(
             html.to_string(),
@@ -678,7 +713,8 @@ mod tests {
             0,
         );
         assert!(!editor.is_valid_json);
-        assert!(!editor.should_highlight());
+        let content_type = detect_content_type(&editor.content());
+        assert_eq!(content_type, ContentType::Html);
     }
 
     #[test]
@@ -708,9 +744,10 @@ mod tests {
             creation_time
         );
 
-        // Should not be detected as JSON
+        // Should be detected as HTML, not JSON
         assert!(!editor.is_valid_json);
-        assert!(!editor.should_highlight());
+        let content_type = detect_content_type(&editor.content());
+        assert_eq!(content_type, ContentType::Html);
 
         // Content should be preserved
         assert_eq!(editor.content(), large_html);

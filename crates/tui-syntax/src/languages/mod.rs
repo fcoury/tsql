@@ -2,9 +2,11 @@
 //!
 //! Each language provides a tree-sitter grammar and highlight queries.
 
+mod html;
 mod json;
 mod sql;
 
+pub use html::html;
 pub use json::json;
 pub use sql::sql;
 

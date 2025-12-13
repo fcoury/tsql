@@ -271,7 +271,7 @@ impl Highlighter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::languages::sql;
+    use crate::languages::{html, sql};
     use crate::themes;
 
     #[test]
@@ -319,5 +319,36 @@ mod tests {
 
         let result = highlighter.highlight("unknown", "some code");
         assert!(matches!(result, Err(HighlightError::UnknownLanguage(_))));
+    }
+
+    #[test]
+    fn test_highlight_html() {
+        let theme = themes::one_dark();
+        let mut highlighter = Highlighter::new(theme);
+        highlighter.register_language(html()).unwrap();
+
+        let html_content = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
+        let lines = highlighter.highlight("html", html_content).unwrap();
+        assert_eq!(lines.len(), 1);
+        // Should have multiple spans with different styles
+        assert!(!lines[0].spans.is_empty());
+    }
+
+    #[test]
+    fn test_highlight_multiline_html() {
+        let theme = themes::one_dark();
+        let mut highlighter = Highlighter::new(theme);
+        highlighter.register_language(html()).unwrap();
+
+        let html_content = r#"<html>
+<head>
+    <title>Test</title>
+</head>
+<body>
+    <p>Hello</p>
+</body>
+</html>"#;
+        let lines = highlighter.highlight("html", html_content).unwrap();
+        assert_eq!(lines.len(), 8);
     }
 }

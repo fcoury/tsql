@@ -19,6 +19,7 @@ tree-sitter.workspace = true
 tree-sitter-highlight.workspace = true
 tree-sitter-sequel.workspace = true
 tree-sitter-json.workspace = true
+tree-sitter-html.workspace = true
 serde.workspace = true
 toml.workspace = true
 

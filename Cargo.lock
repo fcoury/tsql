@@ -1548,6 +1548,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-html"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-json"
 version = "0.24.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,6 +1615,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-highlight",
+ "tree-sitter-html",
  "tree-sitter-json",
  "tree-sitter-sequel",
 ]
