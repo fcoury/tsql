@@ -1364,10 +1364,23 @@ impl App {
             self.completion.close();
             self.cell_editor.close();
             self.history_picker = None;
+            self.connection_picker = None;
             self.pending_key = None;
             self.last_error = None;
             self.mode = Mode::Normal;
             return false;
+        }
+
+        // Handle history picker when open (takes priority over error dismissal)
+        if self.history_picker.is_some() {
+            return self.handle_history_picker_key(key);
+        }
+
+        // Handle connection picker when open (takes priority over error dismissal)
+        if self.connection_picker.is_some() {
+            // Clear any error when interacting with the picker
+            self.last_error = None;
+            return self.handle_connection_picker_key(key);
         }
 
         // If error is showing, Enter dismisses it.
@@ -1380,20 +1393,10 @@ impl App {
             return false;
         }
 
-        // Global Ctrl+S to execute query (works regardless of mode/focus)
-        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
+        // Global Ctrl+E to execute query (works regardless of mode/focus)
+        if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
             self.execute_query();
             return false;
-        }
-
-        // Handle history picker when open
-        if self.history_picker.is_some() {
-            return self.handle_history_picker_key(key);
-        }
-
-        // Handle connection picker when open
-        if self.connection_picker.is_some() {
-            return self.handle_connection_picker_key(key);
         }
 
         if self.search.active {
@@ -1480,6 +1483,11 @@ impl App {
                 (KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                 | (KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                     self.open_connection_manager();
+                    return false;
+                }
+                // Ctrl+O: Open connection picker
+                (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                    self.open_connection_picker();
                     return false;
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE) => {
@@ -1847,6 +1855,11 @@ impl App {
                 self.last_status = Some("Changes discarded".to_string());
                 false
             }
+            ConfirmContext::SwitchConnection { entry } => {
+                // Proceed with connection switch despite unsaved changes
+                self.connect_to_entry(entry);
+                false
+            }
         }
     }
 
@@ -1872,6 +1885,10 @@ impl App {
             ConfirmContext::CloseConnectionForm => {
                 // Keep the form open
                 self.last_status = Some("Continuing edit".to_string());
+            }
+            ConfirmContext::SwitchConnection { .. } => {
+                // Cancelled connection switch
+                self.last_status = Some("Connection switch cancelled".to_string());
             }
         }
     }
@@ -3320,7 +3337,14 @@ impl App {
             PickerAction::Continue => false,
             PickerAction::Selected(entry) => {
                 self.connection_picker = None;
-                self.connect_to_entry(entry);
+                if self.editor.is_modified() {
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "You have unsaved changes. Switch connection anyway?",
+                        ConfirmContext::SwitchConnection { entry },
+                    ));
+                } else {
+                    self.connect_to_entry(entry);
+                }
                 false
             }
             PickerAction::Cancelled => {
@@ -4673,46 +4697,46 @@ mod tests {
         assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
     }
 
-    // ========== Global Ctrl+S (Execute Query) Tests ==========
+    // ========== Global Ctrl+E (Execute Query) Tests ==========
 
     #[test]
-    fn test_ctrl_s_binding_exists_in_editor_normal_keymap() {
-        // Verify Ctrl+S is bound to ExecuteQuery in editor normal keymap
+    fn test_ctrl_e_binding_exists_in_editor_normal_keymap() {
+        // Verify Ctrl+E is bound to ExecuteQuery in editor normal keymap
         let keymap = crate::config::Keymap::default_editor_normal_keymap();
-        let ctrl_s = KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let ctrl_e = KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
         assert_eq!(
-            keymap.get(&ctrl_s),
+            keymap.get(&ctrl_e),
             Some(&Action::ExecuteQuery),
-            "Ctrl+S should be bound to ExecuteQuery in normal mode"
+            "Ctrl+E should be bound to ExecuteQuery in normal mode"
         );
     }
 
     #[test]
-    fn test_ctrl_s_binding_exists_in_editor_insert_keymap() {
-        // Verify Ctrl+S is bound to ExecuteQuery in editor insert keymap
+    fn test_ctrl_e_binding_exists_in_editor_insert_keymap() {
+        // Verify Ctrl+E is bound to ExecuteQuery in editor insert keymap
         let keymap = crate::config::Keymap::default_editor_insert_keymap();
-        let ctrl_s = KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let ctrl_e = KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
         assert_eq!(
-            keymap.get(&ctrl_s),
+            keymap.get(&ctrl_e),
             Some(&Action::ExecuteQuery),
-            "Ctrl+S should be bound to ExecuteQuery in insert mode"
+            "Ctrl+E should be bound to ExecuteQuery in insert mode"
         );
     }
 
     #[test]
-    fn test_global_ctrl_s_key_detection() {
-        // Test that Ctrl+S is correctly detected as the key combination
-        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        assert_eq!(key.code, KeyCode::Char('s'));
+    fn test_global_ctrl_e_key_detection() {
+        // Test that Ctrl+E is correctly detected as the key combination
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(key.code, KeyCode::Char('e'));
         assert_eq!(key.modifiers, KeyModifiers::CONTROL);
 
-        // Verify it's different from plain 's'
-        let plain_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
-        assert_ne!(key.modifiers, plain_s.modifiers);
+        // Verify it's different from plain 'e'
+        let plain_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_ne!(key.modifiers, plain_e.modifiers);
     }
 
     #[test]
-    fn test_ctrl_s_executes_query_when_grid_focused() {
+    fn test_ctrl_e_executes_query_when_grid_focused() {
         // Create a minimal App for testing
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4722,7 +4746,8 @@ mod tests {
 
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
-        // Close connection manager that auto-opens when no connection provided
+        // Close connection picker/manager that auto-opens when no connection provided
+        app.connection_picker = None;
         app.connection_manager = None;
 
         // Set focus to Grid and mode to Normal
@@ -4732,12 +4757,12 @@ mod tests {
         // Put some text in the editor so we have a query to execute
         app.editor.set_text("SELECT 1".to_string());
 
-        // Press Ctrl+S
-        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        // Press Ctrl+E
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
         let quit = app.on_key(key);
 
         // Should not quit
-        assert!(!quit, "Ctrl+S should not quit");
+        assert!(!quit, "Ctrl+E should not quit");
 
         // Since we have no DB connection, execute_query will set last_error
         // But if EditCell was triggered instead, last_status would be different
@@ -4746,14 +4771,14 @@ mod tests {
             app.last_error.is_some()
                 || app.last_status == Some("No query to run".to_string())
                 || app.last_status == Some("Running...".to_string()),
-            "Ctrl+S should attempt to execute query, not edit cell. last_error={:?}, last_status={:?}",
+            "Ctrl+E should attempt to execute query, not edit cell. last_error={:?}, last_status={:?}",
             app.last_error,
             app.last_status
         );
     }
 
     #[test]
-    fn test_ctrl_s_does_not_open_cell_editor_on_grid() {
+    fn test_ctrl_e_does_not_open_cell_editor_on_grid() {
         // Create a minimal App for testing with some grid data
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4779,14 +4804,14 @@ mod tests {
         // Put some text in the editor
         app.editor.set_text("SELECT 1".to_string());
 
-        // Press Ctrl+S
-        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        // Press Ctrl+E
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
         let _quit = app.on_key(key);
 
         // Cell editor should NOT be opened
         assert!(
             !app.cell_editor.active,
-            "Ctrl+S should not open cell editor, but it did"
+            "Ctrl+E should not open cell editor, but it did"
         );
     }
 
@@ -5026,6 +5051,140 @@ mod tests {
         assert!(
             app.connection_form.is_none(),
             "Form should close after confirming discard"
+        );
+    }
+
+    /// Test: Enter in connection picker should select connection, not execute query
+    #[test]
+    fn test_enter_in_connection_picker_selects_connection() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Clear any existing state
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.last_error = None;
+
+        // Add a test connection
+        let entry = ConnectionEntry {
+            name: "testconn".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry.clone()).unwrap();
+
+        // Manually create the picker without reloading from disk
+        let entries: Vec<ConnectionEntry> =
+            app.connections.sorted().into_iter().cloned().collect();
+        app.connection_picker = Some(FuzzyPicker::with_display(
+            entries,
+            "Connect",
+            |entry| entry.name.clone(),
+        ));
+
+        assert!(
+            app.connection_picker.is_some(),
+            "Connection picker should be open"
+        );
+
+        // Verify there's a connection to select
+        let picker = app.connection_picker.as_ref().unwrap();
+        assert!(
+            picker.filtered_count() > 0,
+            "Connection picker should have at least one connection"
+        );
+
+        // Press Enter to select the connection
+        let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(key_enter);
+
+        // Connection picker should be closed after Enter
+        assert!(
+            app.connection_picker.is_none(),
+            "Connection picker should close after Enter"
+        );
+
+        // Should have started connecting (connection name should be set)
+        assert_eq!(
+            app.current_connection_name,
+            Some("testconn".to_string()),
+            "Should have set current_connection_name after selecting connection"
+        );
+    }
+
+    /// Test: When error is shown AND connection picker is open, Enter should select connection
+    /// not just dismiss the error (bug fix)
+    #[test]
+    fn test_enter_with_error_and_picker_should_select_connection() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Clear any existing state
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Add a test connection
+        let entry = ConnectionEntry {
+            name: "testconn".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry.clone()).unwrap();
+
+        // Manually create the picker
+        let entries: Vec<ConnectionEntry> =
+            app.connections.sorted().into_iter().cloned().collect();
+        app.connection_picker = Some(FuzzyPicker::with_display(
+            entries,
+            "Connect",
+            |entry| entry.name.clone(),
+        ));
+
+        // ALSO set an error (simulating "Unknown connection" scenario)
+        app.last_error = Some("Unknown connection: badname".to_string());
+
+        assert!(app.connection_picker.is_some(), "Picker should be open");
+        assert!(app.last_error.is_some(), "Error should be shown");
+
+        // Press Enter ONCE - should select connection AND dismiss error
+        let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(key_enter);
+
+        // Both should be resolved in one Enter press
+        assert!(
+            app.connection_picker.is_none(),
+            "Connection picker should close after Enter (was: {:?})",
+            app.connection_picker.is_some()
+        );
+        assert!(
+            app.last_error.is_none(),
+            "Error should be dismissed after Enter (was: {:?})",
+            app.last_error
+        );
+
+        // Should have started connecting
+        assert_eq!(
+            app.current_connection_name,
+            Some("testconn".to_string()),
+            "Should have set current_connection_name after selecting connection"
         );
     }
 

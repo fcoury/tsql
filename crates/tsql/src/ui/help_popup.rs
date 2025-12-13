@@ -71,6 +71,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help"),
+        KeyBinding::new("Ctrl+O", "Open connection picker"),
         KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
     ],
 );
@@ -120,7 +121,7 @@ const QUERY_OTHER: HelpSection = HelpSection::new(
         KeyBinding::new("p/P", "Paste after/before cursor"),
         KeyBinding::new("/", "Search in editor"),
         KeyBinding::new("n/N", "Next/previous search match"),
-        KeyBinding::new("Enter", "Execute query"),
+        KeyBinding::new("Enter / Ctrl+E", "Execute query"),
         KeyBinding::new("Ctrl-p/n", "Previous/next history"),
         KeyBinding::new("Ctrl-r", "Fuzzy history search"),
         KeyBinding::new("Tab", "Trigger completion"),

@@ -712,9 +712,9 @@ impl Keymap {
             Action::PrevMatch,
         );
 
-        // Execute query (Ctrl+S)
+        // Execute query (Ctrl+E)
         km.bind(
-            KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             Action::ExecuteQuery,
         );
 
@@ -743,9 +743,9 @@ impl Keymap {
             Action::EnterNormalMode,
         );
 
-        // Execute query (Ctrl+S)
+        // Execute query (Ctrl+E)
         km.bind(
-            KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             Action::ExecuteQuery,
         );
 

@@ -1592,7 +1592,14 @@ fn compute_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<u16> {
             if i >= widths.len() {
                 break;
             }
-            let w = clamp_u16(display_width(cell) as u16, min_w, max_w);
+            // For UUIDs, use the truncated display width (8 hex chars + ellipsis = 9)
+            // since UUIDs are displayed truncated by default
+            let effective_width = if is_uuid(cell) {
+                9 // 8 hex chars + "…" (unicode ellipsis)
+            } else {
+                display_width(cell) as u16
+            };
+            let w = clamp_u16(effective_width, min_w, max_w);
             widths[i] = widths[i].max(w);
         }
     }
@@ -1615,19 +1622,19 @@ fn display_width(s: &str) -> usize {
 /// - UUIDs: truncated to first 8 chars + "..." to save space (unless uuid_expanded is true)
 /// - JSON: condensed to single line if multi-line
 fn format_cell_for_display(s: &str, width: u16, uuid_expanded: bool) -> String {
-    // For UUIDs, truncate to show first 8 chars + "..." unless expanded
-    // This saves significant space in the grid (36 chars -> 11 chars)
+    // For UUIDs, truncate to show first 8 chars + "…" unless expanded
+    // This saves significant space in the grid (36 chars -> 9 chars)
     if is_uuid(s) {
         if uuid_expanded {
             // Show full UUID (may still be truncated by fit_to_width if column is narrow)
             return fit_to_width(s, width);
         }
-        let truncated = if width >= 11 {
-            // Show first 8 hex chars + "..."
-            format!("{}...", &s[..8])
-        } else if width >= 4 {
+        let truncated = if width >= 9 {
+            // Show first 8 hex chars + "…" (unicode ellipsis)
+            format!("{}…", &s[..8])
+        } else if width >= 2 {
             // Very narrow column - show what we can
-            format!("{}...", &s[..(width as usize).saturating_sub(3)])
+            format!("{}…", &s[..(width as usize).saturating_sub(1)])
         } else {
             s[..width as usize].to_string()
         };
@@ -2485,11 +2492,11 @@ mod tests {
         // Test that UUIDs are truncated in display when collapsed
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let result = format_cell_for_display(uuid, 20, false);
-        assert_eq!(result, "550e8400...         ", "UUID should be truncated to 8 chars + ...");
+        assert_eq!(result, "550e8400…           ", "UUID should be truncated to 8 chars + …");
 
-        // With exact width for truncated UUID
-        let result = format_cell_for_display(uuid, 11, false);
-        assert_eq!(result, "550e8400...", "UUID should fit exactly in 11 chars");
+        // With exact width for truncated UUID (8 chars + 1 ellipsis = 9)
+        let result = format_cell_for_display(uuid, 9, false);
+        assert_eq!(result, "550e8400…", "UUID should fit exactly in 9 chars");
 
         // Non-UUID should not be truncated
         let normal = "hello world";
@@ -2516,10 +2523,10 @@ mod tests {
     fn test_uuid_collapsed_by_default() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         
-        // Default (collapsed) shows truncated
+        // Default (collapsed) shows truncated with unicode ellipsis
         let collapsed = format_cell_for_display(uuid, 20, false);
-        assert!(collapsed.starts_with("550e8400..."), 
-            "Collapsed UUID should start with first 8 chars + ...");
+        assert!(collapsed.starts_with("550e8400…"), 
+            "Collapsed UUID should start with first 8 chars + …");
         
         // Expanded shows full
         let expanded = format_cell_for_display(uuid, 40, true);

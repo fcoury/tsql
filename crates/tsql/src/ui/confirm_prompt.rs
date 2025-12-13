@@ -13,6 +13,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::config::ConnectionEntry;
+
 /// Result of handling a key in the confirmation prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmResult {
@@ -39,6 +41,8 @@ pub enum ConfirmContext {
     DeleteConnection { name: String },
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
+    /// Switching to a new connection with unsaved query changes.
+    SwitchConnection { entry: ConnectionEntry },
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -88,7 +92,8 @@ impl ConfirmPrompt {
             ConfirmContext::CloseJsonEditor { .. }
             | ConfirmContext::CloseCellEditor { .. }
             | ConfirmContext::QuitApp
-            | ConfirmContext::CloseConnectionForm => " Unsaved Changes ",
+            | ConfirmContext::CloseConnectionForm
+            | ConfirmContext::SwitchConnection { .. } => " Unsaved Changes ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
         }
