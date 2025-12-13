@@ -196,7 +196,11 @@ impl ConnectionFormModal {
 
     /// Create a form for editing an existing connection.
     pub fn edit(entry: &ConnectionEntry, existing_password: Option<String>) -> Self {
-        Self::edit_with_keymap(entry, existing_password, Keymap::default_connection_form_keymap())
+        Self::edit_with_keymap(
+            entry,
+            existing_password,
+            Keymap::default_connection_form_keymap(),
+        )
     }
 
     /// Create a form for editing an existing connection with a custom keymap.
@@ -707,15 +711,56 @@ impl ConnectionFormModal {
         .split(inner);
 
         // Render each field in the new order
-        self.render_text_field(frame, chunks[0], "Name:", &self.name, self.name_cursor, FormField::Name);
+        self.render_text_field(
+            frame,
+            chunks[0],
+            "Name:",
+            &self.name,
+            self.name_cursor,
+            FormField::Name,
+        );
         self.render_separator(frame, chunks[1]);
-        self.render_text_field(frame, chunks[2], "User:", &self.user, self.user_cursor, FormField::User);
+        self.render_text_field(
+            frame,
+            chunks[2],
+            "User:",
+            &self.user,
+            self.user_cursor,
+            FormField::User,
+        );
         self.render_password_field(frame, chunks[3]);
-        self.render_checkbox(frame, chunks[4], "Save to keychain", self.save_password, FormField::SavePassword);
+        self.render_checkbox(
+            frame,
+            chunks[4],
+            "Save to keychain",
+            self.save_password,
+            FormField::SavePassword,
+        );
         self.render_separator(frame, chunks[5]);
-        self.render_text_field(frame, chunks[6], "Host:", &self.host, self.host_cursor, FormField::Host);
-        self.render_text_field(frame, chunks[7], "Port:", &self.port, self.port_cursor, FormField::Port);
-        self.render_text_field(frame, chunks[8], "Database:", &self.database, self.database_cursor, FormField::Database);
+        self.render_text_field(
+            frame,
+            chunks[6],
+            "Host:",
+            &self.host,
+            self.host_cursor,
+            FormField::Host,
+        );
+        self.render_text_field(
+            frame,
+            chunks[7],
+            "Port:",
+            &self.port,
+            self.port_cursor,
+            FormField::Port,
+        );
+        self.render_text_field(
+            frame,
+            chunks[8],
+            "Database:",
+            &self.database,
+            self.database_cursor,
+            FormField::Database,
+        );
         self.render_separator(frame, chunks[9]);
         self.render_color_field(frame, chunks[10]);
         self.render_url_paste_field(frame, chunks[11]);
@@ -798,7 +843,14 @@ impl ConnectionFormModal {
         frame.render_widget(value_widget, chunks[1]);
     }
 
-    fn render_checkbox(&self, frame: &mut Frame, area: Rect, label: &str, checked: bool, field: FormField) {
+    fn render_checkbox(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        checked: bool,
+        field: FormField,
+    ) {
         let is_focused = self.focused == field;
         let label_width = 10;
 
@@ -930,8 +982,8 @@ impl ConnectionFormModal {
             Span::raw(" cancel"),
         ];
 
-        let help = Paragraph::new(Line::from(help_spans))
-            .alignment(ratatui::layout::Alignment::Center);
+        let help =
+            Paragraph::new(Line::from(help_spans)).alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(help, area);
     }
 }
@@ -1279,7 +1331,11 @@ mod tests {
         form2.user = "postgres".to_string();
 
         let action2 = form2.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert_eq!(action2, ConnectionFormAction::Continue, "Ctrl+S should not save with empty keymap");
+        assert_eq!(
+            action2,
+            ConnectionFormAction::Continue,
+            "Ctrl+S should not save with empty keymap"
+        );
     }
 
     #[test]

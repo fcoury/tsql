@@ -11,14 +11,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
 use tui_syntax::{html, json, themes, Highlighter};
 
 use crate::ui::HighlightedTextArea;
-use crate::util::{detect_content_type, is_json_column_type, is_valid_json, try_format_json, ContentType};
+use crate::util::{
+    detect_content_type, is_json_column_type, is_valid_json, try_format_json, ContentType,
+};
 use crate::vim::{Motion, VimCommand, VimConfig, VimHandler, VimMode};
 
 /// The result of handling a key event in the JSON editor.
@@ -248,16 +252,14 @@ impl<'a> JsonEditorModal<'a> {
             // Quit (cancel)
             "q" | "quit" => JsonEditorAction::Cancel,
             // Save and quit
-            "wq" | "x" => {
-                match self.try_save() {
-                    JsonEditorAction::Error(e) => JsonEditorAction::Error(e),
-                    _ => JsonEditorAction::Save {
-                        value: self.content(),
-                        row: self.row,
-                        col: self.col,
-                    },
-                }
-            }
+            "wq" | "x" => match self.try_save() {
+                JsonEditorAction::Error(e) => JsonEditorAction::Error(e),
+                _ => JsonEditorAction::Save {
+                    value: self.content(),
+                    row: self.row,
+                    col: self.col,
+                },
+            },
             // Unknown command
             _ => JsonEditorAction::Error(format!("Unknown command: {}", cmd)),
         }
@@ -560,7 +562,10 @@ impl<'a> JsonEditorModal<'a> {
         let modified_indicator = if self.is_modified() { " [+]" } else { "" };
         let title = format!(
             " Edit: {} ({}){} - {} ",
-            self.column_name, self.column_type, modified_indicator, self.mode.label()
+            self.column_name,
+            self.column_type,
+            modified_indicator,
+            self.mode.label()
         );
 
         // Detect content type and determine border color
@@ -640,8 +645,8 @@ impl<'a> JsonEditorModal<'a> {
                     .track_symbol(Some("│"))
             };
 
-            let mut scrollbar_state = ScrollbarState::new(total_lines)
-                .position(self.scroll_offset.0 as usize);
+            let mut scrollbar_state =
+                ScrollbarState::new(total_lines).position(self.scroll_offset.0 as usize);
 
             frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
@@ -882,7 +887,10 @@ mod tests {
 
         // Content should be formatted (multi-line)
         let content = editor.content();
-        assert!(content.contains('\n'), "Content should be formatted with newlines");
+        assert!(
+            content.contains('\n'),
+            "Content should be formatted with newlines"
+        );
     }
 
     #[test]
@@ -936,7 +944,10 @@ mod tests {
             editor.original_value,
             "Formatted content should match original"
         );
-        assert!(!editor.is_modified(), "Editor should not be modified initially when content matches original");
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified initially when content matches original"
+        );
     }
 
     #[test]
@@ -1031,7 +1042,10 @@ mod tests {
                 assert_eq!(row, 0);
                 assert_eq!(col, 0);
             }
-            _ => panic!("Expected RequestClose, got {:?}", std::any::type_name_of_val(&result)),
+            _ => panic!(
+                "Expected RequestClose, got {:?}",
+                std::any::type_name_of_val(&result)
+            ),
         }
     }
 

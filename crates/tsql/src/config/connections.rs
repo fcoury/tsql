@@ -190,9 +190,7 @@ impl ConnectionEntry {
         let url = Url::parse(url_str).context("Invalid URL format")?;
 
         if url.scheme() != "postgres" && url.scheme() != "postgresql" {
-            return Err(anyhow!(
-                "URL must use postgres:// or postgresql:// scheme"
-            ));
+            return Err(anyhow!("URL must use postgres:// or postgresql:// scheme"));
         }
 
         let host = url
@@ -297,7 +295,10 @@ impl ConnectionEntry {
 
     /// Format connection for display (without password)
     pub fn display_string(&self) -> String {
-        format!("{}@{}:{}/{}", self.user, self.host, self.port, self.database)
+        format!(
+            "{}@{}:{}/{}",
+            self.user, self.host, self.port, self.database
+        )
     }
 
     /// Short display format for status line
@@ -305,7 +306,10 @@ impl ConnectionEntry {
         if self.port == 5432 {
             format!("{}@{}/{}", self.user, self.host, self.database)
         } else {
-            format!("{}@{}:{}/{}", self.user, self.host, self.port, self.database)
+            format!(
+                "{}@{}:{}/{}",
+                self.user, self.host, self.port, self.database
+            )
         }
     }
 
@@ -529,13 +533,11 @@ impl ConnectionsFile {
     /// Get connections sorted by favorite first, then alphabetically
     pub fn sorted(&self) -> Vec<&ConnectionEntry> {
         let mut sorted: Vec<_> = self.connections.iter().collect();
-        sorted.sort_by(|a, b| {
-            match (a.favorite, b.favorite) {
-                (Some(fa), Some(fb)) => fa.cmp(&fb),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.name.cmp(&b.name),
-            }
+        sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
+            (Some(fa), Some(fb)) => fa.cmp(&fb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
         });
         sorted
     }
@@ -990,11 +992,14 @@ password_in_keychain = true
         };
 
         assert_eq!(entry.display_string(), "admin@db.example.com:5433/mydb");
-        
+
         let entry_default_port = ConnectionEntry {
             port: 5432,
             ..entry
         };
-        assert_eq!(entry_default_port.short_display(), "admin@db.example.com/mydb");
+        assert_eq!(
+            entry_default_port.short_display(),
+            "admin@db.example.com/mydb"
+        );
     }
 }

@@ -679,10 +679,8 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('p'), KeyModifiers::NONE),
             Action::Paste,
         );
-        km.bind(
-            KeyBinding::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            Action::DeleteLine,
-        );
+        // Note: 'd' is handled as a pending operator (dd, dw, de, db, d$, d0)
+        // and should NOT be mapped directly to an action here
         km.bind(
             KeyBinding::new(KeyCode::Char('x'), KeyModifiers::NONE),
             Action::DeleteChar,

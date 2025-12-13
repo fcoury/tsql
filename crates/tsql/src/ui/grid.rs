@@ -6,7 +6,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Widget,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
@@ -1288,7 +1291,7 @@ impl<'a> Widget for DataGrid<'a> {
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-            None, // No search highlighting for headers
+            None,  // No search highlighting for headers
             false, // Headers never have UUID expansion
             buf,
         );
@@ -2492,7 +2495,10 @@ mod tests {
         // Test that UUIDs are truncated in display when collapsed
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let result = format_cell_for_display(uuid, 20, false);
-        assert_eq!(result, "550e8400…           ", "UUID should be truncated to 8 chars + …");
+        assert_eq!(
+            result, "550e8400…           ",
+            "UUID should be truncated to 8 chars + …"
+        );
 
         // With exact width for truncated UUID (8 chars + 1 ellipsis = 9)
         let result = format_cell_for_display(uuid, 9, false);
@@ -2501,37 +2507,48 @@ mod tests {
         // Non-UUID should not be truncated
         let normal = "hello world";
         let result = format_cell_for_display(normal, 20, false);
-        assert_eq!(result, "hello world         ", "Non-UUID should not be truncated");
+        assert_eq!(
+            result, "hello world         ",
+            "Non-UUID should not be truncated"
+        );
     }
 
     #[test]
     fn test_uuid_expanded_shows_full_uuid() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        
+
         // With uuid_expanded = true, should show full UUID (padded to width)
         let result = format_cell_for_display(uuid, 40, true);
-        assert_eq!(result, "550e8400-e29b-41d4-a716-446655440000    ", 
-            "Expanded UUID should show full value padded to width");
-        
+        assert_eq!(
+            result, "550e8400-e29b-41d4-a716-446655440000    ",
+            "Expanded UUID should show full value padded to width"
+        );
+
         // If column is narrower than UUID, it should be truncated with ellipsis
         let result = format_cell_for_display(uuid, 20, true);
-        assert!(result.contains('…') || result.len() == 20, 
-            "Expanded UUID in narrow column should be truncated");
+        assert!(
+            result.contains('…') || result.len() == 20,
+            "Expanded UUID in narrow column should be truncated"
+        );
     }
 
     #[test]
     fn test_uuid_collapsed_by_default() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        
+
         // Default (collapsed) shows truncated with unicode ellipsis
         let collapsed = format_cell_for_display(uuid, 20, false);
-        assert!(collapsed.starts_with("550e8400…"), 
-            "Collapsed UUID should start with first 8 chars + …");
-        
+        assert!(
+            collapsed.starts_with("550e8400…"),
+            "Collapsed UUID should start with first 8 chars + …"
+        );
+
         // Expanded shows full
         let expanded = format_cell_for_display(uuid, 40, true);
-        assert!(expanded.starts_with("550e8400-e29b-41d4-a716-446655440000"), 
-            "Expanded UUID should show full value");
+        assert!(
+            expanded.starts_with("550e8400-e29b-41d4-a716-446655440000"),
+            "Expanded UUID should show full value"
+        );
     }
 
     #[test]

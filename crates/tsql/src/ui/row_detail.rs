@@ -10,7 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use tui_syntax::{html, json, themes, Highlighter};
@@ -87,8 +89,9 @@ impl RowDetailModal {
     pub fn handle_key(&mut self, key: KeyEvent) -> RowDetailAction {
         match (key.code, key.modifiers) {
             // Close view
-            (KeyCode::Esc, KeyModifiers::NONE)
-            | (KeyCode::Char('q'), KeyModifiers::NONE) => RowDetailAction::Close,
+            (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                RowDetailAction::Close
+            }
 
             // Scroll down / next field
             (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
@@ -121,7 +124,8 @@ impl RowDetailModal {
             }
 
             // Full page down (Ctrl-f or PageDown)
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) | (KeyCode::PageDown, KeyModifiers::NONE) => {
+            (KeyCode::Char('f'), KeyModifiers::CONTROL)
+            | (KeyCode::PageDown, KeyModifiers::NONE) => {
                 let amount = self.visible_height.saturating_sub(2);
                 for _ in 0..amount {
                     self.select_next();
@@ -146,7 +150,8 @@ impl RowDetailModal {
             }
 
             // Bottom (G)
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
+            (KeyCode::Char('G'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                 if self.field_count > 0 {
                     self.selected_field = self.field_count - 1;
                     self.ensure_selected_visible();
@@ -220,12 +225,20 @@ impl RowDetailModal {
         frame.render_widget(Clear, modal_area);
 
         // Build title
-        let title = format!(" Row {} Details ({} columns) ", self.row_index + 1, self.field_count);
+        let title = format!(
+            " Row {} Details ({} columns) ",
+            self.row_index + 1,
+            self.field_count
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
             .border_style(Style::default().fg(Color::Cyan));
 
         let inner = block.inner(modal_area);
@@ -317,7 +330,11 @@ impl RowDetailModal {
 
             if value_lines.is_empty() || value.is_empty() {
                 // Empty or NULL value
-                let display_value = if value.is_empty() { "(empty)".to_string() } else { value.clone() };
+                let display_value = if value.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    value.clone()
+                };
                 lines.push(Line::from(vec![
                     Span::styled("    ", value_style),
                     Span::styled(display_value, value_style.fg(Color::DarkGray)),
@@ -326,7 +343,7 @@ impl RowDetailModal {
                 // Single line value
                 let truncated = truncate_for_display(&value, max_value_width);
                 let highlighted = self.highlight_value(&truncated, content_type);
-                
+
                 let mut spans = vec![Span::styled("    ", value_style)];
                 for span in highlighted {
                     spans.push(if is_selected {
@@ -338,11 +355,12 @@ impl RowDetailModal {
                 lines.push(Line::from(spans));
             } else {
                 // Multi-line value - collect the lines first
-                let value_lines_owned: Vec<String> = value_lines.iter().map(|s| s.to_string()).collect();
+                let value_lines_owned: Vec<String> =
+                    value_lines.iter().map(|s| s.to_string()).collect();
                 for (i, line) in value_lines_owned.iter().take(max_lines).enumerate() {
                     let truncated = truncate_for_display(line, max_value_width);
                     let highlighted = self.highlight_value(&truncated, content_type);
-                    
+
                     let mut spans = vec![Span::styled("    ", value_style)];
                     for span in highlighted {
                         spans.push(if is_selected {
@@ -392,7 +410,7 @@ impl RowDetailModal {
                 return spans;
             }
         }
-        
+
         // Plain text - no highlighting
         vec![Span::raw(value.to_string())]
     }
@@ -423,8 +441,8 @@ impl RowDetailModal {
             .track_symbol(Some("│"))
             .thumb_symbol("█");
 
-        let mut scrollbar_state = ScrollbarState::new(self.field_count)
-            .position(self.selected_field);
+        let mut scrollbar_state =
+            ScrollbarState::new(self.field_count).position(self.selected_field);
 
         let scrollbar_area = Rect {
             x: area.x + area.width.saturating_sub(1),
@@ -442,11 +460,11 @@ fn truncate_for_display(s: &str, max_width: usize) -> String {
     if s.len() <= max_width {
         return s.to_string();
     }
-    
+
     if max_width <= 3 {
         return s.chars().take(max_width).collect();
     }
-    
+
     let truncated: String = s.chars().take(max_width - 1).collect();
     format!("{}…", truncated)
 }
@@ -458,7 +476,11 @@ mod tests {
     fn create_test_modal() -> RowDetailModal {
         RowDetailModal::new(
             vec!["id".to_string(), "name".to_string(), "data".to_string()],
-            vec!["1".to_string(), "Alice".to_string(), r#"{"key": "value"}"#.to_string()],
+            vec![
+                "1".to_string(),
+                "Alice".to_string(),
+                r#"{"key": "value"}"#.to_string(),
+            ],
             vec!["int4".to_string(), "text".to_string(), "jsonb".to_string()],
             0,
         )
@@ -475,24 +497,24 @@ mod tests {
     #[test]
     fn test_navigation_j_k() {
         let mut modal = create_test_modal();
-        
+
         // Initial state
         assert_eq!(modal.selected_field, 0);
-        
+
         // Press j to move down
         let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         let result = modal.handle_key(key);
         assert_eq!(result, RowDetailAction::Continue);
         assert_eq!(modal.selected_field, 1);
-        
+
         // Press j again
         modal.handle_key(key);
         assert_eq!(modal.selected_field, 2);
-        
+
         // Press j at bottom - should stay at 2
         modal.handle_key(key);
         assert_eq!(modal.selected_field, 2);
-        
+
         // Press k to move up
         let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
         modal.handle_key(key);
@@ -502,11 +524,11 @@ mod tests {
     #[test]
     fn test_close_actions() {
         let mut modal = create_test_modal();
-        
+
         // Esc closes
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(modal.handle_key(key), RowDetailAction::Close);
-        
+
         // q closes
         let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(modal.handle_key(key), RowDetailAction::Close);
@@ -516,11 +538,11 @@ mod tests {
     fn test_edit_action() {
         let mut modal = create_test_modal();
         modal.selected_field = 1;
-        
+
         // e opens editor
         let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
         assert_eq!(modal.handle_key(key), RowDetailAction::Edit { col: 1 });
-        
+
         // Enter also opens editor
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(modal.handle_key(key), RowDetailAction::Edit { col: 1 });
@@ -530,12 +552,12 @@ mod tests {
     fn test_go_to_top_bottom() {
         let mut modal = create_test_modal();
         modal.selected_field = 1;
-        
+
         // g goes to top
         let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
         modal.handle_key(key);
         assert_eq!(modal.selected_field, 0);
-        
+
         // G goes to bottom
         let key = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE);
         modal.handle_key(key);
