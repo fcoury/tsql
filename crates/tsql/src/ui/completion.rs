@@ -108,7 +108,10 @@ impl CompletionPopup {
 
     pub fn select_prev(&mut self) {
         if !self.filtered.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.filtered.len() - 1);
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.filtered.len() - 1);
         }
     }
 
@@ -188,7 +191,11 @@ impl SchemaCache {
         match context {
             CompletionContext::General => {
                 // Keywords + tables
-                items.extend(sql_keywords().into_iter().map(|k| CompletionItem::keyword(k)));
+                items.extend(
+                    sql_keywords()
+                        .into_iter()
+                        .map(|k| CompletionItem::keyword(k)),
+                );
                 for table in &self.tables {
                     items.push(CompletionItem::table(
                         table.name.clone(),
@@ -215,7 +222,11 @@ impl SchemaCache {
                         ));
                     }
                 }
-                items.extend(sql_keywords().into_iter().map(|k| CompletionItem::keyword(k)));
+                items.extend(
+                    sql_keywords()
+                        .into_iter()
+                        .map(|k| CompletionItem::keyword(k)),
+                );
             }
         }
 
@@ -235,38 +246,145 @@ pub enum CompletionContext {
 pub fn sql_keywords() -> Vec<&'static str> {
     vec![
         // DML
-        "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "EXISTS",
-        "BETWEEN", "LIKE", "ILIKE", "IS", "NULL", "TRUE", "FALSE",
-        "ORDER", "BY", "ASC", "DESC", "NULLS", "FIRST", "LAST",
-        "LIMIT", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY",
-        "GROUP", "HAVING", "DISTINCT", "ALL", "AS",
-        "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "ON", "USING",
-        "UNION", "INTERSECT", "EXCEPT",
-        "INSERT", "INTO", "VALUES", "DEFAULT", "RETURNING",
-        "UPDATE", "SET",
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "EXISTS",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "IS",
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "ORDER",
+        "BY",
+        "ASC",
+        "DESC",
+        "NULLS",
+        "FIRST",
+        "LAST",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "NEXT",
+        "ROWS",
+        "ONLY",
+        "GROUP",
+        "HAVING",
+        "DISTINCT",
+        "ALL",
+        "AS",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "OUTER",
+        "CROSS",
+        "ON",
+        "USING",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "INSERT",
+        "INTO",
+        "VALUES",
+        "DEFAULT",
+        "RETURNING",
+        "UPDATE",
+        "SET",
         "DELETE",
         // DDL
-        "CREATE", "ALTER", "DROP", "TRUNCATE",
-        "TABLE", "INDEX", "VIEW", "SCHEMA", "DATABASE", "SEQUENCE",
-        "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "CHECK", "CONSTRAINT",
-        "CASCADE", "RESTRICT",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "TABLE",
+        "INDEX",
+        "VIEW",
+        "SCHEMA",
+        "DATABASE",
+        "SEQUENCE",
+        "PRIMARY",
+        "KEY",
+        "FOREIGN",
+        "REFERENCES",
+        "UNIQUE",
+        "CHECK",
+        "CONSTRAINT",
+        "CASCADE",
+        "RESTRICT",
         // Types
-        "INTEGER", "INT", "BIGINT", "SMALLINT", "SERIAL", "BIGSERIAL",
-        "TEXT", "VARCHAR", "CHAR", "CHARACTER",
-        "BOOLEAN", "BOOL",
-        "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "INTERVAL",
-        "NUMERIC", "DECIMAL", "REAL", "DOUBLE", "PRECISION", "FLOAT",
-        "JSON", "JSONB", "UUID", "BYTEA", "ARRAY",
+        "INTEGER",
+        "INT",
+        "BIGINT",
+        "SMALLINT",
+        "SERIAL",
+        "BIGSERIAL",
+        "TEXT",
+        "VARCHAR",
+        "CHAR",
+        "CHARACTER",
+        "BOOLEAN",
+        "BOOL",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "DATE",
+        "TIME",
+        "INTERVAL",
+        "NUMERIC",
+        "DECIMAL",
+        "REAL",
+        "DOUBLE",
+        "PRECISION",
+        "FLOAT",
+        "JSON",
+        "JSONB",
+        "UUID",
+        "BYTEA",
+        "ARRAY",
         // Functions
-        "COUNT", "SUM", "AVG", "MIN", "MAX",
-        "COALESCE", "NULLIF", "GREATEST", "LEAST",
-        "CASE", "WHEN", "THEN", "ELSE", "END",
-        "CAST", "EXTRACT", "NOW", "CURRENT_TIMESTAMP", "CURRENT_DATE",
-        "LOWER", "UPPER", "TRIM", "SUBSTRING", "LENGTH", "CONCAT",
+        "COUNT",
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "COALESCE",
+        "NULLIF",
+        "GREATEST",
+        "LEAST",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "CAST",
+        "EXTRACT",
+        "NOW",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_DATE",
+        "LOWER",
+        "UPPER",
+        "TRIM",
+        "SUBSTRING",
+        "LENGTH",
+        "CONCAT",
         // Transaction
-        "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
         // Other
-        "EXPLAIN", "ANALYZE", "VERBOSE", "WITH", "RECURSIVE",
+        "EXPLAIN",
+        "ANALYZE",
+        "VERBOSE",
+        "WITH",
+        "RECURSIVE",
     ]
 }
 

@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
-use tui_syntax::{Highlighter, sql, themes};
+use tui_syntax::{sql, themes, Highlighter};
 use tui_textarea::TextArea;
 
 /// A widget that renders a TextArea with syntax highlighting.
@@ -93,7 +93,7 @@ impl Widget for HighlightedTextArea<'_> {
 
         // Convert highlighted_lines into a vec we can index and take from
         let mut highlighted_lines = self.highlighted_lines;
-        
+
         // Pad with empty lines if textarea has more lines than highlighted
         while highlighted_lines.len() < total_lines {
             highlighted_lines.push(Line::from(vec![]));
@@ -125,8 +125,7 @@ impl Widget for HighlightedTextArea<'_> {
 
             // Apply cursor highlighting (use original cursor_col for span manipulation)
             if is_cursor_line {
-                line_spans =
-                    apply_cursor_to_spans(line_spans, cursor_col, self.cursor_style);
+                line_spans = apply_cursor_to_spans(line_spans, cursor_col, self.cursor_style);
             }
 
             let result_line = Line::from(line_spans);
@@ -140,8 +139,7 @@ impl Widget for HighlightedTextArea<'_> {
         }
 
         // Render the highlighted text as a Paragraph with scroll offset
-        let paragraph = Paragraph::new(final_lines)
-            .scroll((scroll_row as u16, scroll_col as u16));
+        let paragraph = Paragraph::new(final_lines).scroll((scroll_row as u16, scroll_col as u16));
         paragraph.render(inner_area, buf);
     }
 }
@@ -173,7 +171,7 @@ fn calculate_scroll_offset(
     if viewport_width > 0 {
         // Leave some margin (3 chars) for context
         let margin = 3.min(viewport_width / 4);
-        
+
         // If cursor is left of the viewport, scroll left
         if cursor_col < scroll_col + margin {
             scroll_col = cursor_col.saturating_sub(margin);
@@ -384,18 +382,18 @@ mod tests {
         // Simulates: "SELECT\n" with cursor on line 1, col 0
         // highlighted_lines would be ["SELECT"] but cursor is on row 1
         // This test verifies our fix handles this case
-        
+
         let mut textarea = TextArea::new(vec!["SELECT".to_string(), "".to_string()]);
         // Move cursor to second line
         textarea.move_cursor(tui_textarea::CursorMove::Down);
-        
+
         let (cursor_row, cursor_col) = textarea.cursor();
         assert_eq!(cursor_row, 1, "cursor should be on row 1");
         assert_eq!(cursor_col, 0, "cursor should be at column 0");
-        
+
         // Highlighted lines might only have one line if the second is empty
         let highlighted_lines = vec![Line::from("SELECT")];
-        
+
         // The number of highlighted lines (1) is less than cursor_row + 1 (2)
         // This is the bug condition
         assert!(
@@ -429,9 +427,13 @@ mod tests {
         // The cursor should be visible on line 1 (second line)
         // Check that something is rendered on the second line at position (0, 1)
         let cell = buf.cell((0, 1)).unwrap();
-        
+
         // The cursor should be a space with reversed style (cursor on empty line)
-        assert_eq!(cell.symbol(), " ", "Cursor should render as space on empty line");
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "Cursor should render as space on empty line"
+        );
         assert!(
             cell.modifier.contains(Modifier::REVERSED),
             "Cursor should have REVERSED modifier"

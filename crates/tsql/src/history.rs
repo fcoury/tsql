@@ -136,8 +136,7 @@ impl History {
             entries: self.entries.clone(),
         };
 
-        let content = serde_json::to_string_pretty(&file)
-            .context("Failed to serialize history")?;
+        let content = serde_json::to_string_pretty(&file).context("Failed to serialize history")?;
 
         fs::write(&self.path, content)
             .with_context(|| format!("Failed to write history file: {}", self.path.display()))?;
@@ -212,14 +211,13 @@ impl History {
                 let mut buf = Vec::new();
                 let haystack = Utf32Str::new(&entry.query, &mut buf);
 
-                pat.indices(haystack, &mut matcher, &mut indices).map(|score| {
-                    HistoryMatch {
+                pat.indices(haystack, &mut matcher, &mut indices)
+                    .map(|score| HistoryMatch {
                         index,
                         entry: entry.clone(),
                         score,
                         indices,
-                    }
-                })
+                    })
             })
             .collect();
 
@@ -275,7 +273,10 @@ mod tests {
         {
             let mut history = History::load_from_path(&path, 100).unwrap();
             history.push("SELECT * FROM users".to_string(), None);
-            history.push("SELECT * FROM orders".to_string(), Some("localhost/mydb".to_string()));
+            history.push(
+                "SELECT * FROM orders".to_string(),
+                Some("localhost/mydb".to_string()),
+            );
             history.save().unwrap();
         }
 
@@ -284,7 +285,10 @@ mod tests {
         assert_eq!(history.entries()[0].query, "SELECT * FROM users");
         assert_eq!(history.entries()[1].query, "SELECT * FROM orders");
         assert!(history.entries()[0].connection.is_none());
-        assert_eq!(history.entries()[1].connection.as_deref(), Some("localhost/mydb"));
+        assert_eq!(
+            history.entries()[1].connection.as_deref(),
+            Some("localhost/mydb")
+        );
 
         fs::remove_file(&path).ok();
     }
@@ -380,7 +384,8 @@ mod tests {
         };
 
         let mut f = fs::File::create(&path).unwrap();
-        f.write_all(serde_json::to_string(&file).unwrap().as_bytes()).unwrap();
+        f.write_all(serde_json::to_string(&file).unwrap().as_bytes())
+            .unwrap();
 
         // Load with max_entries = 3.
         let history = History::load_from_path(&path, 3).unwrap();

@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use tokio::sync::Mutex;
+use ratatui::Terminal;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
@@ -19,15 +19,14 @@ use super::state::{DbStatus, Focus, Mode, SearchTarget};
 use crate::config::{Action, Config, KeyBinding, Keymap};
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
-    ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo, DataGrid,
-    FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
-    JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction,
-    SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    quote_identifier,
+    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo,
+    DataGrid, FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup,
+    HighlightedTextArea, JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor,
+    ResizeAction, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
 };
-use crate::util::{is_json_column_type, should_use_multiline_editor};
 use crate::util::format_pg_error;
+use crate::util::{is_json_column_type, should_use_multiline_editor};
 use tui_syntax::Highlighter;
 
 // Meta-command SQL queries (psql-style \dt, \d, etc.)
@@ -153,7 +152,10 @@ fn escape_sql_identifier(s: &str) -> String {
     // Remove any existing quotes and escape internal quotes
     let cleaned = s.trim_matches('"').replace('"', "\"\"");
     // For simple identifiers, return as-is; otherwise quote
-    if cleaned.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+    if cleaned
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
         cleaned
     } else {
         format!("\"{}\"", cleaned)
@@ -164,7 +166,7 @@ fn escape_sql_identifier(s: &str) -> String {
 async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
     let query = META_QUERY_PRIMARY_KEYS.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
-    
+
     match guard.simple_query(&query).await {
         Ok(messages) => {
             let mut pks = Vec::new();
@@ -190,10 +192,13 @@ ORDER BY ordinal_position
 "#;
 
 /// Fetch column types for a table, returning a map of column_name -> data_type.
-async fn fetch_column_types(client: &SharedClient, table: &str) -> std::collections::HashMap<String, String> {
+async fn fetch_column_types(
+    client: &SharedClient,
+    table: &str,
+) -> std::collections::HashMap<String, String> {
     let query = META_QUERY_COLUMN_TYPES.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
-    
+
     match guard.simple_query(&query).await {
         Ok(messages) => {
             let mut types = std::collections::HashMap::new();
@@ -232,40 +237,40 @@ pub struct QueryResult {
 /// Returns None for complex queries (JOINs, subqueries, etc.)
 fn extract_table_from_query(query: &str) -> Option<String> {
     let query = query.trim().to_lowercase();
-    
+
     // Must start with SELECT
     if !query.starts_with("select") {
         return None;
     }
-    
+
     // Find FROM keyword
     let from_pos = query.find(" from ")?;
     let after_from = &query[from_pos + 6..].trim_start();
-    
+
     // Extract the table name (first word after FROM)
     // Stop at whitespace, semicolon, or end of string
     let table_end = after_from
         .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
         .unwrap_or(after_from.len());
-    
+
     let table = after_from[..table_end].trim();
-    
+
     if table.is_empty() {
         return None;
     }
-    
+
     // Check for complex queries (JOINs, subqueries)
     let rest = &after_from[table_end..];
     if rest.contains(" join ") || table.starts_with('(') {
         return None;
     }
-    
+
     // Remove schema prefix if present (public.users -> users)
     let table_name = table.rsplit('.').next().unwrap_or(table);
-    
+
     // Remove quotes if present
     let table_name = table_name.trim_matches('"').trim_matches('\'');
-    
+
     Some(table_name.to_string())
 }
 
@@ -476,11 +481,7 @@ impl CellEditor {
         }
 
         // Extract visible characters
-        let visible_chars: String = chars
-            .iter()
-            .skip(scroll)
-            .take(visible_width)
-            .collect();
+        let visible_chars: String = chars.iter().skip(scroll).take(visible_width).collect();
 
         let cursor_in_visible = cursor_char_pos.saturating_sub(scroll);
 
@@ -765,15 +766,13 @@ impl App {
                     .title(query_title)
                     .border_style(query_border);
 
-                let highlighted_editor = HighlightedTextArea::new(
-                    &self.editor.textarea,
-                    highlighted_lines.clone(),
-                )
-                .block(query_block)
-                .scroll(self.editor_scroll);
+                let highlighted_editor =
+                    HighlightedTextArea::new(&self.editor.textarea, highlighted_lines.clone())
+                        .block(query_block)
+                        .scroll(self.editor_scroll);
 
                 frame.render_widget(highlighted_editor, query_area);
-                
+
                 // Update editor scroll based on cursor position
                 // The inner area height is query_area.height - 2 (for borders)
                 let inner_height = query_area.height.saturating_sub(2) as usize;
@@ -902,7 +901,9 @@ impl App {
                         let (cursor_row, cursor_col) = self.editor.textarea.cursor();
                         // Estimate position (query_area starts at y=0, each line is 1 row)
                         let popup_y = query_area.y + 1 + cursor_row as u16;
-                        let popup_x = query_area.x + 1 + cursor_col.saturating_sub(self.completion.prefix.len()) as u16;
+                        let popup_x = query_area.x
+                            + 1
+                            + cursor_col.saturating_sub(self.completion.prefix.len()) as u16;
 
                         let popup_height = (visible.len() + 2) as u16; // +2 for borders
                         let popup_width = 40u16.min(size.width.saturating_sub(popup_x));
@@ -939,7 +940,10 @@ impl App {
                                     Style::default()
                                 };
                                 Line::from(vec![
-                                    Span::styled(format!("{} ", prefix), Style::default().fg(Color::DarkGray)),
+                                    Span::styled(
+                                        format!("{} ", prefix),
+                                        Style::default().fg(Color::DarkGray),
+                                    ),
                                     Span::styled(&item.label, style),
                                 ])
                             })
@@ -1030,7 +1034,9 @@ impl App {
 
                     // Show scroll indicators if needed
                     let total_chars = self.cell_editor.value.chars().count();
-                    let scroll_indicator = if self.cell_editor.scroll_offset > 0 || total_chars > inner_width {
+                    let scroll_indicator = if self.cell_editor.scroll_offset > 0
+                        || total_chars > inner_width
+                    {
                         let at_start = self.cell_editor.scroll_offset == 0;
                         let at_end = self.cell_editor.scroll_offset + inner_width >= total_chars;
                         match (at_start, at_end) {
@@ -1056,7 +1062,9 @@ impl App {
                             "{} len: {} pos: {}",
                             scroll_indicator,
                             value_len,
-                            self.cell_editor.value[..self.cell_editor.cursor].chars().count()
+                            self.cell_editor.value[..self.cell_editor.cursor]
+                                .chars()
+                                .count()
                         );
                         let info_area = Rect {
                             x: popup_area.x + 1,
@@ -1064,8 +1072,8 @@ impl App {
                             width: popup_area.width.saturating_sub(2),
                             height: 1,
                         };
-                        let info_widget = Paragraph::new(info)
-                            .style(Style::default().fg(Color::DarkGray));
+                        let info_widget =
+                            Paragraph::new(info).style(Style::default().fg(Color::DarkGray));
                         frame.render_widget(info_widget, info_area);
                     }
                 }
@@ -1283,13 +1291,11 @@ impl App {
                         GridKeyResult::CopyToClipboard(text) => {
                             self.copy_to_clipboard(&text);
                         }
-                        GridKeyResult::ResizeColumn { col, action } => {
-                            match action {
-                                ResizeAction::Widen => self.grid.widen_column(col, 2),
-                                ResizeAction::Narrow => self.grid.narrow_column(col, 2),
-                                ResizeAction::AutoFit => self.grid.autofit_column(col),
-                            }
-                        }
+                        GridKeyResult::ResizeColumn { col, action } => match action {
+                            ResizeAction::Widen => self.grid.widen_column(col, 2),
+                            ResizeAction::Narrow => self.grid.narrow_column(col, 2),
+                            ResizeAction::AutoFit => self.grid.autofit_column(col),
+                        },
                         GridKeyResult::EditCell { row, col } => {
                             self.start_cell_edit(row, col);
                         }
@@ -1307,24 +1313,22 @@ impl App {
 
     fn copy_to_clipboard(&mut self, text: &str) {
         match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                match clipboard.set_text(text) {
-                    Ok(()) => {
-                        let lines = text.lines().count();
-                        let chars = text.len();
-                        self.last_status = Some(format!(
-                            "Copied {} line{}, {} char{}",
-                            lines,
-                            if lines == 1 { "" } else { "s" },
-                            chars,
-                            if chars == 1 { "" } else { "s" }
-                        ));
-                    }
-                    Err(e) => {
-                        self.last_error = Some(format!("Failed to copy: {}", e));
-                    }
+            Ok(mut clipboard) => match clipboard.set_text(text) {
+                Ok(()) => {
+                    let lines = text.lines().count();
+                    let chars = text.len();
+                    self.last_status = Some(format!(
+                        "Copied {} line{}, {} char{}",
+                        lines,
+                        if lines == 1 { "" } else { "s" },
+                        chars,
+                        if chars == 1 { "" } else { "s" }
+                    ));
                 }
-            }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed to copy: {}", e));
+                }
+            },
             Err(e) => {
                 self.last_error = Some(format!("Clipboard unavailable: {}", e));
             }
@@ -1362,9 +1366,7 @@ impl App {
         // Determine if we should use the multiline JSON editor
         if should_use_multiline_editor(&value) || is_json_column_type(&col_type) {
             // Open JSON editor modal
-            self.json_editor = Some(JsonEditorModal::new(
-                value, col_name, col_type, row, col,
-            ));
+            self.json_editor = Some(JsonEditorModal::new(value, col_name, col_type, row, col));
         } else {
             // Use inline editor for simple values
             self.cell_editor.open(row, col, value);
@@ -1842,7 +1844,8 @@ impl App {
                         match msg {
                             SimpleQueryMessage::Row(row) => {
                                 if headers.is_empty() {
-                                    headers = row.columns()
+                                    headers = row
+                                        .columns()
                                         .iter()
                                         .map(|c| c.name().to_string())
                                         .collect();
@@ -1908,7 +1911,10 @@ impl App {
             "json" => self.grid.rows_as_json(&indices),
             "tsv" => self.grid.rows_as_tsv(&indices, true),
             _ => {
-                self.last_error = Some(format!("Unknown format: {}. Use csv, json, or tsv.", format));
+                self.last_error = Some(format!(
+                    "Unknown format: {}. Use csv, json, or tsv.",
+                    format
+                ));
                 return;
             }
         };
@@ -1961,11 +1967,13 @@ impl App {
                         database, user, host, port
                     ));
                 } else {
-                    self.last_status = Some("Connected (no connection string available).".to_string());
+                    self.last_status =
+                        Some("Connected (no connection string available).".to_string());
                 }
             }
             DbStatus::Error => {
-                self.last_status = Some("Connection error. Use :connect <url> to reconnect.".to_string());
+                self.last_status =
+                    Some("Connection error. Use :connect <url> to reconnect.".to_string());
             }
         }
     }
@@ -1985,22 +1993,20 @@ impl App {
         }
 
         let gen_type = parts[0].to_lowercase();
-        
+
         // Use provided table or fall back to source_table from query
         let table: String = match parts.get(1) {
             Some(t) if !t.is_empty() => t.to_string(),
-            _ => {
-                match &self.grid.source_table {
-                    Some(t) => t.clone(),
-                    None => {
-                        self.last_error = Some(format!(
-                            "No table specified and couldn't infer from query. Usage: :gen {} <table>",
-                            gen_type
-                        ));
-                        return;
-                    }
+            _ => match &self.grid.source_table {
+                Some(t) => t.clone(),
+                None => {
+                    self.last_error = Some(format!(
+                        "No table specified and couldn't infer from query. Usage: :gen {} <table>",
+                        gen_type
+                    ));
+                    return;
                 }
-            }
+            },
         };
 
         // Parse optional key columns (comma-separated) - shifts by 1 if table was provided
@@ -2032,12 +2038,16 @@ impl App {
 
         let sql = match gen_type.as_str() {
             "update" | "u" => {
-                let keys: Option<Vec<&str>> = key_columns.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                let keys: Option<Vec<&str>> = key_columns
+                    .as_ref()
+                    .map(|v| v.iter().map(|s| s.as_str()).collect());
                 self.grid
                     .generate_update_sql(&table, &row_indices, keys.as_deref())
             }
             "delete" | "d" => {
-                let keys: Option<Vec<&str>> = key_columns.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                let keys: Option<Vec<&str>> = key_columns
+                    .as_ref()
+                    .map(|v| v.iter().map(|s| s.as_str()).collect());
                 self.grid
                     .generate_delete_sql(&table, &row_indices, keys.as_deref())
             }
@@ -2326,7 +2336,8 @@ impl App {
                     (KeyCode::Char('c'), KeyModifiers::NONE) => {
                         self.pending_key = Some('c');
                     }
-                    (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('G'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Bottom);
                     }
@@ -2373,7 +2384,8 @@ impl App {
                             }
                         }
                     }
-                    (KeyCode::Char('N'), KeyModifiers::SHIFT) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('N'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('N'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         if let Some(p) = self.search.last_applied.clone() {
                             let found = self.editor.textarea.search_back(false);
@@ -2407,12 +2419,14 @@ impl App {
                         self.editor.textarea.move_cursor(CursorMove::Forward);
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('A'), KeyModifiers::SHIFT) | (KeyCode::Char('A'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('A'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('A'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::End);
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('I'), KeyModifiers::SHIFT) | (KeyCode::Char('I'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('I'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('I'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Head);
                         self.mode = Mode::Insert;
@@ -2423,7 +2437,8 @@ impl App {
                         self.editor.textarea.insert_newline();
                         self.mode = Mode::Insert;
                     }
-                    (KeyCode::Char('O'), KeyModifiers::SHIFT) | (KeyCode::Char('O'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('O'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('O'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::Head);
                         self.editor.textarea.insert_newline();
@@ -2436,15 +2451,18 @@ impl App {
                         self.pending_key = None;
                         self.editor.textarea.delete_next_char();
                     }
-                    (KeyCode::Char('X'), KeyModifiers::SHIFT) | (KeyCode::Char('X'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('X'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('X'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_char();
                     }
-                    (KeyCode::Char('D'), KeyModifiers::SHIFT) | (KeyCode::Char('D'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('D'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('D'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_line_by_end();
                     }
-                    (KeyCode::Char('C'), KeyModifiers::SHIFT) | (KeyCode::Char('C'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('C'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('C'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.delete_line_by_end();
                         self.mode = Mode::Insert;
@@ -2472,7 +2490,8 @@ impl App {
                         self.pending_key = None;
                         self.editor.textarea.paste();
                     }
-                    (KeyCode::Char('P'), KeyModifiers::SHIFT) | (KeyCode::Char('P'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('P'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('P'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         // Paste before cursor: move back, paste, then adjust.
                         self.editor.textarea.move_cursor(CursorMove::Back);
@@ -2644,7 +2663,8 @@ impl App {
                     (KeyCode::Char('g'), KeyModifiers::NONE) => {
                         self.pending_key = Some('g');
                     }
-                    (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('G'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::Bottom);
                     }
                     _ => {}
@@ -2835,13 +2855,16 @@ impl App {
 
         // Push to both editor history (for Ctrl-p/n navigation) and persistent history.
         self.editor.push_history(query.clone());
-        let conn_info = self.db.conn_str.as_ref().map(|s| {
-            ConnectionInfo::parse(s).format(50)
-        });
+        let conn_info = self
+            .db
+            .conn_str
+            .as_ref()
+            .map(|s| ConnectionInfo::parse(s).format(50));
         self.history.push(query.clone(), conn_info);
 
         let Some(client) = self.db.client.clone() else {
-            self.last_error = Some("Not connected. Use :connect <url> or set DATABASE_URL.".to_string());
+            self.last_error =
+                Some("Not connected. Use :connect <url> or set DATABASE_URL.".to_string());
             return;
         };
 
@@ -2929,7 +2952,10 @@ impl App {
                     // Fetch column types if we have a source table
                     let col_types = if let Some(ref table) = source_table {
                         let type_map = fetch_column_types(&client, table).await;
-                        headers.iter().map(|h| type_map.get(h).cloned().unwrap_or_default()).collect()
+                        headers
+                            .iter()
+                            .map(|h| type_map.get(h).cloned().unwrap_or_default())
+                            .collect()
                     } else {
                         vec![String::new(); headers.len()]
                     };
@@ -3129,7 +3155,9 @@ impl App {
 
         // Query timing info
         let timing_info = if let Some(ref tag) = self.db.last_command_tag {
-            let time_part = self.db.last_elapsed
+            let time_part = self
+                .db
+                .last_elapsed
                 .map(|e| format!(" ({}ms)", e.as_millis()))
                 .unwrap_or_default();
             Some(format!("{}{}", tag, time_part))
@@ -3157,12 +3185,16 @@ impl App {
             // Critical: Mode (always shown)
             .add(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
             // Critical: Connection info
-            .add(StatusSegment::new(conn_segment, Priority::Critical).style(conn_style).min_width(40))
+            .add(
+                StatusSegment::new(conn_segment, Priority::Critical)
+                    .style(conn_style)
+                    .min_width(40),
+            )
             // High: Running indicator (if running)
             .add_if(
                 running_indicator.is_some(),
                 StatusSegment::new(running_indicator.unwrap_or_default(), Priority::High)
-                    .style(Style::default().fg(Color::Yellow))
+                    .style(Style::default().fg(Color::Yellow)),
             )
             // Medium: Row info
             .add(StatusSegment::new(row_info, Priority::Medium).min_width(50))
@@ -3171,17 +3203,21 @@ impl App {
                 selection_info.is_some(),
                 StatusSegment::new(selection_info.unwrap_or_default(), Priority::Medium)
                     .style(Style::default().fg(Color::Cyan))
-                    .min_width(60)
+                    .min_width(60),
             )
             // Low: Query timing
             .add_if(
                 timing_info.is_some(),
                 StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
                     .style(Style::default().fg(Color::DarkGray))
-                    .min_width(80)
+                    .min_width(80),
             )
             // Right-aligned: Status message
-            .add(StatusSegment::new(status, Priority::Critical).style(status_style).right_align())
+            .add(
+                StatusSegment::new(status, Priority::Critical)
+                    .style(status_style)
+                    .right_align(),
+            )
             .build(width);
 
         Paragraph::new(line)
@@ -3256,7 +3292,7 @@ fn calculate_editor_scroll(
     if viewport_width > 0 {
         // Leave some margin (3 chars) for context
         let margin = 3.min(viewport_width / 4);
-        
+
         // If cursor is left of the viewport, scroll left
         if cursor_col < scroll_col + margin {
             scroll_col = cursor_col.saturating_sub(margin);
@@ -3549,7 +3585,11 @@ mod tests {
             editor.update_scroll(10);
             let (_, cursor_pos) = editor.visible_text(10);
             // Cursor should always be visible (within window)
-            assert!(cursor_pos < 10, "Cursor should be visible, got pos {}", cursor_pos);
+            assert!(
+                cursor_pos < 10,
+                "Cursor should be visible, got pos {}",
+                cursor_pos
+            );
         }
     }
 
@@ -3634,7 +3674,9 @@ mod tests {
     fn test_extract_table_returns_none_for_complex_queries() {
         // JOINs
         assert_eq!(
-            extract_table_from_query("SELECT * FROM users JOIN orders ON users.id = orders.user_id"),
+            extract_table_from_query(
+                "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
+            ),
             None
         );
         // Subqueries

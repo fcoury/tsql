@@ -344,9 +344,8 @@ impl<'a> JsonEditorModal<'a> {
             }
 
             // Save: Ctrl+Enter or Ctrl+S
-            (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.try_save()
-            }
+            (KeyCode::Enter, KeyModifiers::CONTROL)
+            | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.try_save(),
 
             // Format JSON: Ctrl+F
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
@@ -441,12 +440,7 @@ impl<'a> JsonEditorModal<'a> {
         let highlighted_lines = self
             .highlighter
             .highlight("json", &content)
-            .unwrap_or_else(|_| {
-                content
-                    .lines()
-                    .map(|l| Line::from(l.to_string()))
-                    .collect()
-            });
+            .unwrap_or_else(|_| content.lines().map(|l| Line::from(l.to_string())).collect());
 
         // Render highlighted textarea
         let highlighted_textarea = HighlightedTextArea::new(&self.textarea, highlighted_lines)
@@ -475,9 +469,19 @@ impl<'a> JsonEditorModal<'a> {
         };
 
         let mode_span = if self.mode == EditorMode::Normal {
-            Span::styled(" NORMAL ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            Span::styled(
+                " NORMAL ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::styled(" INSERT ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            Span::styled(
+                " INSERT ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
         };
 
         let pos_span = Span::raw(format!(

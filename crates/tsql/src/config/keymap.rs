@@ -844,9 +844,18 @@ mod tests {
     fn test_action_from_str() {
         assert_eq!("move_up".parse::<Action>().unwrap(), Action::MoveUp);
         assert_eq!("move_down".parse::<Action>().unwrap(), Action::MoveDown);
-        assert_eq!("execute_query".parse::<Action>().unwrap(), Action::ExecuteQuery);
-        assert_eq!("enter_insert_mode".parse::<Action>().unwrap(), Action::EnterInsertMode);
-        assert_eq!("copy_selection".parse::<Action>().unwrap(), Action::CopySelection);
+        assert_eq!(
+            "execute_query".parse::<Action>().unwrap(),
+            Action::ExecuteQuery
+        );
+        assert_eq!(
+            "enter_insert_mode".parse::<Action>().unwrap(),
+            Action::EnterInsertMode
+        );
+        assert_eq!(
+            "copy_selection".parse::<Action>().unwrap(),
+            Action::CopySelection
+        );
 
         // Test with dashes (should normalize to underscores)
         assert_eq!("move-up".parse::<Action>().unwrap(), Action::MoveUp);

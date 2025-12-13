@@ -31,10 +31,10 @@
 //! ```
 
 mod highlighter;
-mod theme;
 pub mod languages;
+mod theme;
 pub mod themes;
 
-pub use highlighter::{Highlighter, HighlightError};
-pub use theme::{Theme, ThemeError, Style as ThemeStyle, StyleModifier};
-pub use languages::{Language, LanguageError, json, sql};
+pub use highlighter::{HighlightError, Highlighter};
+pub use languages::{json, sql, Language, LanguageError};
+pub use theme::{Style as ThemeStyle, StyleModifier, Theme, ThemeError};

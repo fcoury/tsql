@@ -393,8 +393,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 })
                 .collect();
         } else {
-            let pattern =
-                Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+            let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
 
             let mut matches: Vec<FilteredItem<T>> = self
                 .items

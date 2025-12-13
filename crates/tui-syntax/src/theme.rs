@@ -134,8 +134,7 @@ fn parse_color(color: &str) -> Option<Color> {
     let color = color.trim();
 
     // Hex color
-    if color.starts_with('#') {
-        let hex = &color[1..];
+    if let Some(hex) = color.strip_prefix('#') {
         return match hex.len() {
             6 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;

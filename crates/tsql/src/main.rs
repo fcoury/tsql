@@ -4,16 +4,20 @@ use std::io::{self, Stdout};
 use anyhow::{Context, Result};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use tsql::app::App;
 use tsql::config;
 use tsql::ui::GridModel;
+
+fn print_version() {
+    println!("tsql {}", env!("CARGO_PKG_VERSION"));
+}
 
 fn print_usage() {
     eprintln!("tsql - A modern PostgreSQL CLI");
@@ -26,6 +30,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -h, --help        Print this help message");
+    eprintln!("  -V, --version     Print version information");
     eprintln!();
     eprintln!("Environment Variables:");
     eprintln!("  DATABASE_URL      Default connection URL if not provided as argument");
@@ -47,6 +52,12 @@ fn main() -> Result<()> {
     // Check for help flag
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_usage();
+        return Ok(());
+    }
+
+    // Check for version flag
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        print_version();
         return Ok(());
     }
 

@@ -96,7 +96,9 @@ impl ConnectionInfo {
             .unwrap_or(conn_str);
 
         // Split off query params
-        let (main_part, _params) = without_scheme.split_once('?').unwrap_or((without_scheme, ""));
+        let (main_part, _params) = without_scheme
+            .split_once('?')
+            .unwrap_or((without_scheme, ""));
 
         // Split user:pass@host:port/database
         let (auth_host, database) = main_part.rsplit_once('/').unwrap_or((main_part, ""));
@@ -301,10 +303,8 @@ impl StatusLineBuilder {
         let separator_width = self.separator.chars().count() as u16;
 
         // Separate left-aligned and right-aligned segments
-        let (right_segments, left_segments): (Vec<_>, Vec<_>) = self
-            .segments
-            .into_iter()
-            .partition(|s| s.right_align);
+        let (right_segments, left_segments): (Vec<_>, Vec<_>) =
+            self.segments.into_iter().partition(|s| s.right_align);
 
         // Sort by priority (lower = higher priority)
         let mut left_segments = left_segments;
@@ -322,14 +322,21 @@ impl StatusLineBuilder {
         };
 
         // Available width for left segments
-        let left_available = available_width.saturating_sub(right_width).saturating_sub(right_sep_width);
+        let left_available = available_width
+            .saturating_sub(right_width)
+            .saturating_sub(right_sep_width);
 
         // Select left segments that fit
         let mut left_used: u16 = 0;
         let mut selected_left: Vec<&StatusSegment> = Vec::new();
 
         for segment in &left_segments {
-            let needed = segment.width() + if selected_left.is_empty() { 0 } else { separator_width };
+            let needed = segment.width()
+                + if selected_left.is_empty() {
+                    0
+                } else {
+                    separator_width
+                };
             if segment.min_width <= available_width && left_used + needed <= left_available {
                 left_used += needed;
                 selected_left.push(segment);
@@ -398,7 +405,8 @@ mod tests {
 
     #[test]
     fn test_parse_postgres_url_with_params() {
-        let info = ConnectionInfo::parse("postgres://user:pass@localhost:5432/mydb?sslmode=require");
+        let info =
+            ConnectionInfo::parse("postgres://user:pass@localhost:5432/mydb?sslmode=require");
         assert_eq!(info.user, Some("user".to_string()));
         assert_eq!(info.host, Some("localhost".to_string()));
         assert_eq!(info.port, Some(5432));
@@ -468,7 +476,12 @@ mod tests {
         };
         let formatted = info.format(10);
         // Use char count, not byte count (since we have unicode ellipsis)
-        assert!(formatted.chars().count() <= 10, "formatted='{}' len={}", formatted, formatted.chars().count());
+        assert!(
+            formatted.chars().count() <= 10,
+            "formatted='{}' len={}",
+            formatted,
+            formatted.chars().count()
+        );
         assert!(formatted.ends_with('…'));
     }
 

@@ -269,7 +269,11 @@ impl HelpPopup {
             }
 
             // Page down
-            KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('d')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
                 self.scroll_down(self.visible_height / 2);
                 HelpAction::Continue
             }
@@ -279,7 +283,11 @@ impl HelpPopup {
             }
 
             // Page up
-            KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('u')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
                 self.scroll_up(self.visible_height / 2);
                 HelpAction::Continue
             }
@@ -332,7 +340,11 @@ impl HelpPopup {
         // Create the outer block
         let block = Block::default()
             .title(" Help ")
-            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan));
 
@@ -375,29 +387,26 @@ impl HelpPopup {
         let header = Line::from(vec![
             Span::styled(
                 "tsql",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" - PostgreSQL CLI  "),
-            Span::styled(
-                "Press ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "q",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " or ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" or ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "Esc",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " to close",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" to close", Style::default().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(header), area);
     }
@@ -407,15 +416,13 @@ impl HelpPopup {
 
         for (section_idx, section) in self.sections.iter().enumerate() {
             // Section header
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", section.title),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {} ", section.title),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]));
 
             // Separator under header
             lines.push(Line::from(Span::styled(
@@ -454,7 +461,9 @@ impl HelpPopup {
             Span::raw("  "),
             Span::styled(
                 keys,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 binding.description.to_string(),
@@ -476,35 +485,14 @@ impl HelpPopup {
         };
 
         let footer = Line::from(vec![
-            Span::styled(
-                " j/k ",
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(
-                "scroll  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                " g/G ",
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(
-                "top/bottom  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                " PgUp/PgDn ",
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(
-                "page  ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" j/k ", Style::default().fg(Color::Yellow)),
+            Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" g/G ", Style::default().fg(Color::Yellow)),
+            Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" PgUp/PgDn ", Style::default().fg(Color::Yellow)),
+            Span::styled("page  ", Style::default().fg(Color::DarkGray)),
             Span::raw(" ".repeat(area.width.saturating_sub(50) as usize)),
-            Span::styled(
-                scroll_info,
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
         ]);
         frame.render_widget(Paragraph::new(footer), area);
     }
@@ -519,8 +507,7 @@ impl HelpPopup {
         // The scrollbar needs to know the max scroll position (total - visible)
         // and the current scroll position
         let max_scroll = self.total_lines.saturating_sub(self.visible_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll)
-            .position(self.scroll_offset);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(self.scroll_offset);
 
         // Render scrollbar in a slightly inset area
         let scrollbar_area = Rect {

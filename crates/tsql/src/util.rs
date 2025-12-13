@@ -107,10 +107,10 @@ mod tests {
         // JSON should always use multiline
         assert!(should_use_multiline_editor(r#"{"key": "value"}"#));
         assert!(should_use_multiline_editor("[1, 2, 3]"));
-        
+
         // Newlines should use multiline
         assert!(should_use_multiline_editor("line1\nline2"));
-        
+
         // Simple values should not
         assert!(!should_use_multiline_editor("hello"));
         assert!(!should_use_multiline_editor("123"));

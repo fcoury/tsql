@@ -123,10 +123,8 @@ impl Highlighter {
         // Configure the capture names
         config.configure(CAPTURE_NAMES);
 
-        self.languages.insert(
-            language.name.to_string(),
-            LanguageConfig { config },
-        );
+        self.languages
+            .insert(language.name.to_string(), LanguageConfig { config });
 
         Ok(())
     }
@@ -149,7 +147,11 @@ impl Highlighter {
     ///
     /// # Returns
     /// A vector of styled `Line`s, one per line in the source.
-    pub fn highlight(&mut self, language: &str, source: &str) -> Result<Vec<Line<'static>>, HighlightError> {
+    pub fn highlight(
+        &mut self,
+        language: &str,
+        source: &str,
+    ) -> Result<Vec<Line<'static>>, HighlightError> {
         let lang_config = self
             .languages
             .get(language)
@@ -171,10 +173,7 @@ impl Highlighter {
                     spans.push((start, end, current_style));
                 }
                 HighlightEvent::HighlightStart(highlight) => {
-                    let capture_name = CAPTURE_NAMES
-                        .get(highlight.0)
-                        .copied()
-                        .unwrap_or("text");
+                    let capture_name = CAPTURE_NAMES.get(highlight.0).copied().unwrap_or("text");
                     let style = self.theme.style_for(capture_name);
                     style_stack.push(style);
                 }
@@ -189,7 +188,11 @@ impl Highlighter {
     }
 
     /// Convert byte-indexed spans to line-based ratatui Lines.
-    fn spans_to_lines(&self, source: &str, spans: &[(usize, usize, RatatuiStyle)]) -> Vec<Line<'static>> {
+    fn spans_to_lines(
+        &self,
+        source: &str,
+        spans: &[(usize, usize, RatatuiStyle)],
+    ) -> Vec<Line<'static>> {
         let lines: Vec<&str> = source.lines().collect();
         let mut result: Vec<Line<'static>> = Vec::with_capacity(lines.len());
 

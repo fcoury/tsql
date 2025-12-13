@@ -138,7 +138,8 @@ impl GridSearch {
 
     /// Check if a cell is the current match.
     pub fn is_current_match(&self, row: usize, col: usize) -> bool {
-        self.current().map_or(false, |m| m.row == row && m.col == col)
+        self.current()
+            .map_or(false, |m| m.row == row && m.col == col)
     }
 
     /// Get match count info string.
@@ -211,10 +212,12 @@ impl GridState {
                 }
             }
             // Viewport scrolling (Shift+H/L)
-            (KeyCode::Char('H'), KeyModifiers::SHIFT) | (KeyCode::Char('H'), KeyModifiers::NONE) => {
+            (KeyCode::Char('H'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('H'), KeyModifiers::NONE) => {
                 self.col_offset = self.col_offset.saturating_sub(1);
             }
-            (KeyCode::Char('L'), KeyModifiers::SHIFT) | (KeyCode::Char('L'), KeyModifiers::NONE) => {
+            (KeyCode::Char('L'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('L'), KeyModifiers::NONE) => {
                 if col_count > 0 {
                     self.col_offset = (self.col_offset + 1).min(col_count - 1);
                 }
@@ -254,7 +257,8 @@ impl GridState {
                     self.col_offset = m.col;
                 }
             }
-            (KeyCode::Char('N'), KeyModifiers::SHIFT) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
+            (KeyCode::Char('N'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('N'), KeyModifiers::NONE) => {
                 if let Some(m) = self.search.prev_match() {
                     self.cursor_row = m.row;
                     self.cursor_col = m.col;
@@ -282,7 +286,8 @@ impl GridState {
                 return GridKeyResult::CopyToClipboard(text);
             }
             // Y - yank with headers (Shift+Y sends SHIFT modifier)
-            (KeyCode::Char('Y'), KeyModifiers::SHIFT) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+            (KeyCode::Char('Y'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
                 if row_count == 0 {
                     return GridKeyResult::None;
                 }
@@ -737,7 +742,10 @@ impl GridModel {
 
     /// Get a specific cell value.
     pub fn cell(&self, row: usize, col: usize) -> Option<&str> {
-        self.rows.get(row).and_then(|r| r.get(col)).map(|s| s.as_str())
+        self.rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .map(|s| s.as_str())
     }
 
     /// Format a single row as tab-separated values.
@@ -1374,7 +1382,9 @@ fn render_row_cells_with_search(
 
     // Styles for search matches and cursor
     let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
-    let current_match_style = Style::default().bg(Color::Rgb(255, 165, 0)).fg(Color::Black); // Orange
+    let current_match_style = Style::default()
+        .bg(Color::Rgb(255, 165, 0))
+        .fg(Color::Black); // Orange
     let cursor_cell_style = Style::default().bg(Color::Cyan).fg(Color::Black);
 
     let mut col = col_offset;
@@ -1598,10 +1608,7 @@ mod tests {
                     "Yank with headers should start with header row, got: {}",
                     text
                 );
-                assert!(
-                    text.contains("1\tAlice"),
-                    "Should contain the row data"
-                );
+                assert!(text.contains("1\tAlice"), "Should contain the row data");
             }
             _ => panic!("Expected CopyToClipboard result, got {:?}", result),
         }
@@ -1622,7 +1629,10 @@ mod tests {
 
         // Press 'l' again - should stay at max (1 for 2-column model)
         state.handle_key(key, &model);
-        assert_eq!(state.cursor_col, 1, "cursor_col should not exceed column count");
+        assert_eq!(
+            state.cursor_col, 1,
+            "cursor_col should not exceed column count"
+        );
 
         // Press 'h' to move column cursor left
         let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
@@ -1737,22 +1747,44 @@ mod tests {
         // After marker column (3 chars), data starts at x=4
         // Check that the header shows same columns as body
         let header_row: String = (4..area.width - 1)
-            .map(|x| buf.cell((x, 1)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .map(|x| {
+                buf.cell((x, 1))
+                    .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                    .unwrap_or(' ')
+            })
             .collect();
 
         // Body row is at y=2
         let body_row: String = (4..area.width - 1)
-            .map(|x| buf.cell((x, 2)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .map(|x| {
+                buf.cell((x, 2))
+                    .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                    .unwrap_or(' ')
+            })
             .collect();
 
         // The first column shown in header should match the first column shown in body
         // Extract first word from each
-        let header_first_col: String = header_row.trim().split_whitespace().next().unwrap_or("").to_string();
-        let body_first_col: String = body_row.trim().split_whitespace().next().unwrap_or("").to_string();
+        let header_first_col: String = header_row
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let body_first_col: String = body_row
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
 
         // Get the column index from header (col1 -> 1, col2 -> 2, etc)
-        let header_col_num: Option<u32> = header_first_col.strip_prefix("col").and_then(|n| n.parse().ok());
-        let _body_col_num: Option<u32> = body_first_col.strip_prefix("col").and_then(|n| n.parse().ok());
+        let header_col_num: Option<u32> = header_first_col
+            .strip_prefix("col")
+            .and_then(|n| n.parse().ok());
+        let _body_col_num: Option<u32> = body_first_col
+            .strip_prefix("col")
+            .and_then(|n| n.parse().ok());
 
         // For body, it shows data "a", "b", "c", etc which correspond to col1, col2, col3...
         // So body shows starting from col_offset that ensure_cursor_visible calculated
@@ -1889,8 +1921,7 @@ mod tests {
         model.narrow_column(0, 2);
 
         assert_eq!(
-            model.col_widths[0],
-            8,
+            model.col_widths[0], 8,
             "narrow_column should decrease width by the given amount"
         );
     }
@@ -1904,8 +1935,7 @@ mod tests {
         model.narrow_column(0, 10);
 
         assert_eq!(
-            model.col_widths[0],
-            3,
+            model.col_widths[0], 3,
             "narrow_column should not go below minimum width of 3"
         );
     }
@@ -1919,8 +1949,7 @@ mod tests {
         model.widen_column(0, 10);
 
         assert_eq!(
-            model.col_widths[0],
-            200,
+            model.col_widths[0], 200,
             "widen_column should not exceed maximum width of 200"
         );
     }
@@ -1939,8 +1968,7 @@ mod tests {
         model.autofit_column(1);
 
         assert_eq!(
-            model.col_widths[1],
-            18,
+            model.col_widths[1], 18,
             "autofit_column should size to longest content (header in this case)"
         );
     }
@@ -1957,7 +1985,10 @@ mod tests {
 
         let sql = model.generate_update_sql("users", &[0], Some(&["id"]));
 
-        assert!(sql.contains("UPDATE users SET"), "Should have UPDATE clause");
+        assert!(
+            sql.contains("UPDATE users SET"),
+            "Should have UPDATE clause"
+        );
         assert!(sql.contains("name = 'Alice'"), "Should set name column");
         assert!(sql.contains("age = 30"), "Should set age column (numeric)");
         assert!(sql.contains("WHERE id = 1"), "Should have WHERE with id");
@@ -1991,7 +2022,10 @@ mod tests {
         // No key columns specified = use all columns
         let sql = model.generate_delete_sql("users", &[0], None);
 
-        assert!(sql.contains("DELETE FROM users WHERE"), "Should have DELETE clause");
+        assert!(
+            sql.contains("DELETE FROM users WHERE"),
+            "Should have DELETE clause"
+        );
         assert!(sql.contains("id = 1"), "Should have id in WHERE");
         assert!(sql.contains("name = 'Alice'"), "Should have name in WHERE");
     }
@@ -2006,7 +2040,10 @@ mod tests {
         let sql = model.generate_delete_sql("users", &[0], Some(&["id"]));
 
         assert!(sql.contains("DELETE FROM users WHERE id = 1;"));
-        assert!(!sql.contains("name"), "Should not include name in WHERE when id is the key");
+        assert!(
+            !sql.contains("name"),
+            "Should not include name in WHERE when id is the key"
+        );
     }
 
     #[test]
@@ -2036,7 +2073,10 @@ mod tests {
         let sql = model.generate_insert_sql("posts", &[0]);
 
         // Single quotes should be escaped
-        assert!(sql.contains("'It''s a test'"), "Should escape single quotes");
+        assert!(
+            sql.contains("'It''s a test'"),
+            "Should escape single quotes"
+        );
     }
 
     #[test]
@@ -2108,15 +2148,24 @@ mod tests {
         );
 
         // No PKs yet
-        assert!(!model.has_valid_pk(), "Should not have valid PK without primary_keys set");
+        assert!(
+            !model.has_valid_pk(),
+            "Should not have valid PK without primary_keys set"
+        );
 
         // Set PK that's in headers
         model.primary_keys = vec!["id".to_string()];
-        assert!(model.has_valid_pk(), "Should have valid PK when PK column exists");
+        assert!(
+            model.has_valid_pk(),
+            "Should have valid PK when PK column exists"
+        );
 
         // Set PK that's not in headers
         model.primary_keys = vec!["user_id".to_string()];
-        assert!(!model.has_valid_pk(), "Should not have valid PK when PK column missing");
+        assert!(
+            !model.has_valid_pk(),
+            "Should not have valid PK when PK column missing"
+        );
     }
 
     #[test]
@@ -2138,7 +2187,10 @@ mod tests {
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
 
         assert_eq!(state.cursor_col, 1);
-        assert_eq!(state.col_offset, 0, "col_offset should stay 0 since cursor is still visible");
+        assert_eq!(
+            state.col_offset, 0,
+            "col_offset should stay 0 since cursor is still visible"
+        );
 
         // Now move left back to column 0
         let key_left = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
@@ -2146,7 +2198,10 @@ mod tests {
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
 
         assert_eq!(state.cursor_col, 0);
-        assert_eq!(state.col_offset, 0, "col_offset should stay 0 when moving left within visible area");
+        assert_eq!(
+            state.col_offset, 0,
+            "col_offset should stay 0 when moving left within visible area"
+        );
     }
 
     #[test]
@@ -2170,14 +2225,20 @@ mod tests {
 
         assert_eq!(state.cursor_col, 3);
         // col_offset should stay at 3 because column 3 is still visible
-        assert_eq!(state.col_offset, 3, "col_offset should not change when cursor is still at leftmost visible column");
+        assert_eq!(
+            state.col_offset, 3,
+            "col_offset should not change when cursor is still at leftmost visible column"
+        );
 
         // Move left again to column 2 (now col_offset should scroll left to show col 2)
         state.handle_key(key_left, &model);
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
 
         assert_eq!(state.cursor_col, 2);
-        assert_eq!(state.col_offset, 2, "col_offset should scroll left to keep cursor visible");
+        assert_eq!(
+            state.col_offset, 2,
+            "col_offset should scroll left to keep cursor visible"
+        );
     }
 
     #[test]
@@ -2195,7 +2256,7 @@ mod tests {
 
         // Move right through columns 0, 1, 2 - all should be visible without scrolling
         let key_right = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
-        
+
         state.handle_key(key_right, &model); // to col 1
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
         assert_eq!(state.cursor_col, 1);
@@ -2210,7 +2271,10 @@ mod tests {
         state.handle_key(key_right, &model);
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
         assert_eq!(state.cursor_col, 3);
-        assert!(state.col_offset > 0, "Should scroll when cursor exceeds visible area");
+        assert!(
+            state.col_offset > 0,
+            "Should scroll when cursor exceeds visible area"
+        );
 
         // Remember the scroll position
         let _scrolled_offset = state.col_offset;
@@ -2219,7 +2283,7 @@ mod tests {
         let key_left = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
         state.handle_key(key_left, &model);
         state.ensure_cursor_visible(10, 1, 5, col_widths, viewport_width);
-        
+
         assert_eq!(state.cursor_col, 2);
         // The key insight: col_offset should NOT immediately scroll back left
         // unless cursor_col < col_offset
