@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -129,11 +129,15 @@ impl<T: Clone> FuzzyPicker<T> {
             }
 
             // Navigation.
-            (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            (KeyCode::Up, _)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                 self.move_up();
                 PickerAction::Continue
             }
-            (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            (KeyCode::Down, _)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 self.move_down();
                 PickerAction::Continue
             }
@@ -306,6 +310,20 @@ impl<T: Clone> FuzzyPicker<T> {
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
         let visible_height = area.height as usize;
+        let total_items = self.filtered.len();
+        let needs_scrollbar = total_items > visible_height;
+
+        // Reserve space for scrollbar if needed
+        let (list_area, scrollbar_area) = if needs_scrollbar {
+            let chunks = Layout::horizontal([
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
+        };
 
         // Adjust scroll to keep selected visible.
         if self.selected < self.scroll_offset {
@@ -345,7 +363,31 @@ impl<T: Clone> FuzzyPicker<T> {
         let list = List::new(items);
         let mut state = ListState::default();
 
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_stateful_widget(list, list_area, &mut state);
+
+        // Render scrollbar if needed
+        if let Some(sb_area) = scrollbar_area {
+            let scrollbar = if sb_area.height >= 7 {
+                // Full scrollbar with arrows
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("▲"))
+                    .end_symbol(Some("▼"))
+                    .thumb_symbol("█")
+                    .track_symbol(Some("░"))
+            } else {
+                // Minimal scrollbar
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_symbol("█")
+                    .track_symbol(Some("│"))
+            };
+
+            let mut scrollbar_state = ScrollbarState::new(total_items)
+                .position(self.scroll_offset);
+
+            frame.render_stateful_widget(scrollbar, sb_area, &mut scrollbar_state);
+        }
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {

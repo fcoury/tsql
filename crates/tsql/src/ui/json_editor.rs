@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -31,8 +31,10 @@ pub enum JsonEditorAction {
         row: usize,
         col: usize,
     },
-    /// Cancel editing and close the editor.
+    /// Cancel editing and close the editor (no unsaved changes).
     Cancel,
+    /// Request to close with unsaved changes (needs confirmation).
+    RequestClose { row: usize, col: usize },
     /// Show an error message (e.g., invalid JSON for jsonb column).
     Error(String),
 }
@@ -126,6 +128,11 @@ impl<'a> JsonEditorModal<'a> {
         self.textarea.lines().join("\n")
     }
 
+    /// Check if the content has been modified from the original.
+    pub fn is_modified(&self) -> bool {
+        self.content() != self.original_value
+    }
+
     /// Check if the column is a JSON type (json/jsonb).
     pub fn is_json_column(&self) -> bool {
         is_json_column_type(&self.column_type)
@@ -161,8 +168,35 @@ impl<'a> JsonEditorModal<'a> {
             return self.handle_command_mode_key(key);
         }
 
+        // Handle q and Esc in Normal mode to close/request close
+        if self.mode == VimMode::Normal {
+            match (key.code, key.modifiers) {
+                // q in Normal mode closes/requests close
+                (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                    return self.request_close();
+                }
+                // Esc in Normal mode closes/requests close
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    return self.request_close();
+                }
+                _ => {}
+            }
+        }
+
         let command = self.vim_handler.handle_key(key, self.mode);
         self.execute_command(command, key)
+    }
+
+    /// Request to close the editor, checking for unsaved changes.
+    fn request_close(&self) -> JsonEditorAction {
+        if self.is_modified() {
+            JsonEditorAction::RequestClose {
+                row: self.row,
+                col: self.col,
+            }
+        } else {
+            JsonEditorAction::Cancel
+        }
     }
 
     /// Handle key events in command mode (after pressing ':').
@@ -522,10 +556,11 @@ impl<'a> JsonEditorModal<'a> {
         let editor_area = chunks[0];
         let status_area = chunks[1];
 
-        // Build title
+        // Build title with [+] indicator if modified
+        let modified_indicator = if self.is_modified() { " [+]" } else { "" };
         let title = format!(
-            " Edit: {} ({}) - {} ",
-            self.column_name, self.column_type, self.mode.label()
+            " Edit: {} ({}){} - {} ",
+            self.column_name, self.column_type, modified_indicator, self.mode.label()
         );
 
         // Detect content type and determine border color
@@ -566,7 +601,7 @@ impl<'a> JsonEditorModal<'a> {
 
         // Render highlighted textarea
         let highlighted_textarea = HighlightedTextArea::new(&self.textarea, highlighted_lines)
-            .block(block)
+            .block(block.clone())
             .scroll(self.scroll_offset);
 
         frame.render_widget(highlighted_textarea, editor_area);
@@ -578,6 +613,37 @@ impl<'a> JsonEditorModal<'a> {
             self.scroll_offset.0 = (cursor_row - inner_height + 1) as u16;
         } else if cursor_row < self.scroll_offset.0 as usize {
             self.scroll_offset.0 = cursor_row as u16;
+        }
+
+        // Render scrollbar if content exceeds visible area
+        let total_lines = self.textarea.lines().len();
+        if total_lines > inner_height && inner_height > 0 {
+            let inner_area = block.inner(editor_area);
+            let scrollbar_area = Rect {
+                x: inner_area.x + inner_area.width.saturating_sub(1),
+                y: inner_area.y,
+                width: 1,
+                height: inner_area.height,
+            };
+
+            let scrollbar = if scrollbar_area.height >= 7 {
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("▲"))
+                    .end_symbol(Some("▼"))
+                    .thumb_symbol("█")
+                    .track_symbol(Some("░"))
+            } else {
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_symbol("█")
+                    .track_symbol(Some("│"))
+            };
+
+            let mut scrollbar_state = ScrollbarState::new(total_lines)
+                .position(self.scroll_offset.0 as usize);
+
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
 
         // Render status bar
@@ -637,7 +703,7 @@ impl<'a> JsonEditorModal<'a> {
         } else {
             let help_span = match self.mode {
                 VimMode::Normal => Span::styled(
-                    " i:insert  v:visual  :format  Ctrl+S:save  Esc×2:cancel ",
+                    " i:insert  v:visual  :format  Ctrl+S:save  q/Esc:close ",
                     Style::default().fg(Color::DarkGray),
                 ),
                 VimMode::Insert => Span::styled(
@@ -847,5 +913,170 @@ mod tests {
         // Command mode should be closed and buffer cleared
         assert!(!editor.command_active);
         assert!(editor.command_buffer.is_empty());
+    }
+
+    // ========== Change Tracking Tests ==========
+
+    #[test]
+    fn test_json_editor_not_modified_initially() {
+        // Note: JSON content gets formatted on creation, so we use pre-formatted content
+        let formatted = "{\n  \"key\": \"value\"\n}";
+        let editor = JsonEditorModal::new(
+            formatted.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // For formatted JSON, content equals original so not modified
+        // This test verifies the is_modified logic works
+        assert_eq!(
+            editor.content(),
+            editor.original_value,
+            "Formatted content should match original"
+        );
+        assert!(!editor.is_modified(), "Editor should not be modified initially when content matches original");
+    }
+
+    #[test]
+    fn test_json_editor_modified_after_formatting() {
+        // Unformatted JSON gets pretty-printed, so it differs from original
+        let unformatted = r#"{"key":"value"}"#;
+        let editor = JsonEditorModal::new(
+            unformatted.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // After formatting, content differs from original
+        assert!(
+            editor.content() != unformatted,
+            "Formatted content should differ from unformatted original"
+        );
+        assert!(
+            editor.is_modified(),
+            "Editor should be modified when content was formatted"
+        );
+    }
+
+    #[test]
+    fn test_json_editor_plain_text_not_modified() {
+        // Plain text shouldn't be formatted
+        let plain = "hello world";
+        let editor = JsonEditorModal::new(
+            plain.to_string(),
+            "notes".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+
+        assert_eq!(editor.content(), plain);
+        assert!(
+            !editor.is_modified(),
+            "Plain text editor should not be modified"
+        );
+    }
+
+    // ========== Esc/q Close Behavior Tests ==========
+
+    #[test]
+    fn test_json_editor_esc_no_changes_returns_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Plain text that won't be formatted
+        let mut editor = JsonEditorModal::new(
+            "hello".to_string(),
+            "notes".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+
+        // Press Esc in Normal mode with no changes
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = editor.handle_key(esc);
+
+        assert!(
+            matches!(result, JsonEditorAction::Cancel),
+            "Esc with no changes should return Cancel"
+        );
+    }
+
+    #[test]
+    fn test_json_editor_esc_with_changes_returns_request_close() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Unformatted JSON will be auto-formatted, making it modified
+        let mut editor = JsonEditorModal::new(
+            r#"{"key":"value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // Verify it's modified (due to formatting)
+        assert!(editor.is_modified());
+
+        // Press Esc in Normal mode with changes
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = editor.handle_key(esc);
+
+        match result {
+            JsonEditorAction::RequestClose { row, col } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 0);
+            }
+            _ => panic!("Expected RequestClose, got {:?}", std::any::type_name_of_val(&result)),
+        }
+    }
+
+    #[test]
+    fn test_json_editor_q_no_changes_returns_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = JsonEditorModal::new(
+            "hello".to_string(),
+            "notes".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+
+        // Press 'q' in Normal mode
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let result = editor.handle_key(q);
+
+        assert!(
+            matches!(result, JsonEditorAction::Cancel),
+            "'q' with no changes should return Cancel"
+        );
+    }
+
+    #[test]
+    fn test_json_editor_q_with_changes_returns_request_close() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut editor = JsonEditorModal::new(
+            r#"{"key":"value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        assert!(editor.is_modified());
+
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let result = editor.handle_key(q);
+
+        assert!(
+            matches!(result, JsonEditorAction::RequestClose { .. }),
+            "'q' with changes should return RequestClose"
+        );
     }
 }

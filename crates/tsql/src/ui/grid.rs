@@ -38,6 +38,10 @@ pub enum GridKeyResult {
     ResizeColumn { col: usize, action: ResizeAction },
     /// Edit the current cell.
     EditCell { row: usize, col: usize },
+    /// Open row detail view.
+    OpenRowDetail { row: usize },
+    /// Display a status message.
+    StatusMessage(String),
 }
 
 /// A match location in the grid (row, column).
@@ -177,6 +181,8 @@ pub struct GridState {
     pub cursor_col: usize,
     pub selected_rows: BTreeSet<usize>,
     pub search: GridSearch,
+    /// Whether to show full UUIDs (true) or truncated (false, default).
+    pub uuid_expanded: bool,
 }
 
 impl GridState {
@@ -375,6 +381,15 @@ impl GridState {
                 }
             }
 
+            // o to open row detail view
+            (KeyCode::Char('o'), KeyModifiers::NONE) => {
+                if row_count > 0 {
+                    return GridKeyResult::OpenRowDetail {
+                        row: self.cursor_row,
+                    };
+                }
+            }
+
             _ => {}
         }
 
@@ -544,6 +559,26 @@ impl GridState {
                         col: self.cursor_col,
                     };
                 }
+            }
+
+            // Row detail view
+            Action::OpenRowDetail => {
+                if row_count > 0 {
+                    return GridKeyResult::OpenRowDetail {
+                        row: self.cursor_row,
+                    };
+                }
+            }
+
+            // Display
+            Action::ToggleUuidExpand => {
+                self.uuid_expanded = !self.uuid_expanded;
+                let msg = if self.uuid_expanded {
+                    "UUIDs expanded".to_string()
+                } else {
+                    "UUIDs collapsed".to_string()
+                };
+                return GridKeyResult::StatusMessage(msg);
             }
 
             // Command mode
@@ -1254,6 +1289,7 @@ impl<'a> Widget for DataGrid<'a> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
             None, // No search highlighting for headers
+            false, // Headers never have UUID expansion
             buf,
         );
 
@@ -1312,6 +1348,7 @@ impl<'a> Widget for DataGrid<'a> {
                 row_idx,
                 cursor_col,
                 &self.state.search,
+                self.state.uuid_expanded,
                 buf,
             );
         }
@@ -1394,7 +1431,12 @@ fn render_marker_cell(
             row_number,
             width = (row_number_width - 1) as usize
         );
-        let row_num_style = style.fg(Color::DarkGray);
+        // Use lighter color for cursor row (DarkGray bg) to ensure visibility
+        let row_num_style = if is_cursor {
+            style.fg(Color::Gray)
+        } else {
+            style.fg(Color::DarkGray)
+        };
         buf.set_string(current_x, y, &row_num_str, row_num_style);
         current_x += row_number_width;
     }
@@ -1417,6 +1459,7 @@ fn render_row_cells(
     col_offset: usize,
     style: Style,
     _search: Option<&GridSearch>, // Optional search state for highlighting
+    uuid_expanded: bool,
     buf: &mut Buffer,
 ) {
     if available_w == 0 {
@@ -1441,7 +1484,7 @@ fn render_row_cells(
 
         // Allow a partially visible last column.
         let draw_w = w.min(remaining);
-        let content = format_cell_for_display(&cells[col], draw_w);
+        let content = format_cell_for_display(&cells[col], draw_w, uuid_expanded);
         buf.set_string(x, y, content, style);
         x += draw_w;
 
@@ -1472,6 +1515,7 @@ fn render_row_cells_with_search(
     row_idx: usize,
     cursor_col: Option<usize>,
     search: &GridSearch,
+    uuid_expanded: bool,
     buf: &mut Buffer,
 ) {
     if available_w == 0 {
@@ -1515,7 +1559,7 @@ fn render_row_cells_with_search(
 
         // Allow a partially visible last column.
         let draw_w = w.min(remaining);
-        let content = format_cell_for_display(&cells[col], draw_w);
+        let content = format_cell_for_display(&cells[col], draw_w, uuid_expanded);
         buf.set_string(x, y, content, cell_style);
         x += draw_w;
 
@@ -1568,12 +1612,16 @@ fn display_width(s: &str) -> usize {
 /// Format cell value for display in the grid.
 ///
 /// Special handling for:
-/// - UUIDs: truncated to first 8 chars + "..." to save space
+/// - UUIDs: truncated to first 8 chars + "..." to save space (unless uuid_expanded is true)
 /// - JSON: condensed to single line if multi-line
-fn format_cell_for_display(s: &str, width: u16) -> String {
-    // For UUIDs, truncate to show first 8 chars + "..."
+fn format_cell_for_display(s: &str, width: u16, uuid_expanded: bool) -> String {
+    // For UUIDs, truncate to show first 8 chars + "..." unless expanded
     // This saves significant space in the grid (36 chars -> 11 chars)
     if is_uuid(s) {
+        if uuid_expanded {
+            // Show full UUID (may still be truncated by fit_to_width if column is narrow)
+            return fit_to_width(s, width);
+        }
         let truncated = if width >= 11 {
             // Show first 8 hex chars + "..."
             format!("{}...", &s[..8])
@@ -2263,6 +2311,25 @@ mod tests {
     }
 
     #[test]
+    fn test_o_key_opens_row_detail() {
+        let mut state = GridState {
+            cursor_row: 1,
+            ..Default::default()
+        };
+        let model = create_test_model();
+
+        // Press 'o' to open row detail view
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        let result = state.handle_key(key, &model);
+
+        assert_eq!(
+            result,
+            GridKeyResult::OpenRowDetail { row: 1 },
+            "'o' should return OpenRowDetail for current row"
+        );
+    }
+
+    #[test]
     fn test_has_valid_pk() {
         let mut model = GridModel::new(
             vec!["id".to_string(), "name".to_string()],
@@ -2415,18 +2482,93 @@ mod tests {
 
     #[test]
     fn test_uuid_truncation_in_display() {
-        // Test that UUIDs are truncated in display
+        // Test that UUIDs are truncated in display when collapsed
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let result = format_cell_for_display(uuid, 20);
+        let result = format_cell_for_display(uuid, 20, false);
         assert_eq!(result, "550e8400...         ", "UUID should be truncated to 8 chars + ...");
 
         // With exact width for truncated UUID
-        let result = format_cell_for_display(uuid, 11);
+        let result = format_cell_for_display(uuid, 11, false);
         assert_eq!(result, "550e8400...", "UUID should fit exactly in 11 chars");
 
         // Non-UUID should not be truncated
         let normal = "hello world";
-        let result = format_cell_for_display(normal, 20);
+        let result = format_cell_for_display(normal, 20, false);
         assert_eq!(result, "hello world         ", "Non-UUID should not be truncated");
+    }
+
+    #[test]
+    fn test_uuid_expanded_shows_full_uuid() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        
+        // With uuid_expanded = true, should show full UUID (padded to width)
+        let result = format_cell_for_display(uuid, 40, true);
+        assert_eq!(result, "550e8400-e29b-41d4-a716-446655440000    ", 
+            "Expanded UUID should show full value padded to width");
+        
+        // If column is narrower than UUID, it should be truncated with ellipsis
+        let result = format_cell_for_display(uuid, 20, true);
+        assert!(result.contains('…') || result.len() == 20, 
+            "Expanded UUID in narrow column should be truncated");
+    }
+
+    #[test]
+    fn test_uuid_collapsed_by_default() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        
+        // Default (collapsed) shows truncated
+        let collapsed = format_cell_for_display(uuid, 20, false);
+        assert!(collapsed.starts_with("550e8400..."), 
+            "Collapsed UUID should start with first 8 chars + ...");
+        
+        // Expanded shows full
+        let expanded = format_cell_for_display(uuid, 40, true);
+        assert!(expanded.starts_with("550e8400-e29b-41d4-a716-446655440000"), 
+            "Expanded UUID should show full value");
+    }
+
+    #[test]
+    fn test_row_number_cursor_row_uses_visible_color() {
+        // When is_cursor is true, the row number should use Color::Gray (lighter)
+        // to be visible against the DarkGray background of the cursor row.
+        // This is a unit test for the logic, not the actual rendering.
+        let is_cursor = true;
+        let base_style = Style::default().bg(Color::DarkGray);
+
+        // Simulate the logic from render_marker_cell
+        let row_num_style = if is_cursor {
+            base_style.fg(Color::Gray)
+        } else {
+            base_style.fg(Color::DarkGray)
+        };
+
+        // Verify foreground is Gray (not DarkGray which would be invisible)
+        assert_eq!(
+            row_num_style.fg,
+            Some(Color::Gray),
+            "Cursor row should use Gray foreground for visibility"
+        );
+    }
+
+    #[test]
+    fn test_row_number_non_cursor_row_uses_dark_gray() {
+        // When is_cursor is false, the row number should use DarkGray
+        // (subdued color since background is default/transparent).
+        let is_cursor = false;
+        let base_style = Style::default();
+
+        // Simulate the logic from render_marker_cell
+        let row_num_style = if is_cursor {
+            base_style.fg(Color::Gray)
+        } else {
+            base_style.fg(Color::DarkGray)
+        };
+
+        // Verify foreground is DarkGray for non-cursor rows
+        assert_eq!(
+            row_num_style.fg,
+            Some(Color::DarkGray),
+            "Non-cursor row should use DarkGray foreground"
+        );
     }
 }

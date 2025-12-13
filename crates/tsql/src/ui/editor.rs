@@ -86,6 +86,8 @@ pub struct QueryEditor {
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: Option<String>,
+    /// Content at last save point (for change detection)
+    saved_content: String,
 }
 
 impl QueryEditor {
@@ -98,11 +100,27 @@ impl QueryEditor {
             history: Vec::new(),
             history_index: None,
             history_draft: None,
+            saved_content: String::new(),
         }
     }
 
     pub fn text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// Check if content differs from last save point.
+    pub fn is_modified(&self) -> bool {
+        self.text() != self.saved_content
+    }
+
+    /// Mark current content as saved (resets modified state).
+    pub fn mark_saved(&mut self) {
+        self.saved_content = self.text();
+    }
+
+    /// Reset to unmodified state with current content.
+    pub fn reset_modified(&mut self) {
+        self.saved_content = self.text();
     }
 
     pub fn set_text(&mut self, s: String) {
@@ -202,12 +220,27 @@ impl QueryEditor {
     }
 
     /// Yank (copy) the current line (vim `yy`).
-    pub fn yank_line(&mut self) {
+    /// Returns the yanked text so it can be copied to system clipboard.
+    pub fn yank_line(&mut self) -> Option<String> {
         let (row, _) = self.textarea.cursor();
         let lines = self.textarea.lines();
         if row < lines.len() {
             let line = lines[row].clone() + "\n";
-            self.textarea.set_yank_text(line);
+            self.textarea.set_yank_text(line.clone());
+            Some(line)
+        } else {
+            None
+        }
+    }
+
+    /// Get the currently selected text (for visual mode yank).
+    /// Returns None if there's no selection or it's empty.
+    pub fn get_selection(&self) -> Option<String> {
+        let text = self.textarea.yank_text();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
         }
     }
 }
@@ -215,5 +248,144 @@ impl QueryEditor {
 impl Default for QueryEditor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_yank_line_returns_line_content() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("line one\nline two\nline three".to_string());
+
+        // Cursor starts at first line
+        let result = editor.yank_line();
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "line one\n");
+    }
+
+    #[test]
+    fn test_yank_line_empty_editor() {
+        let mut editor = QueryEditor::new();
+        // Empty editor has one empty line
+
+        let result = editor.yank_line();
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "\n");
+    }
+
+    #[test]
+    fn test_yank_line_sets_internal_yank_text() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello world".to_string());
+
+        editor.yank_line();
+
+        // The internal yank text should be set
+        let internal = editor.textarea.yank_text();
+        assert_eq!(internal, "hello world\n");
+    }
+
+    #[test]
+    fn test_get_selection_returns_none_when_no_selection() {
+        let editor = QueryEditor::new();
+
+        let result = editor.get_selection();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_selection_returns_yanked_text() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello world".to_string());
+
+        // Simulate a selection by setting yank text (normally done by copy())
+        editor.textarea.set_yank_text("selected text".to_string());
+
+        let result = editor.get_selection();
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "selected text");
+    }
+
+    // ========== Change Tracking Tests ==========
+
+    #[test]
+    fn test_new_editor_not_modified() {
+        let editor = QueryEditor::new();
+        assert!(!editor.is_modified(), "New editor should not be modified");
+    }
+
+    #[test]
+    fn test_editor_modified_after_set_text() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello world".to_string());
+
+        assert!(
+            editor.is_modified(),
+            "Editor should be modified after set_text"
+        );
+    }
+
+    #[test]
+    fn test_editor_not_modified_after_mark_saved() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello world".to_string());
+
+        editor.mark_saved();
+
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified after mark_saved"
+        );
+    }
+
+    #[test]
+    fn test_editor_modified_after_change_following_save() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello".to_string());
+        editor.mark_saved();
+
+        editor.set_text("hello world".to_string());
+
+        assert!(
+            editor.is_modified(),
+            "Editor should be modified after changing content following save"
+        );
+    }
+
+    #[test]
+    fn test_editor_not_modified_when_content_matches_saved() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello".to_string());
+        editor.mark_saved();
+
+        // Set text back to the same value
+        editor.set_text("hello".to_string());
+
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified when content matches saved"
+        );
+    }
+
+    #[test]
+    fn test_reset_modified_clears_modified_state() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello".to_string());
+
+        assert!(editor.is_modified());
+
+        editor.reset_modified();
+
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified after reset_modified"
+        );
     }
 }

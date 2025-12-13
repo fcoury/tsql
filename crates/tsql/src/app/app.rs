@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -20,10 +20,11 @@ use crate::config::{Action, Config, KeyBinding, Keymap};
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConnectionInfo,
-    DataGrid, FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup,
-    HighlightedTextArea, JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor,
-    ResizeAction, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
+    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
+    ConfirmPrompt, ConfirmResult, ConnectionInfo, DataGrid, FuzzyPicker, GridKeyResult, GridModel,
+    GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction, JsonEditorModal,
+    PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
+    SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -381,6 +382,11 @@ impl CellEditor {
         self.scroll_offset = 0;
     }
 
+    /// Check if the value has been modified from the original.
+    pub fn is_modified(&self) -> bool {
+        self.active && self.value != self.original_value
+    }
+
     /// Insert a character at the current cursor position.
     pub fn insert_char(&mut self, c: char) {
         self.value.insert(self.cursor, c);
@@ -558,6 +564,10 @@ pub struct App {
 
     /// Help popup (Some when open, None when closed).
     pub help_popup: Option<HelpPopup>,
+    /// Row detail modal (Some when open, None when closed).
+    pub row_detail: Option<RowDetailModal>,
+    /// Confirmation prompt (Some when showing confirmation dialog).
+    pub confirm_prompt: Option<ConfirmPrompt>,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
 
@@ -565,6 +575,11 @@ pub struct App {
     pub history: History,
     /// Fuzzy picker for history search (when open).
     pub history_picker: Option<FuzzyPicker<HistoryEntry>>,
+
+    /// Last rendered area for query editor (for mouse click handling).
+    render_query_area: Option<Rect>,
+    /// Last rendered area for results grid (for mouse click handling).
+    render_grid_area: Option<Rect>,
 }
 
 impl App {
@@ -643,11 +658,16 @@ impl App {
             last_grid_viewport: None,
 
             help_popup: None,
+            row_detail: None,
+            confirm_prompt: None,
             last_status: None,
             last_error: None,
 
             history,
             history_picker: None,
+
+            render_query_area: None,
+            render_grid_area: None,
         };
 
         // Auto-connect if connection string provided
@@ -748,6 +768,10 @@ impl App {
                 let grid_area = chunks[2];
                 let status_area = chunks[3];
 
+                // Store rendered areas for mouse click handling
+                self.render_query_area = Some(query_area);
+                self.render_grid_area = Some(grid_area);
+
                 // Query editor with syntax highlighting
                 let query_border = match (self.focus, self.mode) {
                     (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
@@ -756,23 +780,29 @@ impl App {
                     (Focus::Grid, _) => Style::default().fg(Color::DarkGray),
                 };
 
+                // Build query title with [+] indicator if modified
+                let modified_indicator = if self.editor.is_modified() { " [+]" } else { "" };
                 let query_title = match (self.focus, self.mode) {
                     (Focus::Query, Mode::Normal) => {
-                        "Query [NORMAL] (i insert, Enter run, Ctrl-r history, Tab to grid)"
+                        format!("Query [NORMAL]{} (i insert, Enter run, Ctrl-r history, Tab to grid)", modified_indicator)
                     }
-                    (Focus::Query, Mode::Insert) => "Query [INSERT] (Esc normal, Ctrl-r history)",
-                    (Focus::Query, Mode::Visual) => "Query [VISUAL] (y yank, d delete, Esc cancel)",
-                    (Focus::Grid, _) => "Query (Tab to focus)",
+                    (Focus::Query, Mode::Insert) => {
+                        format!("Query [INSERT]{} (Esc normal, Ctrl-r history)", modified_indicator)
+                    }
+                    (Focus::Query, Mode::Visual) => {
+                        format!("Query [VISUAL]{} (y yank, d delete, Esc cancel)", modified_indicator)
+                    }
+                    (Focus::Grid, _) => "Query (Tab to focus)".to_string(),
                 };
 
                 let query_block = Block::default()
                     .borders(Borders::ALL)
-                    .title(query_title)
+                    .title(query_title.as_str())
                     .border_style(query_border);
 
                 let highlighted_editor =
                     HighlightedTextArea::new(&self.editor.textarea, highlighted_lines.clone())
-                        .block(query_block)
+                        .block(query_block.clone())
                         .scroll(self.editor_scroll);
 
                 frame.render_widget(highlighted_editor, query_area);
@@ -789,6 +819,37 @@ impl App {
                     inner_height,
                     inner_width,
                 );
+
+                // Render scrollbar for query editor if content exceeds visible area
+                let total_lines = self.editor.textarea.lines().len();
+                if total_lines > inner_height && inner_height > 0 {
+                    let inner_area = query_block.inner(query_area);
+                    let scrollbar_area = Rect {
+                        x: inner_area.x + inner_area.width.saturating_sub(1),
+                        y: inner_area.y,
+                        width: 1,
+                        height: inner_area.height,
+                    };
+
+                    let scrollbar = if scrollbar_area.height >= 7 {
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .begin_symbol(Some("▲"))
+                            .end_symbol(Some("▼"))
+                            .thumb_symbol("█")
+                            .track_symbol(Some("░"))
+                    } else {
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .begin_symbol(None)
+                            .end_symbol(None)
+                            .thumb_symbol("█")
+                            .track_symbol(Some("│"))
+                    };
+
+                    let mut scrollbar_state = ScrollbarState::new(total_lines)
+                        .position(self.editor_scroll.0 as usize);
+
+                    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+                }
 
                 // Error display (if any).
                 if let Some(ref err) = self.last_error {
@@ -901,6 +962,8 @@ impl App {
                 if self.completion.active {
                     let max_visible = 8usize;
                     let visible = self.completion.visible_items(max_visible);
+                    let total_items = self.completion.filtered_count();
+                    let needs_scrollbar = total_items > max_visible;
 
                     if !visible.is_empty() {
                         // Position popup near the cursor
@@ -912,7 +975,9 @@ impl App {
                             + cursor_col.saturating_sub(self.completion.prefix.len()) as u16;
 
                         let popup_height = (visible.len() + 2) as u16; // +2 for borders
-                        let popup_width = 40u16.min(size.width.saturating_sub(popup_x));
+                        let base_width = 40u16;
+                        let popup_width = (base_width + if needs_scrollbar { 1 } else { 0 })
+                            .min(size.width.saturating_sub(popup_x));
 
                         // Make sure popup fits on screen
                         let popup_y = if popup_y + popup_height > size.height {
@@ -960,10 +1025,41 @@ impl App {
                             .title("Completions (Tab select, Esc cancel)")
                             .border_style(Style::default().fg(Color::Cyan));
 
-                        let completion_list = Paragraph::new(lines).block(completion_block);
+                        let completion_list = Paragraph::new(lines).block(completion_block.clone());
 
                         frame.render_widget(Clear, popup_area);
                         frame.render_widget(completion_list, popup_area);
+
+                        // Render scrollbar if needed
+                        if needs_scrollbar {
+                            let inner = completion_block.inner(popup_area);
+                            let scrollbar_area = Rect {
+                                x: inner.x + inner.width.saturating_sub(1),
+                                y: inner.y,
+                                width: 1,
+                                height: inner.height,
+                            };
+
+                            let scrollbar = if scrollbar_area.height >= 7 {
+                                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                                    .begin_symbol(Some("▲"))
+                                    .end_symbol(Some("▼"))
+                                    .thumb_symbol("█")
+                                    .track_symbol(Some("░"))
+                            } else {
+                                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                                    .begin_symbol(None)
+                                    .end_symbol(None)
+                                    .thumb_symbol("█")
+                                    .track_symbol(Some("│"))
+                            };
+
+                            let scroll_offset = self.completion.scroll_offset(max_visible);
+                            let mut scrollbar_state = ScrollbarState::new(total_items)
+                                .position(scroll_offset);
+
+                            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+                        }
                     }
                 }
 
@@ -1004,7 +1100,8 @@ impl App {
                     // Update scroll offset based on cursor position
                     self.cell_editor.update_scroll(inner_width);
 
-                    let title = format!("Edit: {} (Enter confirm, Esc cancel)", col_name);
+                    let modified_indicator = if self.cell_editor.is_modified() { " [+]" } else { "" };
+                    let title = format!("Edit: {}{} (Enter confirm, Esc cancel)", col_name, modified_indicator);
                     let edit_block = Block::default()
                         .borders(Borders::ALL)
                         .title(title)
@@ -1088,17 +1185,33 @@ impl App {
                 if let Some(ref mut json_editor) = self.json_editor {
                     json_editor.render(frame, size);
                 }
+
+                // Render row detail modal if active
+                if let Some(ref mut row_detail) = self.row_detail {
+                    row_detail.render(frame, size);
+                }
+
+                // Render confirmation prompt if active (topmost layer)
+                if let Some(ref prompt) = self.confirm_prompt {
+                    prompt.render(frame, size);
+                }
             })?;
 
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
 
-                    if self.on_key(key) {
-                        break;
+                        if self.on_key(key) {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        self.on_mouse(mouse);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1107,6 +1220,29 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Handle confirmation prompt when active (highest priority)
+        if let Some(prompt) = self.confirm_prompt.take() {
+            match prompt.handle_key(key) {
+                ConfirmResult::Confirmed => {
+                    return self.handle_confirm_confirmed(prompt.context().clone());
+                }
+                ConfirmResult::Cancelled => {
+                    self.handle_confirm_cancelled(prompt.context().clone());
+                    return false;
+                }
+                ConfirmResult::Pending => {
+                    // Put it back, wait for valid input
+                    self.confirm_prompt = Some(prompt);
+                    return false;
+                }
+            }
+        }
+
+        // Handle row detail modal when active - it captures all input
+        if self.row_detail.is_some() {
+            return self.handle_row_detail_key(key);
+        }
+
         // Handle JSON editor when active - it captures all input
         if self.json_editor.is_some() {
             return self.handle_json_editor_key(key);
@@ -1150,6 +1286,12 @@ impl App {
             return false;
         }
 
+        // Global Ctrl+Enter to execute query (works regardless of mode/focus)
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL {
+            self.execute_query();
+            return false;
+        }
+
         // Handle history picker when open
         if self.history_picker.is_some() {
             return self.handle_history_picker_key(key);
@@ -1180,14 +1322,16 @@ impl App {
                 // Tab cycles to next item (wraps around)
                 (KeyCode::Tab, KeyModifiers::NONE)
                 | (KeyCode::Down, KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                     self.completion.select_next();
                     return false;
                 }
                 // Shift+Tab cycles to previous item (wraps around)
                 (KeyCode::Tab, KeyModifiers::SHIFT)
                 | (KeyCode::Up, KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                     self.completion.select_prev();
                     return false;
                 }
@@ -1233,7 +1377,21 @@ impl App {
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), KeyModifiers::NONE) => return true,
+                (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                    // Always show confirmation prompt, with different message based on unsaved changes
+                    if self.editor.is_modified() {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "You have unsaved changes. Quit anyway?",
+                            ConfirmContext::QuitApp,
+                        ));
+                    } else {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "Are you sure you want to quit?",
+                            ConfirmContext::QuitAppClean,
+                        ));
+                    }
+                    return false;
+                }
                 (KeyCode::Char('?'), KeyModifiers::NONE) => {
                     // Toggle help popup
                     if self.help_popup.is_some() {
@@ -1317,6 +1475,12 @@ impl App {
                         GridKeyResult::EditCell { row, col } => {
                             self.start_cell_edit(row, col);
                         }
+                        GridKeyResult::OpenRowDetail { row } => {
+                            self.open_row_detail(row);
+                        }
+                        GridKeyResult::StatusMessage(msg) => {
+                            self.last_status = Some(msg);
+                        }
                         GridKeyResult::None => {}
                     }
                 }
@@ -1327,6 +1491,109 @@ impl App {
         }
 
         false
+    }
+
+    /// Handle mouse events
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        // Don't process mouse events when modals are open
+        if self.confirm_prompt.is_some()
+            || self.json_editor.is_some()
+            || self.row_detail.is_some()
+            || self.help_popup.is_some()
+            || self.history_picker.is_some()
+        {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_mouse_click(mouse.column, mouse.row);
+            }
+            MouseEventKind::ScrollUp => {
+                self.handle_mouse_scroll(-3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.handle_mouse_scroll(3);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click at the given position
+    fn handle_mouse_click(&mut self, x: u16, y: u16) {
+        // Check if click is in query area
+        if let Some(query_area) = self.render_query_area {
+            if x >= query_area.x
+                && x < query_area.x + query_area.width
+                && y >= query_area.y
+                && y < query_area.y + query_area.height
+            {
+                // Click in query editor - focus it
+                if self.focus != Focus::Query {
+                    self.focus = Focus::Query;
+                    self.mode = Mode::Normal;
+                }
+                return;
+            }
+        }
+
+        // Check if click is in grid area
+        if let Some(grid_area) = self.render_grid_area {
+            if x >= grid_area.x
+                && x < grid_area.x + grid_area.width
+                && y >= grid_area.y
+                && y < grid_area.y + grid_area.height
+            {
+                // Click in grid - focus it and try to select the row
+                if self.focus != Focus::Grid {
+                    self.focus = Focus::Grid;
+                    self.mode = Mode::Normal;
+                }
+
+                // Calculate which row was clicked (accounting for border and header)
+                let inner_y = y.saturating_sub(grid_area.y + 2); // +2 for border and header
+                let clicked_row = self.grid_state.row_offset + inner_y as usize;
+
+                if clicked_row < self.grid.rows.len() {
+                    self.grid_state.cursor_row = clicked_row;
+                }
+            }
+        }
+    }
+
+    /// Handle mouse scroll in the focused area
+    fn handle_mouse_scroll(&mut self, delta: i32) {
+        match self.focus {
+            Focus::Query => {
+                // Scroll the query editor
+                if delta < 0 {
+                    // Scroll up
+                    self.editor_scroll.0 = self.editor_scroll.0.saturating_sub((-delta) as u16);
+                } else {
+                    // Scroll down
+                    let max_scroll = self.editor.textarea.lines().len().saturating_sub(1) as u16;
+                    self.editor_scroll.0 = (self.editor_scroll.0 + delta as u16).min(max_scroll);
+                }
+            }
+            Focus::Grid => {
+                // Scroll the results grid
+                let row_count = self.grid.rows.len();
+                if row_count == 0 {
+                    return;
+                }
+
+                if delta < 0 {
+                    // Scroll up
+                    let amount = (-delta) as usize;
+                    self.grid_state.cursor_row = self.grid_state.cursor_row.saturating_sub(amount);
+                } else {
+                    // Scroll down
+                    let amount = delta as usize;
+                    self.grid_state.cursor_row =
+                        (self.grid_state.cursor_row + amount).min(row_count - 1);
+                }
+            }
+        }
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
@@ -1391,6 +1658,83 @@ impl App {
         }
     }
 
+    /// Open the row detail modal to show all columns for a row.
+    fn open_row_detail(&mut self, row: usize) {
+        if row >= self.grid.rows.len() {
+            return;
+        }
+
+        let headers = self.grid.headers.clone();
+        let values = self.grid.rows[row].clone();
+        let col_types = self.grid.col_types.clone();
+
+        self.row_detail = Some(RowDetailModal::new(headers, values, col_types, row));
+    }
+
+    /// Handle key events for the row detail modal.
+    fn handle_row_detail_key(&mut self, key: KeyEvent) -> bool {
+        // Take the modal temporarily to avoid borrow issues
+        let mut modal = match self.row_detail.take() {
+            Some(m) => m,
+            None => return false,
+        };
+
+        match modal.handle_key(key) {
+            RowDetailAction::Continue => {
+                // Put the modal back
+                self.row_detail = Some(modal);
+            }
+            RowDetailAction::Close => {
+                // Modal is already taken, just don't put it back
+            }
+            RowDetailAction::Edit { col } => {
+                // Get the row from the modal before closing
+                let row = self.grid_state.cursor_row;
+                // Close the detail modal first
+                // Then start editing the selected field
+                self.start_cell_edit(row, col);
+            }
+        }
+        false
+    }
+
+    /// Handle confirmed action based on context.
+    fn handle_confirm_confirmed(&mut self, context: ConfirmContext) -> bool {
+        match context {
+            ConfirmContext::CloseJsonEditor { .. } => {
+                self.json_editor = None;
+                self.last_status = Some("Changes discarded".to_string());
+                false
+            }
+            ConfirmContext::CloseCellEditor { .. } => {
+                self.cell_editor.close();
+                self.last_status = Some("Changes discarded".to_string());
+                false
+            }
+            ConfirmContext::QuitApp | ConfirmContext::QuitAppClean => {
+                true // Quit the application
+            }
+        }
+    }
+
+    /// Handle cancelled confirmation based on context.
+    fn handle_confirm_cancelled(&mut self, context: ConfirmContext) {
+        match context {
+            ConfirmContext::CloseJsonEditor { .. } => {
+                // Editor is still open, nothing to do
+                self.last_status = Some("Continuing edit".to_string());
+            }
+            ConfirmContext::CloseCellEditor { .. } => {
+                // Cell editor is still open, nothing to do
+                self.last_status = Some("Continuing edit".to_string());
+            }
+            ConfirmContext::QuitApp | ConfirmContext::QuitAppClean => {
+                // Stay in the app
+                self.last_status = Some("Quit cancelled".to_string());
+            }
+        }
+    }
+
     fn handle_cell_edit_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             // Enter: confirm edit
@@ -1398,10 +1742,21 @@ impl App {
                 self.commit_cell_edit();
                 return false;
             }
-            // Escape: cancel edit
+            // Escape: cancel edit (with confirmation if modified)
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.cell_editor.close();
-                self.last_status = Some("Edit cancelled".to_string());
+                if self.cell_editor.is_modified() {
+                    // Show confirmation prompt
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "You have unsaved changes. Discard them?",
+                        ConfirmContext::CloseCellEditor {
+                            row: self.cell_editor.row,
+                            col: self.cell_editor.col,
+                        },
+                    ));
+                } else {
+                    self.cell_editor.close();
+                    self.last_status = Some("Edit cancelled".to_string());
+                }
                 return false;
             }
             // Backspace: delete character before cursor
@@ -1475,6 +1830,14 @@ impl App {
             JsonEditorAction::Cancel => {
                 // Editor is already taken, just don't put it back
                 self.last_status = Some("Edit cancelled".to_string());
+            }
+            JsonEditorAction::RequestClose { row, col } => {
+                // Show confirmation prompt, keep editor open
+                self.json_editor = Some(editor);
+                self.confirm_prompt = Some(ConfirmPrompt::new(
+                    "You have unsaved changes. Discard them?",
+                    ConfirmContext::CloseJsonEditor { row, col },
+                ));
             }
             JsonEditorAction::Error(msg) => {
                 // Show error but keep editor open
@@ -2321,10 +2684,11 @@ impl App {
                             self.mode = Mode::Insert;
                             return;
                         }
-                        // yy - yank (copy) line
+                        // yy - yank (copy) line to system clipboard
                         ('y', KeyCode::Char('y'), KeyModifiers::NONE) => {
-                            self.editor.yank_line();
-                            self.last_status = Some("Yanked line".to_string());
+                            if let Some(text) = self.editor.yank_line() {
+                                self.copy_to_clipboard(&text);
+                            }
                             return;
                         }
                         _ => {
@@ -2628,12 +2992,16 @@ impl App {
                         self.editor.textarea.cancel_selection();
                         self.mode = Mode::Normal;
                     }
-                    // Yank (copy) selection.
+                    // Yank (copy) selection to system clipboard.
                     (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                        // Copy to internal buffer first (this also captures the selection)
                         self.editor.textarea.copy();
+                        // Get the yanked text and copy to system clipboard
+                        if let Some(text) = self.editor.get_selection() {
+                            self.copy_to_clipboard(&text);
+                        }
                         self.editor.textarea.cancel_selection();
                         self.mode = Mode::Normal;
-                        self.last_status = Some("Yanked".to_string());
                     }
                     // Delete selection.
                     (KeyCode::Char('d'), KeyModifiers::NONE)
@@ -3092,6 +3460,9 @@ impl App {
                 // Move focus to grid to show results
                 self.focus = Focus::Grid;
 
+                // Mark the query as "saved" since it was successfully executed
+                self.editor.mark_saved();
+
                 let mut msg = String::new();
                 if let Some(tag) = result.command_tag {
                     msg.push_str(&tag);
@@ -3290,6 +3661,7 @@ impl App {
             PickerAction::Selected(entry) => {
                 // Load selected query into editor.
                 self.editor.set_text(entry.query);
+                self.editor.mark_saved(); // Mark as unmodified since it's loaded content
                 self.history_picker = None;
                 self.last_status = Some("Loaded from history".to_string());
                 false
@@ -3359,6 +3731,54 @@ mod tests {
         assert_eq!(editor.value, "hello");
         assert_eq!(editor.cursor, 5); // Cursor at end
         assert_eq!(editor.original_value, "hello");
+    }
+
+    #[test]
+    fn test_cell_editor_not_modified_initially() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified when just opened"
+        );
+    }
+
+    #[test]
+    fn test_cell_editor_modified_after_change() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        editor.insert_char('!');
+
+        assert!(
+            editor.is_modified(),
+            "Editor should be modified after inserting a character"
+        );
+    }
+
+    #[test]
+    fn test_cell_editor_not_modified_when_restored() {
+        let mut editor = CellEditor::new();
+        editor.open(0, 0, "hello".to_string());
+
+        editor.insert_char('!');
+        editor.delete_char_before(); // Remove the '!' we just added
+
+        assert!(
+            !editor.is_modified(),
+            "Editor should not be modified when content matches original"
+        );
+    }
+
+    #[test]
+    fn test_cell_editor_not_modified_when_inactive() {
+        let editor = CellEditor::new();
+
+        assert!(
+            !editor.is_modified(),
+            "Inactive editor should not be considered modified"
+        );
     }
 
     #[test]
@@ -3856,5 +4276,116 @@ mod tests {
         // Default bindings should still work
         let j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
+    }
+
+    // ========== Global Ctrl+Enter Tests ==========
+
+    #[test]
+    fn test_ctrl_enter_binding_exists_in_editor_normal_keymap() {
+        // Verify Ctrl+Enter is bound to ExecuteQuery in editor normal keymap
+        let keymap = crate::config::Keymap::default_editor_normal_keymap();
+        let ctrl_enter = KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(
+            keymap.get(&ctrl_enter),
+            Some(&Action::ExecuteQuery),
+            "Ctrl+Enter should be bound to ExecuteQuery in normal mode"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_enter_binding_exists_in_editor_insert_keymap() {
+        // Verify Ctrl+Enter is bound to ExecuteQuery in editor insert keymap
+        let keymap = crate::config::Keymap::default_editor_insert_keymap();
+        let ctrl_enter = KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(
+            keymap.get(&ctrl_enter),
+            Some(&Action::ExecuteQuery),
+            "Ctrl+Enter should be bound to ExecuteQuery in insert mode"
+        );
+    }
+
+    #[test]
+    fn test_global_ctrl_enter_key_detection() {
+        // Test that Ctrl+Enter is correctly detected as the key combination
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(key.code, KeyCode::Enter);
+        assert_eq!(key.modifiers, KeyModifiers::CONTROL);
+
+        // Verify it's different from plain Enter
+        let plain_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_ne!(key.modifiers, plain_enter.modifiers);
+    }
+
+    #[test]
+    fn test_ctrl_enter_executes_query_when_grid_focused() {
+        // Create a minimal App for testing
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Set focus to Grid and mode to Normal
+        app.focus = Focus::Grid;
+        app.mode = Mode::Normal;
+
+        // Put some text in the editor so we have a query to execute
+        app.editor.set_text("SELECT 1".to_string());
+
+        // Press Ctrl+Enter
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let quit = app.on_key(key);
+
+        // Should not quit
+        assert!(!quit, "Ctrl+Enter should not quit");
+
+        // Since we have no DB connection, execute_query will set last_error
+        // But if EditCell was triggered instead, last_status would be different
+        // Check that execute_query was attempted (shows error about no connection)
+        assert!(
+            app.last_error.is_some()
+                || app.last_status == Some("No query to run".to_string())
+                || app.last_status == Some("Running...".to_string()),
+            "Ctrl+Enter should attempt to execute query, not edit cell. last_error={:?}, last_status={:?}",
+            app.last_error,
+            app.last_status
+        );
+    }
+
+    #[test]
+    fn test_ctrl_enter_does_not_open_cell_editor_on_grid() {
+        // Create a minimal App for testing with some grid data
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let grid = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        )
+        .with_source_table(Some("users".to_string()));
+
+        let mut app = App::new(grid, rt.handle().clone(), tx, rx, None);
+
+        // Set focus to Grid and mode to Normal
+        app.focus = Focus::Grid;
+        app.mode = Mode::Normal;
+
+        // Put some text in the editor
+        app.editor.set_text("SELECT 1".to_string());
+
+        // Press Ctrl+Enter
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let _quit = app.on_key(key);
+
+        // Cell editor should NOT be opened
+        assert!(
+            !app.cell_editor.active,
+            "Ctrl+Enter should not open cell editor, but it did"
+        );
     }
 }

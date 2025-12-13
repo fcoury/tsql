@@ -121,6 +121,27 @@ impl CompletionPopup {
             .and_then(|&i| self.items.get(i))
     }
 
+    /// Get the total number of filtered items
+    pub fn filtered_count(&self) -> usize {
+        self.filtered.len()
+    }
+
+    /// Get the scroll offset for the visible items window
+    pub fn scroll_offset(&self, max_items: usize) -> usize {
+        let total = self.filtered.len();
+        if total == 0 || total <= max_items {
+            return 0;
+        }
+
+        if self.selected < max_items / 2 {
+            0
+        } else if self.selected > total - max_items / 2 {
+            total - max_items
+        } else {
+            self.selected - max_items / 2
+        }
+    }
+
     pub fn visible_items(&self, max_items: usize) -> Vec<(usize, &CompletionItem)> {
         // Return items around the selected one
         let total = self.filtered.len();

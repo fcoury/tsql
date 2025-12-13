@@ -60,6 +60,7 @@ pub enum Action {
     ExportCsv,
     ExportJson,
     EditCell,
+    OpenRowDetail,
     GenerateUpdate,
     GenerateDelete,
     GenerateInsert,
@@ -74,6 +75,9 @@ pub enum Action {
     ResizeColumnLeft,
     ResizeColumnRight,
     AutoFitColumn,
+
+    // Display
+    ToggleUuidExpand,
 
     // Application
     Quit,
@@ -132,6 +136,7 @@ impl Action {
             Action::ExportCsv => "Export to CSV file",
             Action::ExportJson => "Export to JSON file",
             Action::EditCell => "Edit cell",
+            Action::OpenRowDetail => "Open row detail view",
             Action::GenerateUpdate => "Generate UPDATE statement",
             Action::GenerateDelete => "Generate DELETE statement",
             Action::GenerateInsert => "Generate INSERT statement",
@@ -142,6 +147,7 @@ impl Action {
             Action::ResizeColumnLeft => "Make column narrower",
             Action::ResizeColumnRight => "Make column wider",
             Action::AutoFitColumn => "Auto-fit column width",
+            Action::ToggleUuidExpand => "Toggle UUID expansion",
             Action::Quit => "Quit",
             Action::ForceQuit => "Force quit without saving",
             Action::Help => "Show help",
@@ -213,6 +219,7 @@ impl FromStr for Action {
             "export_csv" => Ok(Action::ExportCsv),
             "export_json" => Ok(Action::ExportJson),
             "edit_cell" => Ok(Action::EditCell),
+            "open_row_detail" => Ok(Action::OpenRowDetail),
             "generate_update" => Ok(Action::GenerateUpdate),
             "generate_delete" => Ok(Action::GenerateDelete),
             "generate_insert" => Ok(Action::GenerateInsert),
@@ -227,6 +234,9 @@ impl FromStr for Action {
             "resize_column_left" => Ok(Action::ResizeColumnLeft),
             "resize_column_right" => Ok(Action::ResizeColumnRight),
             "auto_fit_column" => Ok(Action::AutoFitColumn),
+
+            // Display
+            "toggle_uuid_expand" => Ok(Action::ToggleUuidExpand),
 
             // Application
             "quit" => Ok(Action::Quit),
@@ -522,6 +532,12 @@ impl Keymap {
             Action::EditCell,
         );
 
+        // Row detail view
+        km.bind(
+            KeyBinding::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            Action::OpenRowDetail,
+        );
+
         // Search
         km.bind(
             KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE),
@@ -554,6 +570,12 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char('i'), KeyModifiers::NONE),
             Action::FocusQuery,
+        );
+
+        // Display
+        km.bind(
+            KeyBinding::new(KeyCode::Char('U'), KeyModifiers::SHIFT),
+            Action::ToggleUuidExpand,
         );
 
         // Commands

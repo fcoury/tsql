@@ -37,14 +37,14 @@ impl Default for VimConfig {
 }
 
 impl VimConfig {
-    /// Create config for JSON editor (double Esc, no search).
+    /// Create config for JSON editor (single Esc to close, no search).
     pub fn json_editor() -> Self {
         Self {
             half_page_lines: 10,
             full_page_lines: 20,
             enable_visual: true,
             enable_search: false,
-            double_esc_to_exit: true,
+            double_esc_to_exit: false, // Changed: single Esc triggers close
         }
     }
 }
@@ -648,7 +648,11 @@ mod tests {
 
     #[test]
     fn test_double_esc_config() {
-        let config = VimConfig::json_editor();
+        // Create a config with double_esc_to_exit enabled
+        let config = VimConfig {
+            double_esc_to_exit: true,
+            ..VimConfig::default()
+        };
         let mut handler = VimHandler::new(config);
 
         // First Esc does nothing (just sets flag)
@@ -661,6 +665,19 @@ mod tests {
         assert_eq!(
             handler.handle_key(key(KeyCode::Esc), VimMode::Normal),
             VimCommand::custom("cancel")
+        );
+    }
+
+    #[test]
+    fn test_single_esc_json_editor_config() {
+        // json_editor config now has double_esc_to_exit: false
+        let config = VimConfig::json_editor();
+        let mut handler = VimHandler::new(config);
+
+        // Single Esc in Normal mode returns None (handled by json_editor itself)
+        assert_eq!(
+            handler.handle_key(key(KeyCode::Esc), VimMode::Normal),
+            VimCommand::None
         );
     }
 }

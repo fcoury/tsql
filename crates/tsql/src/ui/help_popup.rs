@@ -156,6 +156,7 @@ const GRID_ACTIONS: HelpSection = HelpSection::new(
         KeyBinding::new("y", "Yank (copy) row as TSV"),
         KeyBinding::new("Y", "Yank row with headers"),
         KeyBinding::new("e / Enter", "Edit cell"),
+        KeyBinding::new("o", "Open row detail view"),
         KeyBinding::new("/", "Search in results"),
         KeyBinding::new("n/N", "Next/previous match"),
     ],
