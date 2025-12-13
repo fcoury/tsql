@@ -90,6 +90,11 @@ pub enum Action {
     Connect,
     Disconnect,
     Reconnect,
+
+    // Connection Form
+    SaveConnection,
+    TestConnection,
+    ClearField,
 }
 
 impl Action {
@@ -156,6 +161,9 @@ impl Action {
             Action::Connect => "Connect to database",
             Action::Disconnect => "Disconnect from database",
             Action::Reconnect => "Reconnect to database",
+            Action::SaveConnection => "Save connection",
+            Action::TestConnection => "Test connection",
+            Action::ClearField => "Clear current field",
         }
     }
 }
@@ -249,6 +257,11 @@ impl FromStr for Action {
             "connect" => Ok(Action::Connect),
             "disconnect" => Ok(Action::Disconnect),
             "reconnect" => Ok(Action::Reconnect),
+
+            // Connection Form
+            "save_connection" => Ok(Action::SaveConnection),
+            "test_connection" => Ok(Action::TestConnection),
+            "clear_field" => Ok(Action::ClearField),
 
             _ => Err(format!("Unknown action: {}", s)),
         }
@@ -699,9 +712,9 @@ impl Keymap {
             Action::PrevMatch,
         );
 
-        // Execute query
+        // Execute query (Ctrl+S)
         km.bind(
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             Action::ExecuteQuery,
         );
 
@@ -730,9 +743,9 @@ impl Keymap {
             Action::EnterNormalMode,
         );
 
-        // Execute query
+        // Execute query (Ctrl+S)
         km.bind(
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             Action::ExecuteQuery,
         );
 
@@ -766,6 +779,31 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             Action::ShowHistory,
+        );
+
+        km
+    }
+
+    /// Create the default keymap for the connection form
+    pub fn default_connection_form_keymap() -> Self {
+        let mut km = Self::new();
+
+        // Save connection (Ctrl+S is the default)
+        km.bind(
+            KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Action::SaveConnection,
+        );
+
+        // Test connection
+        km.bind(
+            KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            Action::TestConnection,
+        );
+
+        // Clear field
+        km.bind(
+            KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Action::ClearField,
         );
 
         km

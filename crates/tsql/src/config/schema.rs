@@ -140,6 +140,9 @@ pub struct KeymapConfig {
     /// Custom keybindings for grid navigation
     #[serde(default)]
     pub grid: Vec<CustomKeyBinding>,
+    /// Custom keybindings for connection form
+    #[serde(default)]
+    pub connection_form: Vec<CustomKeyBinding>,
 }
 
 impl Default for KeymapConfig {
@@ -150,6 +153,7 @@ impl Default for KeymapConfig {
             insert: Vec::new(),
             visual: Vec::new(),
             grid: Vec::new(),
+            connection_form: Vec::new(),
         }
     }
 }

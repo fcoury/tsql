@@ -79,6 +79,7 @@ auto_reconnect = true
 vim_mode = true
 
 # Custom keybindings for normal mode
+# Default: Ctrl+S executes the query (works in any mode/focus)
 # [[keymap.normal]]
 # key = "ctrl+s"
 # action = "execute_query"
@@ -86,6 +87,19 @@ vim_mode = true
 
 # Custom keybindings for grid navigation
 # [[keymap.grid]]
-# key = "ctrl+e"
+# key = "ctrl+x"
 # action = "export_csv"
 # description = "Export results to CSV"
+
+# Custom keybindings for connection form (add/edit connection modal)
+# Default save key is Ctrl+S. If you have Ctrl+S mapped to something else
+# (e.g., in tmux), you can remap the save action to another key.
+# [[keymap.connection_form]]
+# key = "ctrl+w"
+# action = "save_connection"
+# description = "Save the connection"
+
+# Available connection_form actions:
+# - save_connection: Save the connection (default: Ctrl+S)
+# - test_connection: Test the connection (default: Ctrl+T)
+# - clear_field: Clear the current field (default: Ctrl+U)

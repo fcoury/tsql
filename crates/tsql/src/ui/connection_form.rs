@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::config::{ConnectionColor, ConnectionEntry};
+use crate::config::{Action, ConnectionColor, ConnectionEntry, Keymap};
 
 /// Which field is currently focused in the form
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,6 +138,9 @@ pub struct ConnectionFormModal {
 
     /// Original values for detecting changes (only set when editing)
     original_values: Option<OriginalFormValues>,
+
+    /// Keymap for form actions
+    keymap: Keymap,
 }
 
 /// Original form values for tracking modifications
@@ -156,6 +159,11 @@ struct OriginalFormValues {
 impl ConnectionFormModal {
     /// Create a new form for adding a connection.
     pub fn new() -> Self {
+        Self::with_keymap(Keymap::default_connection_form_keymap())
+    }
+
+    /// Create a new form with a custom keymap.
+    pub fn with_keymap(keymap: Keymap) -> Self {
         Self {
             name: String::new(),
             host: "localhost".to_string(),
@@ -182,11 +190,21 @@ impl ConnectionFormModal {
             title: "New Connection".to_string(),
             modified: false,
             original_values: None,
+            keymap,
         }
     }
 
     /// Create a form for editing an existing connection.
     pub fn edit(entry: &ConnectionEntry, existing_password: Option<String>) -> Self {
+        Self::edit_with_keymap(entry, existing_password, Keymap::default_connection_form_keymap())
+    }
+
+    /// Create a form for editing an existing connection with a custom keymap.
+    pub fn edit_with_keymap(
+        entry: &ConnectionEntry,
+        existing_password: Option<String>,
+        keymap: Keymap,
+    ) -> Self {
         let password = existing_password.unwrap_or_default();
         let color_index = ConnectionColor::all_names()
             .iter()
@@ -230,6 +248,7 @@ impl ConnectionFormModal {
             title: format!("Edit: {}", entry.name),
             modified: false,
             original_values: Some(original_values),
+            keymap,
         }
     }
 
@@ -264,8 +283,46 @@ impl ConnectionFormModal {
         false
     }
 
+    /// Set the keymap for this form.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+    }
+
+    /// Get the key binding for saving (for help display).
+    pub fn save_key_display(&self) -> String {
+        self.keymap
+            .bindings()
+            .iter()
+            .find(|(_, action)| **action == Action::SaveConnection)
+            .map(|(key, _)| key.to_string())
+            .unwrap_or_else(|| "Ctrl+S".to_string())
+    }
+
+    /// Get the key binding for testing (for help display).
+    pub fn test_key_display(&self) -> String {
+        self.keymap
+            .bindings()
+            .iter()
+            .find(|(_, action)| **action == Action::TestConnection)
+            .map(|(key, _)| key.to_string())
+            .unwrap_or_else(|| "Ctrl+T".to_string())
+    }
+
     /// Handle a key event and return the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> ConnectionFormAction {
+        // Check keymap for configurable actions first
+        if let Some(action) = self.keymap.get_action(&key) {
+            match action {
+                Action::SaveConnection => return self.try_save(),
+                Action::TestConnection => return self.try_test(),
+                Action::ClearField => {
+                    self.clear_field();
+                    return ConnectionFormAction::Continue;
+                }
+                _ => {}
+            }
+        }
+
         match (key.code, key.modifiers) {
             // Cancel - check for unsaved changes
             (KeyCode::Esc, _) => {
@@ -275,12 +332,6 @@ impl ConnectionFormModal {
                     ConnectionFormAction::Cancel
                 }
             }
-
-            // Save (Ctrl+S)
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.try_save(),
-
-            // Test connection (Ctrl+T)
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => self.try_test(),
 
             // Tab - next field
             (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
@@ -366,12 +417,6 @@ impl ConnectionFormModal {
             }
             (KeyCode::End, _) => {
                 self.move_cursor_end();
-                ConnectionFormAction::Continue
-            }
-
-            // Ctrl+U - clear field
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.clear_field();
                 ConnectionFormAction::Continue
             }
 
@@ -871,12 +916,15 @@ impl ConnectionFormModal {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let save_key = self.save_key_display();
+        let test_key = self.test_key_display();
+
         let help_spans = vec![
             Span::styled("Tab", Style::default().fg(Color::Yellow)),
             Span::raw(" next  "),
-            Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
+            Span::styled(save_key, Style::default().fg(Color::Yellow)),
             Span::raw(" save  "),
-            Span::styled("Ctrl+T", Style::default().fg(Color::Yellow)),
+            Span::styled(test_key, Style::default().fg(Color::Yellow)),
             Span::raw(" test  "),
             Span::styled("Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" cancel"),
@@ -1152,5 +1200,165 @@ mod tests {
             }
             _ => panic!("Expected TestConnection action"),
         }
+    }
+
+    // ========== Issue Reproduction Tests ==========
+
+    /// Test that Ctrl+S saves the form (default save shortcut)
+    #[test]
+    fn test_ctrl_s_saves_form() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "testconn".to_string();
+        form.host = "localhost".to_string();
+        form.database = "testdb".to_string();
+        form.user = "postgres".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.name, "testconn");
+            }
+            other => panic!("Expected Save action with Ctrl+S, got {:?}", other),
+        }
+    }
+
+    /// Test that Ctrl+S works with exact CONTROL modifier
+    #[test]
+    fn test_ctrl_s_with_exact_control_modifier() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "testconn".to_string();
+        form.host = "localhost".to_string();
+        form.database = "testdb".to_string();
+        form.user = "postgres".to_string();
+
+        // Exact CONTROL modifier (ideal case)
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.name, "testconn");
+            }
+            other => panic!("Expected Save action with exact CONTROL, got {:?}", other),
+        }
+    }
+
+    /// Test custom keymap binding for save
+    #[test]
+    fn test_custom_save_keybinding() {
+        use crate::config::{Action, KeyBinding, Keymap};
+
+        // Create a custom keymap with Ctrl+W as the save key
+        let mut keymap = Keymap::new();
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Action::SaveConnection,
+        );
+
+        let mut form = ConnectionFormModal::with_keymap(keymap);
+        form.name = "testconn".to_string();
+        form.host = "localhost".to_string();
+        form.database = "testdb".to_string();
+        form.user = "postgres".to_string();
+
+        // Ctrl+W should now save
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.name, "testconn");
+            }
+            other => panic!("Expected Save action with Ctrl+W, got {:?}", other),
+        }
+
+        // Ctrl+S should NOT save (not in the custom keymap)
+        let mut form2 = ConnectionFormModal::with_keymap(Keymap::new());
+        form2.name = "testconn".to_string();
+        form2.host = "localhost".to_string();
+        form2.database = "testdb".to_string();
+        form2.user = "postgres".to_string();
+
+        let action2 = form2.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(action2, ConnectionFormAction::Continue, "Ctrl+S should not save with empty keymap");
+    }
+
+    #[test]
+    fn test_ctrl_s_first_press_should_work() {
+        // Simulating the exact user scenario: fill form and press Ctrl+S once
+        let mut form = ConnectionFormModal::new();
+
+        // User types "Paypol" in name field
+        form.name = "Paypol".to_string();
+        form.name_cursor = 6;
+
+        // User fills other fields
+        form.host = "localhost".to_string();
+        form.database = "paypol".to_string();
+        form.user = "postgres".to_string();
+
+        // User presses Ctrl+S ONCE - should work immediately
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        // This should be a Save action, not Continue
+        assert!(
+            matches!(action, ConnectionFormAction::Save { .. }),
+            "First Ctrl+S press should trigger Save, got {:?}",
+            action
+        );
+    }
+
+    /// Issue 3: Esc requiring two presses
+    /// Test Esc behavior with modified vs unmodified forms
+    #[test]
+    fn test_esc_on_unmodified_form_closes_immediately() {
+        let form = ConnectionFormModal::new();
+        // New form with default values should not be "modified"
+        assert!(
+            !form.is_modified(),
+            "New form with defaults should not be modified"
+        );
+    }
+
+    #[test]
+    fn test_esc_on_modified_form_requests_confirmation() {
+        let mut form = ConnectionFormModal::new();
+        // User types a name - form is now modified
+        form.name = "Paypol".to_string();
+
+        assert!(form.is_modified(), "Form with name should be modified");
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            action,
+            ConnectionFormAction::RequestClose,
+            "Esc on modified form should request close (show confirmation)"
+        );
+    }
+
+    #[test]
+    fn test_form_modification_detection() {
+        let mut form = ConnectionFormModal::new();
+
+        // Initially unmodified (only defaults)
+        assert!(!form.is_modified(), "New form should not be modified");
+
+        // Setting name makes it modified
+        form.name = "test".to_string();
+        assert!(form.is_modified(), "Form with name should be modified");
+
+        // Clear name, still modified because user changed something
+        form.name.clear();
+        // Actually, empty name with default host/port should NOT be modified
+        assert!(
+            !form.is_modified(),
+            "Form back to defaults should not be modified"
+        );
+
+        // Change host from default
+        form.host = "remotehost".to_string();
+        assert!(
+            form.is_modified(),
+            "Form with non-default host should be modified"
+        );
     }
 }

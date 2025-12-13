@@ -538,6 +538,8 @@ pub struct App {
     pub editor_normal_keymap: Keymap,
     /// Keymap for editor in insert mode
     pub editor_insert_keymap: Keymap,
+    /// Keymap for connection form
+    pub connection_form_keymap: Keymap,
 
     pub editor: QueryEditor,
     pub highlighter: Highlighter,
@@ -638,6 +640,7 @@ impl App {
         let grid_keymap = Self::build_grid_keymap(&config);
         let editor_normal_keymap = Self::build_editor_normal_keymap(&config);
         let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
+        let connection_form_keymap = Self::build_connection_form_keymap(&config);
 
         let mut app = Self {
             focus: Focus::Query,
@@ -648,6 +651,7 @@ impl App {
             grid_keymap,
             editor_normal_keymap,
             editor_insert_keymap,
+            connection_form_keymap,
 
             editor,
             highlighter: create_sql_highlighter(),
@@ -758,6 +762,22 @@ impl App {
 
         // Apply custom bindings from config
         for binding in &config.keymap.insert {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
+    }
+
+    /// Build the connection form keymap from defaults + config overrides
+    fn build_connection_form_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_connection_form_keymap();
+
+        // Apply custom bindings from config
+        for binding in &config.keymap.connection_form {
             if let Some(key) = KeyBinding::parse(&binding.key) {
                 if let Ok(action) = binding.action.parse::<Action>() {
                     keymap.bind(key, action);
@@ -1352,8 +1372,8 @@ impl App {
             return false;
         }
 
-        // Global Ctrl+Enter to execute query (works regardless of mode/focus)
-        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL {
+        // Global Ctrl+S to execute query (works regardless of mode/focus)
+        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
             self.execute_query();
             return false;
         }
@@ -3046,7 +3066,7 @@ impl App {
                     return;
                 }
 
-                // Check keymap for insert mode actions (e.g., Ctrl+Enter to execute)
+                // Check keymap for insert mode actions (e.g., Ctrl+S to execute)
                 if let Some(action) = self.editor_insert_keymap.get_action(&key) {
                     match action {
                         Action::EnterNormalMode => {
@@ -3237,6 +3257,10 @@ impl App {
 
     /// Open the connection manager modal.
     fn open_connection_manager(&mut self) {
+        // Reload connections from disk to pick up changes from other instances
+        if let Ok(connections) = load_connections() {
+            self.connections = connections;
+        }
         self.connection_manager = Some(ConnectionManagerModal::new(
             &self.connections,
             self.current_connection_name.clone(),
@@ -3255,12 +3279,17 @@ impl App {
                 self.connect_to_entry(entry);
             }
             ConnectionManagerAction::Add => {
-                self.connection_form = Some(ConnectionFormModal::new());
+                self.connection_form =
+                    Some(ConnectionFormModal::with_keymap(self.connection_form_keymap.clone()));
             }
             ConnectionManagerAction::Edit { entry } => {
                 // Try to get existing password for editing
                 let password = entry.get_password().ok().flatten();
-                self.connection_form = Some(ConnectionFormModal::edit(&entry, password));
+                self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
+                    &entry,
+                    password,
+                    self.connection_form_keymap.clone(),
+                ));
             }
             ConnectionManagerAction::Delete { name } => {
                 // Show confirmation for delete
@@ -4569,46 +4598,46 @@ mod tests {
         assert_eq!(app.grid_keymap.get(&j), Some(&Action::MoveDown));
     }
 
-    // ========== Global Ctrl+Enter Tests ==========
+    // ========== Global Ctrl+S (Execute Query) Tests ==========
 
     #[test]
-    fn test_ctrl_enter_binding_exists_in_editor_normal_keymap() {
-        // Verify Ctrl+Enter is bound to ExecuteQuery in editor normal keymap
+    fn test_ctrl_s_binding_exists_in_editor_normal_keymap() {
+        // Verify Ctrl+S is bound to ExecuteQuery in editor normal keymap
         let keymap = crate::config::Keymap::default_editor_normal_keymap();
-        let ctrl_enter = KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let ctrl_s = KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(
-            keymap.get(&ctrl_enter),
+            keymap.get(&ctrl_s),
             Some(&Action::ExecuteQuery),
-            "Ctrl+Enter should be bound to ExecuteQuery in normal mode"
+            "Ctrl+S should be bound to ExecuteQuery in normal mode"
         );
     }
 
     #[test]
-    fn test_ctrl_enter_binding_exists_in_editor_insert_keymap() {
-        // Verify Ctrl+Enter is bound to ExecuteQuery in editor insert keymap
+    fn test_ctrl_s_binding_exists_in_editor_insert_keymap() {
+        // Verify Ctrl+S is bound to ExecuteQuery in editor insert keymap
         let keymap = crate::config::Keymap::default_editor_insert_keymap();
-        let ctrl_enter = KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let ctrl_s = KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(
-            keymap.get(&ctrl_enter),
+            keymap.get(&ctrl_s),
             Some(&Action::ExecuteQuery),
-            "Ctrl+Enter should be bound to ExecuteQuery in insert mode"
+            "Ctrl+S should be bound to ExecuteQuery in insert mode"
         );
     }
 
     #[test]
-    fn test_global_ctrl_enter_key_detection() {
-        // Test that Ctrl+Enter is correctly detected as the key combination
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert_eq!(key.code, KeyCode::Enter);
+    fn test_global_ctrl_s_key_detection() {
+        // Test that Ctrl+S is correctly detected as the key combination
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(key.code, KeyCode::Char('s'));
         assert_eq!(key.modifiers, KeyModifiers::CONTROL);
 
-        // Verify it's different from plain Enter
-        let plain_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_ne!(key.modifiers, plain_enter.modifiers);
+        // Verify it's different from plain 's'
+        let plain_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_ne!(key.modifiers, plain_s.modifiers);
     }
 
     #[test]
-    fn test_ctrl_enter_executes_query_when_grid_focused() {
+    fn test_ctrl_s_executes_query_when_grid_focused() {
         // Create a minimal App for testing
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4628,12 +4657,12 @@ mod tests {
         // Put some text in the editor so we have a query to execute
         app.editor.set_text("SELECT 1".to_string());
 
-        // Press Ctrl+Enter
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        // Press Ctrl+S
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         let quit = app.on_key(key);
 
         // Should not quit
-        assert!(!quit, "Ctrl+Enter should not quit");
+        assert!(!quit, "Ctrl+S should not quit");
 
         // Since we have no DB connection, execute_query will set last_error
         // But if EditCell was triggered instead, last_status would be different
@@ -4642,14 +4671,14 @@ mod tests {
             app.last_error.is_some()
                 || app.last_status == Some("No query to run".to_string())
                 || app.last_status == Some("Running...".to_string()),
-            "Ctrl+Enter should attempt to execute query, not edit cell. last_error={:?}, last_status={:?}",
+            "Ctrl+S should attempt to execute query, not edit cell. last_error={:?}, last_status={:?}",
             app.last_error,
             app.last_status
         );
     }
 
     #[test]
-    fn test_ctrl_enter_does_not_open_cell_editor_on_grid() {
+    fn test_ctrl_s_does_not_open_cell_editor_on_grid() {
         // Create a minimal App for testing with some grid data
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4675,14 +4704,268 @@ mod tests {
         // Put some text in the editor
         app.editor.set_text("SELECT 1".to_string());
 
-        // Press Ctrl+Enter
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        // Press Ctrl+S
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         let _quit = app.on_key(key);
 
         // Cell editor should NOT be opened
         assert!(
             !app.cell_editor.active,
-            "Ctrl+Enter should not open cell editor, but it did"
+            "Ctrl+S should not open cell editor, but it did"
+        );
+    }
+
+    // ========== Connection Manager Issue Tests ==========
+
+    /// Helper to type a string into the app by simulating key presses
+    fn type_string(app: &mut App, s: &str) {
+        for c in s.chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            app.on_key(key);
+        }
+    }
+
+    /// Issue 2: After adding a connection, pressing 'a' should open a new form
+    #[test]
+    fn test_pressing_a_after_saving_connection_opens_new_form() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Clear any existing connections to avoid conflicts
+        app.connections = ConnectionsFile::new();
+        if let Some(ref mut manager) = app.connection_manager {
+            manager.update_connections(&app.connections);
+        }
+
+        // App starts with connection manager open (no connection provided)
+        assert!(
+            app.connection_manager.is_some(),
+            "Connection manager should be open on startup"
+        );
+        assert!(
+            app.connection_form.is_none(),
+            "Connection form should not be open initially"
+        );
+
+        // Step 1: Press 'a' to open add form
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(key_a);
+
+        assert!(
+            app.connection_form.is_some(),
+            "Connection form should open after pressing 'a'"
+        );
+
+        // Step 2: Fill in the form by typing (form starts focused on Name field)
+        // Use a unique name based on test timestamp
+        type_string(&mut app, "testconn_unique_12345");
+
+        // Tab to User field
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_string(&mut app, "postgres");
+
+        // Tab to Password, then SavePassword, then Host
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Password
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SavePassword
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host (already localhost)
+
+        // Tab to Port (already 5432), then Database
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Database
+        type_string(&mut app, "testdb");
+
+        // Step 3: Press Ctrl+S to save
+        let key_ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.on_key(key_ctrl_s);
+
+        // After save, form should be closed
+        assert!(
+            app.connection_form.is_none(),
+            "Connection form should close after successful save. last_error={:?}, last_status={:?}",
+            app.last_error,
+            app.last_status
+        );
+
+        // Connection manager should still be open
+        assert!(
+            app.connection_manager.is_some(),
+            "Connection manager should still be open after save"
+        );
+
+        // Step 4: Press 'a' again - this is the issue: should open a new form
+        app.on_key(key_a);
+
+        assert!(
+            app.connection_form.is_some(),
+            "Connection form should open when pressing 'a' after saving a connection"
+        );
+    }
+
+    /// Issue: Ctrl+S requires two presses when EDITING a connection
+    #[test]
+    fn test_ctrl_s_works_first_press_when_editing_connection() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Add a connection to edit
+        let entry = ConnectionEntry {
+            name: "editme".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry.clone()).unwrap();
+
+        // Update the manager with the new connection
+        if let Some(ref mut manager) = app.connection_manager {
+            manager.update_connections(&app.connections);
+        }
+
+        // Press 'e' to edit the selected connection
+        let key_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        app.on_key(key_e);
+
+        assert!(
+            app.connection_form.is_some(),
+            "Connection form should open after pressing 'e'"
+        );
+
+        // Make a change - add something to the name
+        // First, go to end of name field and add a character
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        type_string(&mut app, "2");
+
+        // Now press Ctrl+S ONCE - should save
+        let key_ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.on_key(key_ctrl_s);
+
+        // Form should be closed after first Ctrl+S
+        assert!(
+            app.connection_form.is_none(),
+            "Connection form should close after first Ctrl+S. last_error={:?}, last_status={:?}",
+            app.last_error,
+            app.last_status
+        );
+
+        // Verify the connection was updated
+        assert!(
+            app.connections.find_by_name("editme2").is_some(),
+            "Connection should be renamed to 'editme2'"
+        );
+    }
+
+    /// Issue 3: Esc in connection manager should close it in one press
+    #[test]
+    fn test_esc_closes_connection_manager_single_press() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Connection manager is open
+        assert!(app.connection_manager.is_some());
+
+        // Press Esc once
+        let key_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(key_esc);
+
+        // Connection manager should be closed
+        assert!(
+            app.connection_manager.is_none(),
+            "Connection manager should close with single Esc press"
+        );
+    }
+
+    /// Issue 3: Esc on connection form with unsaved changes shows confirmation
+    #[test]
+    fn test_esc_on_modified_form_shows_confirmation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Open the add form
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(key_a);
+
+        // Modify the form by typing
+        type_string(&mut app, "testconn");
+
+        // Press Esc
+        let key_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(key_esc);
+
+        // Confirmation prompt should appear
+        assert!(
+            app.confirm_prompt.is_some(),
+            "Confirmation prompt should appear when Esc on modified form"
+        );
+
+        // Form should still be open (waiting for confirmation)
+        assert!(
+            app.connection_form.is_some(),
+            "Form should still be open while confirmation is pending"
+        );
+
+        // Press 'y' to confirm discard
+        let key_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        app.on_key(key_y);
+
+        // Now form should be closed
+        assert!(
+            app.connection_form.is_none(),
+            "Form should close after confirming discard"
+        );
+    }
+
+    /// Test the full workflow: Esc on unmodified form closes immediately
+    #[test]
+    fn test_esc_on_unmodified_form_closes_immediately() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Open the add form
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(key_a);
+
+        assert!(app.connection_form.is_some(), "Form should be open");
+
+        // Don't modify anything - just press Esc
+        let key_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(key_esc);
+
+        // No confirmation needed - form should close immediately
+        assert!(
+            app.confirm_prompt.is_none(),
+            "No confirmation should appear for unmodified form"
+        );
+        assert!(
+            app.connection_form.is_none(),
+            "Unmodified form should close immediately with Esc"
         );
     }
 }
