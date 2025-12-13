@@ -22,8 +22,14 @@ pub use schema::{
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-/// Returns the default config directory path (~/.config/tsql)
+/// Returns the config directory path.
+///
+/// Checks `TSQL_CONFIG_DIR` environment variable first, then falls back
+/// to the system default (~/.config/tsql on Linux/macOS).
 pub fn config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("TSQL_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     dirs::config_dir().map(|p| p.join("tsql"))
 }
 

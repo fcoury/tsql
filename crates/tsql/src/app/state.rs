@@ -1,7 +1,16 @@
+/// Which section of the sidebar is focused
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarSection {
+    #[default]
+    Connections,
+    Schema,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Query,
     Grid,
+    Sidebar(SidebarSection),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -9,6 +9,7 @@ mod help_popup;
 mod highlighted_editor;
 mod json_editor;
 mod row_detail;
+pub mod sidebar;
 mod status_line;
 
 pub use completion::{
@@ -28,4 +29,5 @@ pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, HighlightedTextArea};
 pub use json_editor::{JsonEditorAction, JsonEditorModal};
 pub use row_detail::{RowDetailAction, RowDetailModal};
+pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};

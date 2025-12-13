@@ -95,6 +95,9 @@ pub enum Action {
     SaveConnection,
     TestConnection,
     ClearField,
+
+    // Sidebar
+    ToggleSidebar,
 }
 
 impl Action {
@@ -164,6 +167,7 @@ impl Action {
             Action::SaveConnection => "Save connection",
             Action::TestConnection => "Test connection",
             Action::ClearField => "Clear current field",
+            Action::ToggleSidebar => "Toggle sidebar",
         }
     }
 }
@@ -262,6 +266,9 @@ impl FromStr for Action {
             "save_connection" => Ok(Action::SaveConnection),
             "test_connection" => Ok(Action::TestConnection),
             "clear_field" => Ok(Action::ClearField),
+
+            // Sidebar
+            "toggle_sidebar" => Ok(Action::ToggleSidebar),
 
             _ => Err(format!("Unknown action: {}", s)),
         }
@@ -597,6 +604,12 @@ impl Keymap {
             Action::EnterCommandMode,
         );
 
+        // Sidebar
+        km.bind(
+            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+
         km
     }
 
@@ -728,6 +741,12 @@ impl Keymap {
             Action::ShowHistory,
         );
 
+        // Sidebar
+        km.bind(
+            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+
         km
     }
 
@@ -777,6 +796,12 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             Action::ShowHistory,
+        );
+
+        // Sidebar
+        km.bind(
+            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
         );
 
         km

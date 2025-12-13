@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
-use super::state::{DbStatus, Focus, Mode, SearchTarget};
+use super::state::{DbStatus, Focus, Mode, SearchTarget, SidebarSection};
 use crate::config::{
     load_connections, save_connections, Action, Config, ConnectionEntry, ConnectionsFile,
     KeyBinding, Keymap,
@@ -33,7 +33,7 @@ use crate::ui::{
     ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
     GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
     JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
-    RowDetailModal, SchemaCache, SearchPrompt, StatusLineBuilder, StatusSegment, TableInfo,
+    RowDetailModal, SchemaCache, SearchPrompt, Sidebar, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -607,6 +607,15 @@ pub struct App {
     pub connection_manager: Option<ConnectionManagerModal>,
     /// Connection form modal (when open, for add/edit).
     pub connection_form: Option<ConnectionFormModal>,
+
+    /// Sidebar component state.
+    pub sidebar: Sidebar,
+    /// Whether sidebar is visible.
+    pub sidebar_visible: bool,
+    /// Which section of the sidebar is focused.
+    pub sidebar_focus: SidebarSection,
+    /// Sidebar width in characters.
+    pub sidebar_width: u16,
 }
 
 impl App {
@@ -703,6 +712,11 @@ impl App {
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
+
+            sidebar: Sidebar::new(),
+            sidebar_visible: false,
+            sidebar_focus: SidebarSection::Connections,
+            sidebar_width: 30,
         };
 
         // Load saved connections
@@ -819,6 +833,40 @@ impl App {
             terminal.draw(|frame| {
                 let size = frame.area();
 
+                // Split horizontally for sidebar + main content
+                let horizontal = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(if self.sidebar_visible {
+                            self.sidebar_width
+                        } else {
+                            0
+                        }),
+                        Constraint::Min(60), // Main content minimum width
+                    ])
+                    .split(size);
+
+                let sidebar_area = horizontal[0];
+                let main_area = horizontal[1];
+
+                // Render sidebar if visible
+                if self.sidebar_visible && sidebar_area.width > 0 {
+                    let schema_items = self.schema_cache.build_tree_items();
+                    let has_focus = matches!(self.focus, Focus::Sidebar(_));
+
+                    self.sidebar.render(
+                        frame,
+                        sidebar_area,
+                        &self.connections,
+                        self.current_connection_name.as_deref(),
+                        &schema_items,
+                        !self.schema_cache.loaded && self.db.status == DbStatus::Connected,
+                        None, // No error handling yet
+                        self.sidebar_focus,
+                        has_focus,
+                    );
+                }
+
                 // Determine if we have an error to show.
                 let error_height = if self.last_error.is_some() {
                     4u16
@@ -834,7 +882,7 @@ impl App {
                         Constraint::Min(3),
                         Constraint::Length(1),
                     ])
-                    .split(size);
+                    .split(main_area);
 
                 let query_area = chunks[0];
                 let error_area = chunks[1];
@@ -850,7 +898,7 @@ impl App {
                     (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
                     (Focus::Query, Mode::Insert) => Style::default().fg(Color::Green),
                     (Focus::Query, Mode::Visual) => Style::default().fg(Color::Yellow),
-                    (Focus::Grid, _) => Style::default().fg(Color::DarkGray),
+                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => Style::default().fg(Color::DarkGray),
                 };
 
                 // Build query title with [+] indicator if modified
@@ -878,7 +926,7 @@ impl App {
                             modified_indicator
                         )
                     }
-                    (Focus::Grid, _) => "Query (Tab to focus)".to_string(),
+                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => "Query (Tab to focus)".to_string(),
                 };
 
                 let query_block = Block::default()
@@ -1549,8 +1597,24 @@ impl App {
                 (KeyCode::Tab, KeyModifiers::NONE) => {
                     self.focus = match self.focus {
                         Focus::Query => Focus::Grid,
-                        Focus::Grid => Focus::Query,
+                        Focus::Grid => {
+                            if self.sidebar_visible {
+                                Focus::Sidebar(SidebarSection::Connections)
+                            } else {
+                                Focus::Query
+                            }
+                        }
+                        Focus::Sidebar(_) => Focus::Query,
                     };
+                    return false;
+                }
+                // Ctrl+B: Toggle sidebar
+                (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                    self.sidebar_visible = !self.sidebar_visible;
+                    // If hiding sidebar and focus was on it, move focus to query
+                    if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
+                        self.focus = Focus::Query;
+                    }
                     return false;
                 }
                 _ => {}
@@ -1589,6 +1653,13 @@ impl App {
                             }
                             Action::Help => {
                                 self.help_popup = Some(HelpPopup::new());
+                                GridKeyResult::None
+                            }
+                            Action::ToggleSidebar => {
+                                self.sidebar_visible = !self.sidebar_visible;
+                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
+                                    self.focus = Focus::Query;
+                                }
                                 GridKeyResult::None
                             }
                             _ => {
@@ -1633,9 +1704,99 @@ impl App {
             Focus::Query => {
                 self.handle_editor_key(key);
             }
+            Focus::Sidebar(section) => {
+                self.handle_sidebar_key(key, section);
+            }
         }
 
         false
+    }
+
+    /// Handle key events when sidebar is focused
+    fn handle_sidebar_key(&mut self, key: KeyEvent, section: SidebarSection) {
+        match (key.code, key.modifiers, section) {
+            // Navigation within connections list
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE, SidebarSection::Connections) => {
+                self.sidebar.connections_up(self.connections.sorted().len());
+            }
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE, SidebarSection::Connections) => {
+                // Check if at bottom of connections list - if so, move to schema section
+                let count = self.connections.sorted().len();
+                let at_bottom = self.sidebar.connections_state.selected()
+                    == Some(count.saturating_sub(1));
+                if at_bottom && count > 0 {
+                    self.sidebar_focus = SidebarSection::Schema;
+                    self.focus = Focus::Sidebar(SidebarSection::Schema);
+                } else {
+                    self.sidebar.connections_down(count);
+                }
+            }
+            // Enter on connection: switch to that connection
+            (KeyCode::Enter, KeyModifiers::NONE, SidebarSection::Connections) => {
+                if let Some(entry) = self.sidebar.get_selected_connection(&self.connections) {
+                    self.connect_to_entry(entry.clone());
+                }
+            }
+            // 'a' or 'e' to open connection manager
+            (KeyCode::Char('a') | KeyCode::Char('e'), KeyModifiers::NONE, SidebarSection::Connections) => {
+                self.open_connection_manager();
+            }
+
+            // Navigation within schema tree
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE, SidebarSection::Schema) => {
+                // Check if at top of schema tree - if so, move to connections section
+                let at_top = self.sidebar.schema_state.selected().is_empty();
+                if at_top {
+                    self.sidebar_focus = SidebarSection::Connections;
+                    self.focus = Focus::Sidebar(SidebarSection::Connections);
+                } else {
+                    self.sidebar.schema_up();
+                }
+            }
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE, SidebarSection::Schema) => {
+                self.sidebar.schema_down();
+            }
+            (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE, SidebarSection::Schema) => {
+                self.sidebar.schema_right();
+            }
+            (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE, SidebarSection::Schema) => {
+                self.sidebar.schema_left();
+            }
+            // Enter on schema item: insert name at cursor or toggle expand
+            (KeyCode::Enter, KeyModifiers::NONE, SidebarSection::Schema) => {
+                if let Some(name) = self.sidebar.get_selected_schema_name() {
+                    // Extract just the name from the identifier (skip the prefix)
+                    let insert_name = if let Some((_prefix, actual_name)) = name.rsplit_once(':') {
+                        actual_name.to_string()
+                    } else {
+                        name
+                    };
+                    // Insert the name at cursor in editor
+                    for ch in insert_name.chars() {
+                        self.editor.textarea.insert_char(ch);
+                    }
+                    self.focus = Focus::Query;
+                    self.mode = Mode::Insert;
+                } else {
+                    self.sidebar.schema_toggle();
+                }
+            }
+            // Space toggles tree node
+            (KeyCode::Char(' '), KeyModifiers::NONE, SidebarSection::Schema) => {
+                self.sidebar.schema_toggle();
+            }
+            // 'r' to refresh schema
+            (KeyCode::Char('r'), KeyModifiers::NONE, SidebarSection::Schema) => {
+                self.load_schema();
+            }
+
+            // Tab or Escape to leave sidebar
+            (KeyCode::Tab, KeyModifiers::NONE, _) | (KeyCode::Esc, KeyModifiers::NONE, _) => {
+                self.focus = Focus::Query;
+            }
+
+            _ => {}
+        }
     }
 
     /// Handle mouse events
@@ -1737,6 +1898,25 @@ impl App {
                     let amount = delta as usize;
                     self.grid_state.cursor_row =
                         (self.grid_state.cursor_row + amount).min(row_count - 1);
+                }
+            }
+            Focus::Sidebar(section) => {
+                // Scroll sidebar sections
+                match section {
+                    SidebarSection::Connections => {
+                        if delta < 0 {
+                            self.sidebar.connections_up(self.connections.sorted().len());
+                        } else {
+                            self.sidebar.connections_down(self.connections.sorted().len());
+                        }
+                    }
+                    SidebarSection::Schema => {
+                        if delta < 0 {
+                            self.sidebar.schema_up();
+                        } else {
+                            self.sidebar.schema_down();
+                        }
+                    }
                 }
             }
         }
@@ -2791,6 +2971,12 @@ impl App {
             }
             Action::ShowHistory => {
                 self.open_history_picker();
+            }
+            Action::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
+                    self.focus = Focus::Query;
+                }
             }
 
             // Actions not applicable to editor
@@ -4245,6 +4431,27 @@ fn calculate_editor_scroll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Guard that sets TSQL_CONFIG_DIR to a temp directory for test isolation.
+    /// Automatically cleans up when dropped (even on panic).
+    struct ConfigDirGuard {
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl ConfigDirGuard {
+        fn new() -> Self {
+            let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            std::env::set_var("TSQL_CONFIG_DIR", temp_dir.path());
+            Self { _temp_dir: temp_dir }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("TSQL_CONFIG_DIR");
+        }
+    }
 
     // ========== CellEditor Tests ==========
 
@@ -4934,7 +5141,9 @@ mod tests {
 
     /// Issue 2: After adding a connection, pressing 'a' should open a new form
     #[test]
+    #[serial]
     fn test_pressing_a_after_saving_connection_opens_new_form() {
+        let _guard = ConfigDirGuard::new(); // Isolate config to temp directory
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5017,7 +5226,9 @@ mod tests {
 
     /// Issue: Ctrl+S requires two presses when EDITING a connection
     #[test]
+    #[serial]
     fn test_ctrl_s_works_first_press_when_editing_connection() {
+        let _guard = ConfigDirGuard::new(); // Isolate config to temp directory
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5083,7 +5294,9 @@ mod tests {
 
     /// Issue 3: Esc in connection manager should close it in one press
     #[test]
+    #[serial]
     fn test_esc_closes_connection_manager_single_press() {
+        let _guard = ConfigDirGuard::new(); // Isolate config to temp directory
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5113,7 +5326,9 @@ mod tests {
 
     /// Issue 3: Esc on connection form with unsaved changes shows confirmation
     #[test]
+    #[serial]
     fn test_esc_on_modified_form_shows_confirmation() {
+        let _guard = ConfigDirGuard::new(); // Isolate config to temp directory
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5291,7 +5506,9 @@ mod tests {
 
     /// Test the full workflow: Esc on unmodified form closes immediately
     #[test]
+    #[serial]
     fn test_esc_on_unmodified_form_closes_immediately() {
+        let _guard = ConfigDirGuard::new(); // Isolate config to temp directory
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

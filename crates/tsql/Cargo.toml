@@ -39,9 +39,14 @@ keyring.workspace = true
 # URL parsing
 url.workspace = true
 
+# Tree widget for sidebar
+tui-tree-widget.workspace = true
+
 # Internal crate
 tui-syntax = { path = "../tui-syntax", version = "0.1.0" }
 
 [dev-dependencies]
 dotenvy.workspace = true
 uuid.workspace = true
+tempfile.workspace = true
+serial_test = "3"

@@ -204,6 +204,59 @@ impl SchemaCache {
         }
     }
 
+    /// Build a tree structure for the sidebar schema browser
+    pub fn build_tree_items(&self) -> Vec<tui_tree_widget::TreeItem<'static, String>> {
+        use std::collections::BTreeMap;
+        use tui_tree_widget::TreeItem;
+
+        if self.tables.is_empty() {
+            return Vec::new();
+        }
+
+        // Group tables by schema, then by type (Tables vs Views)
+        // For now, we treat everything as tables since we're getting relkind IN ('r', 'v', 'm')
+        let mut schemas: BTreeMap<String, Vec<&TableInfo>> = BTreeMap::new();
+
+        for table in &self.tables {
+            schemas
+                .entry(table.schema.clone())
+                .or_default()
+                .push(table);
+        }
+
+        let mut tree_items = Vec::new();
+
+        for (schema_name, tables) in schemas {
+            let schema_id = format!("schema:{}", schema_name);
+
+            // Build table items with their columns
+            let mut table_items = Vec::new();
+            for table in tables {
+                let table_id = format!("table:{}:{}", schema_name, table.name);
+
+                // Build column items
+                let column_items: Vec<TreeItem<'static, String>> = table
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        let col_id = format!("column:{}:{}:{}", schema_name, table.name, col.name);
+                        TreeItem::new_leaf(col_id, col.name.clone())
+                    })
+                    .collect();
+
+                let table_item = TreeItem::new(table_id, table.name.clone(), column_items)
+                    .expect("valid table tree item");
+                table_items.push(table_item);
+            }
+
+            let schema_item = TreeItem::new(schema_id, schema_name, table_items)
+                .expect("valid schema tree item");
+            tree_items.push(schema_item);
+        }
+
+        tree_items
+    }
+
     pub fn get_completion_items(&self, context: CompletionContext) -> Vec<CompletionItem> {
         let mut items = Vec::new();
 
