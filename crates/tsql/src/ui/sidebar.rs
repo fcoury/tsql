@@ -1,5 +1,6 @@
 //! Sidebar component with connections list and schema tree.
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -35,6 +36,10 @@ pub struct Sidebar {
     pub schema_state: TreeState<String>,
     /// Currently selected connection index
     pub selected_connection: Option<usize>,
+    /// Area of the connections section (for mouse hit testing)
+    connections_area: Option<Rect>,
+    /// Area of the schema section (for mouse hit testing)
+    schema_area: Option<Rect>,
 }
 
 impl Default for Sidebar {
@@ -49,6 +54,8 @@ impl Sidebar {
             connections_state: ListState::default(),
             schema_state: TreeState::default(),
             selected_connection: None,
+            connections_area: None,
+            schema_area: None,
         }
     }
 
@@ -71,6 +78,10 @@ impl Sidebar {
             Constraint::Percentage(70),
         ])
         .split(area);
+
+        // Store areas for mouse hit testing
+        self.connections_area = Some(chunks[0]);
+        self.schema_area = Some(chunks[1]);
 
         self.render_connections(
             frame,
@@ -287,5 +298,129 @@ impl Sidebar {
     /// Get the selected schema item identifier (for inserting into query)
     pub fn get_selected_schema_name(&self) -> Option<String> {
         self.schema_state.selected().last().cloned()
+    }
+
+    /// Handle mouse events in the sidebar
+    ///
+    /// Returns a tuple of (action, which_section_was_clicked)
+    /// The section is returned so the caller can update focus appropriately
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        connections: &ConnectionsFile,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        let (x, y) = (mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check connections area
+                if let Some(conn_area) = self.connections_area {
+                    if Self::is_inside(x, y, conn_area) {
+                        return self.handle_connections_click(y, conn_area, connections);
+                    }
+                }
+
+                // Check schema area
+                if let Some(schema_area) = self.schema_area {
+                    if Self::is_inside(x, y, schema_area) {
+                        return self.handle_schema_click(y, schema_area);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.is_over_connections(x, y) {
+                    let count = connections.sorted().len();
+                    self.connections_up(count);
+                    return (None, Some(SidebarSection::Connections));
+                }
+                if self.is_over_schema(x, y) {
+                    self.schema_up();
+                    return (None, Some(SidebarSection::Schema));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.is_over_connections(x, y) {
+                    let count = connections.sorted().len();
+                    self.connections_down(count);
+                    return (None, Some(SidebarSection::Connections));
+                }
+                if self.is_over_schema(x, y) {
+                    self.schema_down();
+                    return (None, Some(SidebarSection::Schema));
+                }
+            }
+            _ => {}
+        }
+
+        (None, None)
+    }
+
+    /// Handle click in the connections area
+    fn handle_connections_click(
+        &mut self,
+        y: u16,
+        conn_area: Rect,
+        connections: &ConnectionsFile,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        // Calculate which row was clicked (subtract 1 for border)
+        let row = y.saturating_sub(conn_area.y + 1) as usize;
+        let sorted = connections.sorted();
+
+        if row < sorted.len() {
+            self.connections_state.select(Some(row));
+            self.selected_connection = Some(row);
+            let name = sorted[row].name.clone();
+            return (
+                Some(SidebarAction::Connect(name)),
+                Some(SidebarSection::Connections),
+            );
+        }
+
+        // Clicked in area but not on an item - just focus
+        (None, Some(SidebarSection::Connections))
+    }
+
+    /// Handle click in the schema area
+    fn handle_schema_click(
+        &mut self,
+        y: u16,
+        schema_area: Rect,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        // Calculate which row was clicked (subtract 1 for border)
+        let row = y.saturating_sub(schema_area.y + 1) as usize;
+
+        // Navigate to the clicked row using key_down from the current position
+        // First, we need to find the currently selected row
+        // TreeState doesn't expose scroll offset directly, so we'll use key navigation
+        // to move to approximately the right position
+
+        // For now, just toggle if we click anywhere in the schema
+        // More sophisticated click-to-select would require tree widget changes
+        // Move down 'row' times from the top (reset first)
+        self.schema_state.select_first();
+        for _ in 0..row {
+            self.schema_state.key_down();
+        }
+
+        (None, Some(SidebarSection::Schema))
+    }
+
+    /// Check if coordinates are inside a rectangle
+    fn is_inside(x: u16, y: u16, area: Rect) -> bool {
+        x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+    }
+
+    /// Check if mouse is over the connections section
+    fn is_over_connections(&self, x: u16, y: u16) -> bool {
+        self.connections_area
+            .map(|area| Self::is_inside(x, y, area))
+            .unwrap_or(false)
+    }
+
+    /// Check if mouse is over the schema section
+    fn is_over_schema(&self, x: u16, y: u16) -> bool {
+        self.schema_area
+            .map(|area| Self::is_inside(x, y, area))
+            .unwrap_or(false)
     }
 }
