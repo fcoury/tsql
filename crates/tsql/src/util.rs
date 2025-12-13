@@ -79,6 +79,24 @@ mod tests {
     }
 
     #[test]
+    fn test_looks_like_json_rejects_html() {
+        // HTML should never be detected as JSON
+        assert!(!looks_like_json("<html></html>"));
+        assert!(!looks_like_json(
+            "<!DOCTYPE html><html><body></body></html>"
+        ));
+        assert!(!looks_like_json("<div>content</div>"));
+        assert!(!looks_like_json("  <html>  "));
+
+        // Large HTML content should not be detected as JSON
+        let large_html = format!(
+            "<html><head><title>Test</title></head><body>{}</body></html>",
+            "<p>paragraph</p>".repeat(1000)
+        );
+        assert!(!looks_like_json(&large_html));
+    }
+
+    #[test]
     fn test_try_format_json_valid() {
         let formatted = try_format_json(r#"{"a":1,"b":2}"#).unwrap();
         assert!(formatted.contains('\n'));

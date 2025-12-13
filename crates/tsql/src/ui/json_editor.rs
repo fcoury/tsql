@@ -435,12 +435,17 @@ impl<'a> JsonEditorModal<'a> {
             .title(title)
             .border_style(Style::default().fg(border_color));
 
-        // Highlight the content
+        // Highlight the content only if it's valid JSON
+        // This avoids performance issues with large non-JSON content (like HTML)
         let content = self.content();
-        let highlighted_lines = self
-            .highlighter
-            .highlight("json", &content)
-            .unwrap_or_else(|_| content.lines().map(|l| Line::from(l.to_string())).collect());
+        let highlighted_lines = if self.should_highlight() {
+            self.highlighter
+                .highlight("json", &content)
+                .unwrap_or_else(|_| content.lines().map(|l| Line::from(l.to_string())).collect())
+        } else {
+            // For non-JSON content, just return plain lines without syntax highlighting
+            content.lines().map(|l| Line::from(l.to_string())).collect()
+        };
 
         // Render highlighted textarea
         let highlighted_textarea = HighlightedTextArea::new(&self.textarea, highlighted_lines)
@@ -508,5 +513,111 @@ impl<'a> JsonEditorModal<'a> {
         let status = Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray));
 
         frame.render_widget(status, status_area);
+    }
+
+    /// Check if syntax highlighting should be applied.
+    /// Only highlight if the content is valid JSON to avoid performance issues
+    /// with large non-JSON content (like HTML).
+    fn should_highlight(&self) -> bool {
+        self.is_valid_json
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_json_editor_with_valid_json() {
+        let editor = JsonEditorModal::new(
+            r#"{"key": "value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+        assert!(editor.is_valid_json);
+        assert!(editor.should_highlight());
+    }
+
+    #[test]
+    fn test_json_editor_with_invalid_json() {
+        let editor = JsonEditorModal::new(
+            "not json".to_string(),
+            "data".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+        assert!(!editor.is_valid_json);
+        assert!(!editor.should_highlight());
+    }
+
+    #[test]
+    fn test_json_editor_with_html_content() {
+        // HTML content should not be treated as JSON
+        let html = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
+        let editor = JsonEditorModal::new(
+            html.to_string(),
+            "content".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+        assert!(!editor.is_valid_json);
+        assert!(!editor.should_highlight());
+    }
+
+    #[test]
+    fn test_json_editor_with_large_html_content_performance() {
+        // Large HTML content should be handled quickly without freezing
+        // This tests the scenario where a text column contains large HTML
+        let large_html = format!(
+            "<!DOCTYPE html><html><head><title>Test</title></head><body>{}</body></html>",
+            "<div class=\"content\"><p>This is a paragraph with some text content.</p></div>"
+                .repeat(500)
+        );
+
+        let start = Instant::now();
+        let editor = JsonEditorModal::new(
+            large_html.clone(),
+            "html_content".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+        let creation_time = start.elapsed();
+
+        // Editor creation should be fast (under 100ms)
+        assert!(
+            creation_time < Duration::from_millis(100),
+            "Editor creation took too long: {:?}",
+            creation_time
+        );
+
+        // Should not be detected as JSON
+        assert!(!editor.is_valid_json);
+        assert!(!editor.should_highlight());
+
+        // Content should be preserved
+        assert_eq!(editor.content(), large_html);
+    }
+
+    #[test]
+    fn test_json_editor_content_retrieval() {
+        let json = r#"{"name": "test", "value": 123}"#;
+        let editor = JsonEditorModal::new(
+            json.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+
+        // Content should be formatted (pretty-printed)
+        let content = editor.content();
+        assert!(content.contains("\"name\""));
+        assert!(content.contains("\"test\""));
     }
 }
