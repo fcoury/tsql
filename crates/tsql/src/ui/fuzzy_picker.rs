@@ -19,6 +19,8 @@ use ratatui::{
     Frame,
 };
 
+use super::mouse_util::is_inside;
+
 /// Result of handling a key event in the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerAction<T> {
@@ -248,14 +250,14 @@ impl<T: Clone> FuzzyPicker<T> {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Check if click is outside popup - cancel if so
                 if let Some(popup) = self.popup_area {
-                    if !Self::is_inside(x, y, popup) {
+                    if !is_inside(x, y, popup) {
                         return PickerAction::Cancelled;
                     }
                 }
 
                 // Check if click is in list area - select item
                 if let Some(list_area) = self.list_area {
-                    if Self::is_inside(x, y, list_area) {
+                    if is_inside(x, y, list_area) {
                         // Calculate which row was clicked
                         let row_in_list = (y - list_area.y) as usize;
                         let clicked_index = self.scroll_offset + row_in_list;
@@ -263,7 +265,9 @@ impl<T: Clone> FuzzyPicker<T> {
                         if clicked_index < self.filtered.len() {
                             // Select and return the item
                             self.selected = clicked_index;
-                            return PickerAction::Selected(self.filtered[clicked_index].item.clone());
+                            return PickerAction::Selected(
+                                self.filtered[clicked_index].item.clone(),
+                            );
                         }
                     }
                 }
@@ -292,15 +296,10 @@ impl<T: Clone> FuzzyPicker<T> {
         }
     }
 
-    /// Check if coordinates are inside a rect.
-    fn is_inside(x: u16, y: u16, rect: Rect) -> bool {
-        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-    }
-
     /// Check if mouse coordinates are inside the popup.
     fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
         self.popup_area
-            .map(|popup| Self::is_inside(x, y, popup))
+            .map(|popup| is_inside(x, y, popup))
             .unwrap_or(false)
     }
 
@@ -350,9 +349,6 @@ impl<T: Clone> FuzzyPicker<T> {
         ])
         .split(inner);
 
-        // Store list area for mouse item selection
-        self.list_area = Some(chunks[2]);
-
         // Render input line.
         self.render_input(frame, chunks[0]);
 
@@ -400,6 +396,9 @@ impl<T: Clone> FuzzyPicker<T> {
         } else {
             (area, None)
         };
+
+        // Store the actual clickable list area (excluding scrollbar) for mouse hit testing
+        self.list_area = Some(list_area);
 
         // Adjust scroll to keep selected visible.
         if self.selected < self.scroll_offset {

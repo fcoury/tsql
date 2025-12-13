@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
+use super::mouse_util::is_inside;
 use crate::app::SidebarSection;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
@@ -73,11 +74,8 @@ impl Sidebar {
         has_focus: bool,
     ) {
         // Split sidebar into connections (30%) and schema (70%)
-        let chunks = Layout::vertical([
-            Constraint::Percentage(30),
-            Constraint::Percentage(70),
-        ])
-        .split(area);
+        let chunks =
+            Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
 
         // Store areas for mouse hit testing
         self.connections_area = Some(chunks[0]);
@@ -271,7 +269,10 @@ impl Sidebar {
     }
 
     /// Get selected connection name
-    pub fn get_selected_connection<'a>(&self, connections: &'a ConnectionsFile) -> Option<&'a ConnectionEntry> {
+    pub fn get_selected_connection<'a>(
+        &self,
+        connections: &'a ConnectionsFile,
+    ) -> Option<&'a ConnectionEntry> {
         let sorted = connections.sorted();
         self.connections_state
             .selected()
@@ -333,14 +334,14 @@ impl Sidebar {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Check connections area
                 if let Some(conn_area) = self.connections_area {
-                    if Self::is_inside(x, y, conn_area) {
+                    if is_inside(x, y, conn_area) {
                         return self.handle_connections_click(y, conn_area, connections);
                     }
                 }
 
                 // Check schema area
                 if let Some(schema_area) = self.schema_area {
-                    if Self::is_inside(x, y, schema_area) {
+                    if is_inside(x, y, schema_area) {
                         return self.handle_schema_click(y, schema_area);
                     }
                 }
@@ -427,22 +428,17 @@ impl Sidebar {
         (None, Some(SidebarSection::Schema))
     }
 
-    /// Check if coordinates are inside a rectangle
-    fn is_inside(x: u16, y: u16, area: Rect) -> bool {
-        x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
-    }
-
     /// Check if mouse is over the connections section
     fn is_over_connections(&self, x: u16, y: u16) -> bool {
         self.connections_area
-            .map(|area| Self::is_inside(x, y, area))
+            .map(|area| is_inside(x, y, area))
             .unwrap_or(false)
     }
 
     /// Check if mouse is over the schema section
     fn is_over_schema(&self, x: u16, y: u16) -> bool {
         self.schema_area
-            .map(|area| Self::is_inside(x, y, area))
+            .map(|area| is_inside(x, y, area))
             .unwrap_or(false)
     }
 }

@@ -8,6 +8,7 @@ mod grid;
 mod help_popup;
 mod highlighted_editor;
 mod json_editor;
+mod mouse_util;
 mod row_detail;
 pub mod sidebar;
 mod status_line;

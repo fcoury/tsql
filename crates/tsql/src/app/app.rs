@@ -907,7 +907,9 @@ impl App {
                     (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
                     (Focus::Query, Mode::Insert) => Style::default().fg(Color::Green),
                     (Focus::Query, Mode::Visual) => Style::default().fg(Color::Yellow),
-                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => Style::default().fg(Color::DarkGray),
+                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => {
+                        Style::default().fg(Color::DarkGray)
+                    }
                 };
 
                 // Build query title with [+] indicator if modified
@@ -1666,7 +1668,8 @@ impl App {
                             }
                             Action::ToggleSidebar => {
                                 self.sidebar_visible = !self.sidebar_visible;
-                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
+                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_))
+                                {
                                     self.focus = Focus::Query;
                                 }
                                 GridKeyResult::None
@@ -1728,11 +1731,15 @@ impl App {
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE, SidebarSection::Connections) => {
                 self.sidebar.connections_up(self.connections.sorted().len());
             }
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE, SidebarSection::Connections) => {
+            (
+                KeyCode::Down | KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                SidebarSection::Connections,
+            ) => {
                 // Check if at bottom of connections list - if so, move to schema section
                 let count = self.connections.sorted().len();
-                let at_bottom = self.sidebar.connections_state.selected()
-                    == Some(count.saturating_sub(1));
+                let at_bottom =
+                    self.sidebar.connections_state.selected() == Some(count.saturating_sub(1));
                 if at_bottom && count > 0 {
                     self.sidebar_focus = SidebarSection::Schema;
                     self.focus = Focus::Sidebar(SidebarSection::Schema);
@@ -1747,7 +1754,11 @@ impl App {
                 }
             }
             // 'a' or 'e' to open connection manager
-            (KeyCode::Char('a') | KeyCode::Char('e'), KeyModifiers::NONE, SidebarSection::Connections) => {
+            (
+                KeyCode::Char('a') | KeyCode::Char('e'),
+                KeyModifiers::NONE,
+                SidebarSection::Connections,
+            ) => {
                 self.open_connection_manager();
             }
 
@@ -1848,28 +1859,40 @@ impl App {
             match action {
                 PickerAction::Selected(entry) => {
                     self.connection_picker = None;
-                    self.connect_to_entry(entry);
+                    self.last_error = None;
+                    if self.editor.is_modified() {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "You have unsaved changes. Switch connection anyway?",
+                            ConfirmContext::SwitchConnection { entry },
+                        ));
+                    } else {
+                        self.connect_to_entry(entry);
+                    }
                 }
                 PickerAction::Cancelled => {
                     self.connection_picker = None;
+                    self.last_error = None;
                 }
                 PickerAction::Continue => {}
             }
             return;
         }
 
-        // Connection manager has mouse support
-        if let Some(ref mut manager) = self.connection_manager {
-            let action = manager.handle_mouse(mouse);
-            // Handle action (the method already exists)
-            self.handle_connection_manager_action(action);
-            return;
+        // Connection manager has mouse support (but not if connection_form is open on top)
+        if self.connection_form.is_none() {
+            if let Some(ref mut manager) = self.connection_manager {
+                let action = manager.handle_mouse(mouse);
+                // Handle action (the method already exists)
+                self.handle_connection_manager_action(action);
+                return;
+            }
         }
 
         // Don't process mouse events for other modals without mouse support
         if self.confirm_prompt.is_some()
             || self.json_editor.is_some()
             || self.row_detail.is_some()
+            || self.connection_form.is_some()
         {
             return;
         }
@@ -1941,6 +1964,16 @@ impl App {
                 && y >= grid_area.y
                 && y < grid_area.y + grid_area.height
             {
+                // Ignore clicks on the top border/header row(s)
+                if y <= grid_area.y + 1 {
+                    // Still focus the grid, just don't select a row
+                    if self.focus != Focus::Grid {
+                        self.focus = Focus::Grid;
+                        self.mode = Mode::Normal;
+                    }
+                    return;
+                }
+
                 // Click in grid - focus it and try to select the row
                 if self.focus != Focus::Grid {
                     self.focus = Focus::Grid;
@@ -1997,7 +2030,8 @@ impl App {
                         if delta < 0 {
                             self.sidebar.connections_up(self.connections.sorted().len());
                         } else {
-                            self.sidebar.connections_down(self.connections.sorted().len());
+                            self.sidebar
+                                .connections_down(self.connections.sorted().len());
                         }
                     }
                     SidebarSection::Schema => {
@@ -3811,9 +3845,22 @@ impl App {
         match action {
             SidebarAction::Connect(name) => {
                 // Find the connection entry and connect
-                if let Some(entry) = self.connections.sorted().into_iter().find(|e| e.name == name)
+                if let Some(entry) = self
+                    .connections
+                    .sorted()
+                    .into_iter()
+                    .find(|e| e.name == name)
                 {
-                    self.connect_to_entry(entry.clone());
+                    if self.editor.is_modified() {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "You have unsaved changes. Switch connection anyway?",
+                            ConfirmContext::SwitchConnection {
+                                entry: entry.clone(),
+                            },
+                        ));
+                    } else {
+                        self.connect_to_entry(entry.clone());
+                    }
                 }
             }
             SidebarAction::InsertText(text) => {
@@ -3827,12 +3874,15 @@ impl App {
                 ));
             }
             SidebarAction::OpenEditConnection(name) => {
-                if let Some(entry) =
-                    self.connections.sorted().into_iter().find(|e| e.name == name)
+                if let Some(entry) = self
+                    .connections
+                    .sorted()
+                    .into_iter()
+                    .find(|e| e.name == name)
                 {
                     let password = entry.get_password().ok().flatten();
                     self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
-                        &entry,
+                        entry,
                         password,
                         self.connection_form_keymap.clone(),
                     ));
@@ -4577,7 +4627,9 @@ mod tests {
         fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             std::env::set_var("TSQL_CONFIG_DIR", temp_dir.path());
-            Self { _temp_dir: temp_dir }
+            Self {
+                _temp_dir: temp_dir,
+            }
         }
     }
 

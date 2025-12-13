@@ -9,6 +9,8 @@ use ratatui::{
     Frame,
 };
 
+use super::mouse_util::is_inside;
+
 /// Result of handling a key event in the help popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelpAction {
@@ -346,7 +348,7 @@ impl HelpPopup {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Check if click is outside popup - close if so
                 if let Some(popup) = self.popup_area {
-                    if !Self::is_inside(x, y, popup) {
+                    if !is_inside(x, y, popup) {
                         return HelpAction::Close;
                     }
                 }
@@ -370,15 +372,10 @@ impl HelpPopup {
         }
     }
 
-    /// Check if coordinates are inside a rect.
-    fn is_inside(x: u16, y: u16, rect: Rect) -> bool {
-        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-    }
-
     /// Check if mouse coordinates are inside the popup.
     fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
         self.popup_area
-            .map(|popup| Self::is_inside(x, y, popup))
+            .map(|popup| is_inside(x, y, popup))
             .unwrap_or(false)
     }
 

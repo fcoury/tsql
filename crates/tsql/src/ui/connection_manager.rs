@@ -16,6 +16,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use super::mouse_util::is_inside;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
 /// Result of handling a key event in the connection manager.
@@ -298,14 +299,14 @@ impl ConnectionManagerModal {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Check if click is outside modal - close if so
                 if let Some(modal) = self.modal_area {
-                    if !Self::is_inside(x, y, modal) {
+                    if !is_inside(x, y, modal) {
                         return ConnectionManagerAction::Close;
                     }
                 }
 
                 // Check if click is in list area - select and connect
                 if let Some(list_area) = self.list_area {
-                    if Self::is_inside(x, y, list_area) && !self.connections.is_empty() {
+                    if is_inside(x, y, list_area) && !self.connections.is_empty() {
                         // Calculate which row was clicked
                         let row_in_list = (y - list_area.y) as usize;
                         let clicked_index = self.scroll_offset + row_in_list;
@@ -344,15 +345,10 @@ impl ConnectionManagerModal {
         }
     }
 
-    /// Check if coordinates are inside a rect.
-    fn is_inside(x: u16, y: u16, rect: Rect) -> bool {
-        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-    }
-
     /// Check if mouse coordinates are inside the modal.
     fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
         self.modal_area
-            .map(|modal| Self::is_inside(x, y, modal))
+            .map(|modal| is_inside(x, y, modal))
             .unwrap_or(false)
     }
 
@@ -401,9 +397,6 @@ impl ConnectionManagerModal {
         ])
         .split(inner);
 
-        // Store list area for mouse item selection
-        self.list_area = Some(chunks[0]);
-
         // Render the list
         self.render_list(frame, chunks[0]);
 
@@ -449,6 +442,9 @@ impl ConnectionManagerModal {
         } else {
             (area, None)
         };
+
+        // Store the actual clickable list area (excluding scrollbar) for mouse hit testing
+        self.list_area = Some(list_area);
 
         // Build list items
         let items: Vec<ListItem> = self
