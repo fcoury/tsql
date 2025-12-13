@@ -314,6 +314,8 @@ pub struct DbSession {
     pub last_command_tag: Option<String>,
     pub last_elapsed: Option<Duration>,
     pub running: bool,
+    /// Whether we're currently in a transaction (after BEGIN, before COMMIT/ROLLBACK)
+    pub in_transaction: bool,
 }
 
 impl DbSession {
@@ -326,6 +328,7 @@ impl DbSession {
             last_command_tag: None,
             last_elapsed: None,
             running: false,
+            in_transaction: false,
         }
     }
 }
@@ -828,6 +831,7 @@ impl App {
                     model: &self.grid,
                     state: &self.grid_state,
                     focused: self.focus == Focus::Grid,
+                    show_row_numbers: self.config.display.show_row_numbers,
                 };
                 frame.render_widget(grid_widget, grid_area);
 
@@ -3054,6 +3058,19 @@ impl App {
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
 
+                // Track transaction state based on command tag
+                if let Some(ref tag) = result.command_tag {
+                    let tag_upper = tag.to_uppercase();
+                    if tag_upper.starts_with("BEGIN") {
+                        self.db.in_transaction = true;
+                    } else if tag_upper.starts_with("COMMIT")
+                        || tag_upper.starts_with("ROLLBACK")
+                        || tag_upper.starts_with("END")
+                    {
+                        self.db.in_transaction = false;
+                    }
+                }
+
                 self.grid = GridModel::new(result.headers, result.rows)
                     .with_source_table(result.source_table)
                     .with_primary_keys(result.primary_keys)
@@ -3197,6 +3214,12 @@ impl App {
                 running_indicator.is_some(),
                 StatusSegment::new(running_indicator.unwrap_or_default(), Priority::High)
                     .style(Style::default().fg(Color::Yellow)),
+            )
+            // High: Transaction indicator (if in transaction)
+            .segment_if(
+                self.db.in_transaction,
+                StatusSegment::new("TXN", Priority::High)
+                    .style(Style::default().fg(Color::Magenta)),
             )
             // Medium: Row info
             .segment(StatusSegment::new(row_info, Priority::Medium).min_width(50))

@@ -1141,6 +1141,7 @@ pub struct DataGrid<'a> {
     pub model: &'a GridModel,
     pub state: &'a GridState,
     pub focused: bool,
+    pub show_row_numbers: bool,
 }
 
 impl<'a> Widget for DataGrid<'a> {
@@ -1201,7 +1202,20 @@ impl<'a> Widget for DataGrid<'a> {
         };
 
         // Keep marker column fixed; horizontal scroll applies to data columns.
-        let marker_w: u16 = 3; // cursor + selected + space
+        // Calculate marker width: cursor (1) + selected (1) + space (1) + optional row numbers
+        let row_number_width = if self.show_row_numbers {
+            // Calculate width needed for largest row number
+            let max_row = self.model.rows.len();
+            if max_row == 0 {
+                0
+            } else {
+                // Width = digits + space separator
+                (max_row.to_string().len() as u16) + 1
+            }
+        } else {
+            0
+        };
+        let marker_w: u16 = 3 + row_number_width; // cursor + selected + space + row_numbers
         let data_x = header_area.x.saturating_add(marker_w);
         let data_w = header_area.width.saturating_sub(marker_w);
 
@@ -1209,7 +1223,13 @@ impl<'a> Widget for DataGrid<'a> {
         // (typically in the App's draw loop) to update scroll positions.
 
         // Header row (frozen vertically, but scrolls horizontally with body).
-        render_marker_header(header_area, buf, marker_w);
+        render_marker_header(
+            header_area,
+            buf,
+            marker_w,
+            self.show_row_numbers,
+            row_number_width,
+        );
         render_row_cells(
             data_x,
             header_area.y,
@@ -1256,6 +1276,9 @@ impl<'a> Widget for DataGrid<'a> {
                 is_selected,
                 row_style,
                 buf,
+                self.show_row_numbers,
+                row_number_width,
+                row_idx + 1, // 1-based row number
             );
 
             // Determine cursor column for this row (only if this is the cursor row)
@@ -1282,29 +1305,70 @@ impl<'a> Widget for DataGrid<'a> {
     }
 }
 
-fn render_marker_header(area: Rect, buf: &mut Buffer, marker_w: u16) {
+fn render_marker_header(
+    area: Rect,
+    buf: &mut Buffer,
+    marker_w: u16,
+    show_row_numbers: bool,
+    row_number_width: u16,
+) {
     let mut x = area.x;
-    for _ in 0..marker_w {
+
+    // Render row number header (e.g., "#" or empty)
+    if show_row_numbers && row_number_width > 0 {
+        let header = format!("{:>width$}", "#", width = (row_number_width - 1) as usize);
+        buf.set_string(
+            x,
+            area.y,
+            &header,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+        x += row_number_width;
+    }
+
+    // Fill remaining marker area with spaces
+    let remaining = marker_w.saturating_sub(row_number_width);
+    for _ in 0..remaining {
         buf.set_string(x, area.y, " ", Style::default());
         x += 1;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_marker_cell(
     x: u16,
     y: u16,
-    marker_w: u16,
+    _marker_w: u16,
     is_cursor: bool,
     is_selected: bool,
     style: Style,
     buf: &mut Buffer,
+    show_row_numbers: bool,
+    row_number_width: u16,
+    row_number: usize,
 ) {
+    let mut current_x = x;
+
+    // Render row number if enabled
+    if show_row_numbers && row_number_width > 0 {
+        let row_num_str = format!(
+            "{:>width$}",
+            row_number,
+            width = (row_number_width - 1) as usize
+        );
+        let row_num_style = style.fg(Color::DarkGray);
+        buf.set_string(current_x, y, &row_num_str, row_num_style);
+        current_x += row_number_width;
+    }
+
+    // Render cursor and selection markers
     let cursor_ch = if is_cursor { '>' } else { ' ' };
     let sel_ch = if is_selected { '*' } else { ' ' };
 
-    let s = format!("{}{} ", cursor_ch, sel_ch);
-    let s = fit_to_width(&s, marker_w);
-    buf.set_string(x, y, s, style);
+    let markers = format!("{}{} ", cursor_ch, sel_ch);
+    buf.set_string(current_x, y, &markers, style);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1738,6 +1802,7 @@ mod tests {
             model: &model,
             state: &state,
             focused: true,
+            show_row_numbers: false,
         };
 
         // Render to a small buffer (narrow viewport)
