@@ -27,15 +27,14 @@ use crate::config::{
 };
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
-    create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    is_inside, quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup,
-    ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
-    ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker,
-    GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
-    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceHandler,
-    KeySequenceResult, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
-    RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder,
-    StatusSegment, TableInfo,
+    create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
+    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
+    ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
+    ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
+    GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
+    JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceHandler, KeySequenceResult,
+    PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
+    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
