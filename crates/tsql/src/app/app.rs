@@ -1865,6 +1865,7 @@ impl App {
                         }
                         Focus::Sidebar(SidebarSection::Connections) => {
                             self.sidebar_focus = SidebarSection::Schema;
+                            self.sidebar.select_first_schema_if_empty();
                             Focus::Sidebar(SidebarSection::Schema)
                         }
                         Focus::Sidebar(SidebarSection::Schema) => Focus::Query,
@@ -1876,6 +1877,7 @@ impl App {
                         Focus::Query => {
                             if self.sidebar_visible {
                                 self.sidebar_focus = SidebarSection::Schema;
+                                self.sidebar.select_first_schema_if_empty();
                                 Focus::Sidebar(SidebarSection::Schema)
                             } else {
                                 Focus::Grid
@@ -1959,9 +1961,7 @@ impl App {
                                 GridKeyResult::None
                             }
                             Action::GotoTables => {
-                                self.sidebar_visible = true;
-                                self.sidebar_focus = SidebarSection::Schema;
-                                self.focus = Focus::Sidebar(SidebarSection::Schema);
+                                self.focus_schema();
                                 GridKeyResult::None
                             }
                             Action::GotoResults => {
@@ -2041,8 +2041,7 @@ impl App {
                 let at_bottom =
                     self.sidebar.connections_state.selected() == Some(count.saturating_sub(1));
                 if at_bottom && count > 0 {
-                    self.sidebar_focus = SidebarSection::Schema;
-                    self.focus = Focus::Sidebar(SidebarSection::Schema);
+                    self.focus_schema();
                 } else {
                     self.sidebar.connections_down(count);
                 }
@@ -2242,6 +2241,9 @@ impl App {
                     if let Some(section) = section {
                         self.focus = Focus::Sidebar(section);
                         self.sidebar_focus = section;
+                        if section == SidebarSection::Schema {
+                            self.sidebar.select_first_schema_if_empty();
+                        }
                     }
 
                     // Handle any action from the sidebar
@@ -2374,6 +2376,14 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Focus on the Schema section of the sidebar, ensuring first item is selected
+    fn focus_schema(&mut self) {
+        self.sidebar_visible = true;
+        self.sidebar_focus = SidebarSection::Schema;
+        self.sidebar.select_first_schema_if_empty();
+        self.focus = Focus::Sidebar(SidebarSection::Schema);
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
@@ -3476,9 +3486,7 @@ impl App {
                 self.focus = Focus::Sidebar(SidebarSection::Connections);
             }
             Action::GotoTables => {
-                self.sidebar_visible = true;
-                self.sidebar_focus = SidebarSection::Schema;
-                self.focus = Focus::Sidebar(SidebarSection::Schema);
+                self.focus_schema();
             }
             Action::GotoResults => {
                 self.focus = Focus::Grid;
@@ -3954,9 +3962,7 @@ impl App {
                             return;
                         }
                         Action::GotoTables => {
-                            self.sidebar_visible = true;
-                            self.sidebar_focus = SidebarSection::Schema;
-                            self.focus = Focus::Sidebar(SidebarSection::Schema);
+                            self.focus_schema();
                             return;
                         }
                         Action::GotoResults => {
@@ -4327,9 +4333,7 @@ impl App {
                 self.focus = Focus::Sidebar(SidebarSection::Connections);
             }
             KeySequenceAction::GotoTables => {
-                self.sidebar_visible = true;
-                self.sidebar_focus = SidebarSection::Schema;
-                self.focus = Focus::Sidebar(SidebarSection::Schema);
+                self.focus_schema();
             }
             KeySequenceAction::GotoResults => {
                 self.focus = Focus::Grid;
