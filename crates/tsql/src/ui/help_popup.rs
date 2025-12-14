@@ -92,6 +92,22 @@ const GOTO: HelpSection = HelpSection::new(
     ],
 );
 
+const SIDEBAR_SCHEMA: HelpSection = HelpSection::new(
+    "Sidebar - Schema",
+    &[
+        KeyBinding::new("h/j/k/l or arrows", "Navigate tree"),
+        KeyBinding::new("Space", "Toggle node expand/collapse"),
+        KeyBinding::new("Enter (schema)", "Toggle schema expand/collapse"),
+        KeyBinding::new("Enter (column)", "Insert column name"),
+        KeyBinding::new("Enter (table) then s", "Insert SELECT template"),
+        KeyBinding::new("Enter (table) then i", "Insert INSERT template"),
+        KeyBinding::new("Enter (table) then u", "Insert UPDATE template"),
+        KeyBinding::new("Enter (table) then d", "Insert DELETE template"),
+        KeyBinding::new("Enter (table) then n", "Insert table name"),
+        KeyBinding::new("r", "Refresh schema"),
+    ],
+);
+
 const QUERY_NAVIGATION: HelpSection = HelpSection::new(
     "Query Editor - Navigation",
     &[
@@ -220,6 +236,7 @@ const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
 const ALL_SECTIONS: &[HelpSection] = &[
     GLOBAL,
     GOTO,
+    SIDEBAR_SCHEMA,
     QUERY_NAVIGATION,
     QUERY_EDITING,
     QUERY_VISUAL,

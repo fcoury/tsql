@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 pub enum PendingKey {
     /// The `g` (goto) key prefix
     G,
+    /// Schema table actions (started by Enter on a table in the schema panel)
+    SchemaTable,
     // Future: Add more pending keys here (e.g., Z for fold commands)
 }
 
@@ -18,21 +20,29 @@ impl PendingKey {
     pub fn display_char(&self) -> char {
         match self {
             PendingKey::G => 'g',
+            PendingKey::SchemaTable => '⏎',
         }
     }
 }
 
 /// Result of processing a key in a sequence
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeySequenceResult {
+pub enum KeySequenceResult<C = ()> {
     /// No sequence active, key was not consumed
     NotConsumed,
     /// Key started a new sequence (waiting for next key)
     Started(PendingKey),
     /// Sequence completed with an action
-    Completed(KeySequenceAction),
+    Completed(KeySequenceCompletion<C>),
     /// Sequence was cancelled (invalid second key)
     Cancelled,
+}
+
+/// A completed key sequence, including optional caller-provided context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySequenceCompletion<C = ()> {
+    pub action: KeySequenceAction,
+    pub context: Option<C>,
 }
 
 /// Actions that can result from completing a key sequence
@@ -48,11 +58,20 @@ pub enum KeySequenceAction {
     GotoTables,
     /// Go to the results grid
     GotoResults,
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Schema panel table templates (Enter + key)
+    // ─────────────────────────────────────────────────────────────────────
+    SchemaTableSelect,
+    SchemaTableInsert,
+    SchemaTableUpdate,
+    SchemaTableDelete,
+    SchemaTableName,
 }
 
 /// Handles multi-key sequences with timeout-based hint display.
 #[derive(Debug)]
-pub struct KeySequenceHandler {
+pub struct KeySequenceHandlerWithContext<C> {
     /// Current pending key, if any
     pending: Option<PendingKey>,
     /// When the pending key was pressed
@@ -61,15 +80,20 @@ pub struct KeySequenceHandler {
     timeout_ms: u64,
     /// Whether the hint popup should be shown
     hint_shown: bool,
+    /// Optional caller-provided context carried with the pending sequence.
+    pending_context: Option<C>,
 }
 
-impl Default for KeySequenceHandler {
+/// Backwards-compatible default handler with no context payload.
+pub type KeySequenceHandler = KeySequenceHandlerWithContext<()>;
+
+impl Default for KeySequenceHandlerWithContext<()> {
     fn default() -> Self {
         Self::new(500)
     }
 }
 
-impl KeySequenceHandler {
+impl<C> KeySequenceHandlerWithContext<C> {
     /// Creates a new handler with the specified timeout in milliseconds.
     pub fn new(timeout_ms: u64) -> Self {
         Self {
@@ -77,6 +101,7 @@ impl KeySequenceHandler {
             pending_since: None,
             timeout_ms,
             hint_shown: false,
+            pending_context: None,
         }
     }
 
@@ -113,11 +138,20 @@ impl KeySequenceHandler {
         self.hint_shown = true;
     }
 
+    /// Starts a new key sequence with caller-provided context.
+    pub fn start_with_context(&mut self, key: PendingKey, context: C) {
+        self.pending = Some(key);
+        self.pending_since = Some(Instant::now());
+        self.hint_shown = false;
+        self.pending_context = Some(context);
+    }
+
     /// Starts a new key sequence.
     pub fn start(&mut self, key: PendingKey) {
         self.pending = Some(key);
         self.pending_since = Some(Instant::now());
         self.hint_shown = false;
+        self.pending_context = None;
     }
 
     /// Cancels the current sequence and clears any pending state.
@@ -135,12 +169,13 @@ impl KeySequenceHandler {
         self.pending = None;
         self.pending_since = None;
         self.hint_shown = false;
+        self.pending_context = None;
     }
 
     /// Process the first key of a potential sequence.
     /// Returns `Started` if this key begins a sequence, `NotConsumed` otherwise.
     /// If a sequence is already pending, it is cancelled first (cancel+restart behavior).
-    pub fn process_first_key(&mut self, c: char) -> KeySequenceResult {
+    pub fn process_first_key(&mut self, c: char) -> KeySequenceResult<C> {
         // Cancel any existing pending sequence before starting a new one
         if self.pending.is_some() {
             self.cancel();
@@ -157,31 +192,41 @@ impl KeySequenceHandler {
 
     /// Process the second key of a sequence.
     /// Returns `Completed` with the action if valid, `Cancelled` otherwise.
-    pub fn process_second_key(&mut self, c: char) -> KeySequenceResult {
+    pub fn process_second_key(&mut self, c: char) -> KeySequenceResult<C> {
         let Some(pending) = self.pending else {
             return KeySequenceResult::NotConsumed;
         };
 
-        let result = match pending {
+        let action = match pending {
             PendingKey::G => match c {
-                'g' => KeySequenceResult::Completed(KeySequenceAction::GotoFirst),
-                'e' => KeySequenceResult::Completed(KeySequenceAction::GotoEditor),
-                'c' => KeySequenceResult::Completed(KeySequenceAction::GotoConnections),
-                't' => KeySequenceResult::Completed(KeySequenceAction::GotoTables),
-                'r' => KeySequenceResult::Completed(KeySequenceAction::GotoResults),
-                _ => KeySequenceResult::Cancelled,
+                'g' => Some(KeySequenceAction::GotoFirst),
+                'e' => Some(KeySequenceAction::GotoEditor),
+                'c' => Some(KeySequenceAction::GotoConnections),
+                't' => Some(KeySequenceAction::GotoTables),
+                'r' => Some(KeySequenceAction::GotoResults),
+                _ => None,
+            },
+            PendingKey::SchemaTable => match c {
+                's' => Some(KeySequenceAction::SchemaTableSelect),
+                'i' => Some(KeySequenceAction::SchemaTableInsert),
+                'u' => Some(KeySequenceAction::SchemaTableUpdate),
+                'd' => Some(KeySequenceAction::SchemaTableDelete),
+                'n' => Some(KeySequenceAction::SchemaTableName),
+                _ => None,
             },
         };
 
-        // Clear the pending state
-        match &result {
-            KeySequenceResult::Completed(_) | KeySequenceResult::Cancelled => {
+        match action {
+            Some(action) => {
+                let context = self.pending_context.take();
                 self.complete();
+                KeySequenceResult::Completed(KeySequenceCompletion { action, context })
             }
-            _ => {}
+            None => {
+                self.cancel();
+                KeySequenceResult::Cancelled
+            }
         }
-
-        result
     }
 
     /// Returns true if there is a pending key sequence.
@@ -218,7 +263,10 @@ mod tests {
         let result = handler.process_second_key('g');
         assert_eq!(
             result,
-            KeySequenceResult::Completed(KeySequenceAction::GotoFirst)
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoFirst,
+                context: None
+            })
         );
         assert!(!handler.is_waiting());
     }
@@ -231,7 +279,10 @@ mod tests {
         let result = handler.process_second_key('e');
         assert_eq!(
             result,
-            KeySequenceResult::Completed(KeySequenceAction::GotoEditor)
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoEditor,
+                context: None
+            })
         );
     }
 
@@ -243,7 +294,10 @@ mod tests {
         let result = handler.process_second_key('c');
         assert_eq!(
             result,
-            KeySequenceResult::Completed(KeySequenceAction::GotoConnections)
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoConnections,
+                context: None
+            })
         );
     }
 
@@ -255,7 +309,10 @@ mod tests {
         let result = handler.process_second_key('t');
         assert_eq!(
             result,
-            KeySequenceResult::Completed(KeySequenceAction::GotoTables)
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoTables,
+                context: None
+            })
         );
     }
 
@@ -267,7 +324,10 @@ mod tests {
         let result = handler.process_second_key('r');
         assert_eq!(
             result,
-            KeySequenceResult::Completed(KeySequenceAction::GotoResults)
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoResults,
+                context: None
+            })
         );
     }
 

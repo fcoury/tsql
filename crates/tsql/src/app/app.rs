@@ -32,13 +32,77 @@ use crate::ui::{
     ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
     ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
     GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
-    JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceHandler, KeySequenceResult,
-    PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
-    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
+    JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
+    KeySequenceHandlerWithContext, KeySequenceResult, PendingKey, PickerAction, Priority,
+    QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
+    SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
 use tui_syntax::Highlighter;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaTableContext {
+    schema: String,
+    table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaTreeSelection {
+    Schema {
+        schema: String,
+    },
+    Table {
+        schema: String,
+        table: String,
+    },
+    Column {
+        schema: String,
+        table: String,
+        column: String,
+    },
+    Unknown {
+        raw: String,
+    },
+}
+
+fn parse_schema_tree_identifier(identifier: &str) -> SchemaTreeSelection {
+    if let Some(schema) = identifier.strip_prefix("schema:") {
+        return SchemaTreeSelection::Schema {
+            schema: schema.to_string(),
+        };
+    }
+
+    if let Some(rest) = identifier.strip_prefix("table:") {
+        let mut parts = rest.splitn(2, ':');
+        let schema = parts.next().unwrap_or_default();
+        let table = parts.next().unwrap_or_default();
+        if !schema.is_empty() && !table.is_empty() {
+            return SchemaTreeSelection::Table {
+                schema: schema.to_string(),
+                table: table.to_string(),
+            };
+        }
+    }
+
+    if let Some(rest) = identifier.strip_prefix("column:") {
+        let mut parts = rest.splitn(3, ':');
+        let schema = parts.next().unwrap_or_default();
+        let table = parts.next().unwrap_or_default();
+        let column = parts.next().unwrap_or_default();
+        if !schema.is_empty() && !table.is_empty() && !column.is_empty() {
+            return SchemaTreeSelection::Column {
+                schema: schema.to_string(),
+                table: table.to_string(),
+                column: column.to_string(),
+            };
+        }
+    }
+
+    SchemaTreeSelection::Unknown {
+        raw: identifier.to_string(),
+    }
+}
 
 // Meta-command SQL queries (psql-style \dt, \d, etc.)
 
@@ -559,7 +623,7 @@ pub struct App {
     pub schema_cache: SchemaCache,
     pub pending_key: Option<char>,
     /// Key sequence handler for multi-key commands like `gg`, `gc`, etc.
-    pub key_sequence: KeySequenceHandler,
+    key_sequence: KeySequenceHandlerWithContext<SchemaTableContext>,
     /// Editor scroll offset (row, col) for horizontal scrolling support.
     pub editor_scroll: (u16, u16),
 
@@ -686,7 +750,7 @@ impl App {
             completion: CompletionPopup::new(),
             schema_cache: SchemaCache::new(),
             pending_key: None,
-            key_sequence: KeySequenceHandler::new(key_sequence_timeout_ms),
+            key_sequence: KeySequenceHandlerWithContext::new(key_sequence_timeout_ms),
             editor_scroll: (0, 0),
 
             rt,
@@ -1622,39 +1686,36 @@ impl App {
             }
         }
 
-        // Handle key sequences (e.g., gg, gc, gt, ge, gr) in Normal mode
-        if self.mode == Mode::Normal {
-            // If there's a pending key sequence, process the second key
-            if self.key_sequence.is_waiting() {
-                // Prevent legacy operator-pending state from leaking across key sequences.
-                self.pending_key = None;
-                if let KeyCode::Char(c) = key.code {
-                    if key.modifiers == KeyModifiers::NONE {
-                        let result = self.key_sequence.process_second_key(c);
-                        match result {
-                            KeySequenceResult::Completed(action) => {
-                                self.execute_key_sequence_action(action);
-                                return false;
-                            }
-                            KeySequenceResult::Cancelled => {
-                                // Invalid second key - cancel and let it fall through to normal handling.
-                                // UX decision: 'g' acts as a "hard prefix" that consumes the first key,
-                                // but invalid second keys fall through so users don't "lose" the keystroke.
-                                // (The sequence was already cancelled by process_second_key)
-                            }
-                            _ => {}
+        // Handle second key of any pending key sequence (e.g., g* or schema-table Enter+key).
+        if self.key_sequence.is_waiting() {
+            // Prevent legacy operator-pending state from leaking across key sequences.
+            self.pending_key = None;
+            if let KeyCode::Char(c) = key.code {
+                if key.modifiers == KeyModifiers::NONE {
+                    let result = self.key_sequence.process_second_key(c);
+                    match result {
+                        KeySequenceResult::Completed(completed) => {
+                            self.execute_key_sequence_completion(completed);
+                            return false;
                         }
-                    } else {
-                        // Modifier key pressed - cancel sequence
-                        self.key_sequence.cancel();
+                        KeySequenceResult::Cancelled => {
+                            // Invalid second key - let it fall through to normal handling.
+                        }
+                        _ => {}
                     }
                 } else {
-                    // Non-char key pressed (arrows, etc.) - cancel sequence
-                    // Note: Esc is handled earlier in on_key() at the global Esc handler
+                    // Modifier key pressed - cancel sequence
                     self.key_sequence.cancel();
                 }
+            } else {
+                // Non-char key pressed (arrows, etc.) - cancel sequence
+                // Note: Esc is handled earlier in on_key() at the global Esc handler
+                self.key_sequence.cancel();
             }
+        }
 
+        // Handle key sequences (e.g., gg, gc, gt, ge, gr) in Normal mode
+        if self.mode == Mode::Normal {
             // Start a new key sequence for 'g' key (only when no sequence is pending)
             if !self.key_sequence.is_waiting() {
                 if let KeyCode::Char('g') = key.code {
@@ -1940,21 +2001,39 @@ impl App {
             }
             // Enter on schema item: insert name at cursor or toggle expand
             (KeyCode::Enter, KeyModifiers::NONE, SidebarSection::Schema) => {
-                if let Some(name) = self.sidebar.get_selected_schema_name() {
-                    // Extract just the name from the identifier (skip the prefix)
-                    let insert_name = if let Some((_prefix, actual_name)) = name.rsplit_once(':') {
-                        actual_name.to_string()
-                    } else {
-                        name
-                    };
-                    // Insert the name at cursor in editor
-                    for ch in insert_name.chars() {
-                        self.editor.textarea.insert_char(ch);
-                    }
-                    self.focus = Focus::Query;
-                    self.mode = Mode::Insert;
-                } else {
+                let Some(id) = self.sidebar.schema_state.selected().last().cloned() else {
                     self.sidebar.schema_toggle();
+                    return;
+                };
+
+                match parse_schema_tree_identifier(&id) {
+                    SchemaTreeSelection::Schema { .. } => {
+                        // Schema node: toggle expand/collapse
+                        self.sidebar.schema_toggle();
+                    }
+                    SchemaTreeSelection::Table { schema, table } => {
+                        // Table node: start a follow-up key sequence (Enter + key)
+                        self.key_sequence.start_with_context(
+                            PendingKey::SchemaTable,
+                            SchemaTableContext { schema, table },
+                        );
+                    }
+                    SchemaTreeSelection::Column { column, .. } => {
+                        // Column node: preserve existing behavior (insert column name)
+                        self.editor.textarea.insert_str(&column);
+                        self.focus = Focus::Query;
+                        self.mode = Mode::Insert;
+                    }
+                    SchemaTreeSelection::Unknown { raw } => {
+                        // Fallback to previous behavior: insert last segment after ':'
+                        let insert_name = raw
+                            .rsplit_once(':')
+                            .map(|(_, name)| name.to_string())
+                            .unwrap_or(raw);
+                        self.editor.textarea.insert_str(&insert_name);
+                        self.focus = Focus::Query;
+                        self.mode = Mode::Insert;
+                    }
                 }
             }
             // Space toggles tree node
@@ -3988,9 +4067,123 @@ impl App {
         }
     }
 
-    /// Execute an action from a completed key sequence.
-    fn execute_key_sequence_action(&mut self, action: KeySequenceAction) {
-        match action {
+    fn quote_identifier_always(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
+    fn format_table_ref(&self, schema: &str, table: &str) -> String {
+        use crate::config::IdentifierStyle;
+
+        match self.config.sql.identifier_style {
+            IdentifierStyle::QualifiedQuoted => format!(
+                "{}.{}",
+                Self::quote_identifier_always(schema),
+                Self::quote_identifier_always(table)
+            ),
+            IdentifierStyle::Minimal => {
+                // Heuristic: omit schema qualification for the common "public" schema.
+                if schema == "public" {
+                    quote_identifier(table)
+                } else {
+                    format!("{}.{}", quote_identifier(schema), quote_identifier(table))
+                }
+            }
+        }
+    }
+
+    fn format_column(&self, column: &str) -> String {
+        use crate::config::IdentifierStyle;
+
+        match self.config.sql.identifier_style {
+            IdentifierStyle::QualifiedQuoted => Self::quote_identifier_always(column),
+            IdentifierStyle::Minimal => quote_identifier(column),
+        }
+    }
+
+    fn schema_table_columns(&self, schema: &str, table: &str) -> Option<Vec<String>> {
+        self.schema_cache
+            .tables
+            .iter()
+            .find(|t| t.schema == schema && t.name == table)
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+    }
+
+    fn build_select_template(&self, ctx: &SchemaTableContext) -> String {
+        let table_ref = self.format_table_ref(&ctx.schema, &ctx.table);
+        let limit = self.config.sql.default_select_limit;
+        format!("SELECT *\nFROM {}\nLIMIT {};", table_ref, limit)
+    }
+
+    fn build_insert_template(&self, ctx: &SchemaTableContext) -> String {
+        let table_ref = self.format_table_ref(&ctx.schema, &ctx.table);
+        let columns = self.schema_table_columns(&ctx.schema, &ctx.table);
+
+        let Some(columns) = columns else {
+            return format!(
+                "INSERT INTO {} (\n  -- TODO: columns\n) VALUES (\n  -- TODO: values\n);",
+                table_ref
+            );
+        };
+
+        if columns.is_empty() {
+            return format!(
+                "INSERT INTO {} (\n  -- TODO: columns\n) VALUES (\n  -- TODO: values\n);",
+                table_ref
+            );
+        }
+
+        let column_lines = columns
+            .iter()
+            .map(|c| format!("  {}", self.format_column(c)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+
+        let value_lines = columns
+            .iter()
+            .map(|c| format!("  NULL -- {}", c))
+            .collect::<Vec<_>>()
+            .join(",\n");
+
+        format!(
+            "INSERT INTO {} (\n{}\n) VALUES (\n{}\n);",
+            table_ref, column_lines, value_lines
+        )
+    }
+
+    fn build_update_template(&self, ctx: &SchemaTableContext) -> String {
+        let table_ref = self.format_table_ref(&ctx.schema, &ctx.table);
+        let first_col = self
+            .schema_table_columns(&ctx.schema, &ctx.table)
+            .and_then(|cols| cols.into_iter().next());
+
+        let set_line = match first_col {
+            Some(col) => format!("  {} = NULL", self.format_column(&col)),
+            None => "  -- TODO: set clause".to_string(),
+        };
+
+        format!(
+            "UPDATE {}\nSET\n{}\nWHERE\n  -- TODO: condition\n;",
+            table_ref, set_line
+        )
+    }
+
+    fn build_delete_template(&self, ctx: &SchemaTableContext) -> String {
+        let table_ref = self.format_table_ref(&ctx.schema, &ctx.table);
+        format!("DELETE FROM {}\nWHERE\n  -- TODO: condition\n;", table_ref)
+    }
+
+    fn insert_into_editor_and_focus(&mut self, text: &str) {
+        self.editor.textarea.insert_str(text);
+        self.focus = Focus::Query;
+        self.mode = Mode::Insert;
+    }
+
+    /// Execute a completed key sequence (action + optional context).
+    fn execute_key_sequence_completion(
+        &mut self,
+        completed: KeySequenceCompletion<SchemaTableContext>,
+    ) {
+        match completed.action {
             KeySequenceAction::GotoFirst => {
                 // Go to first row in grid, or document start in editor
                 match self.focus {
@@ -4025,6 +4218,29 @@ impl App {
             }
             KeySequenceAction::GotoResults => {
                 self.focus = Focus::Grid;
+            }
+
+            KeySequenceAction::SchemaTableSelect
+            | KeySequenceAction::SchemaTableInsert
+            | KeySequenceAction::SchemaTableUpdate
+            | KeySequenceAction::SchemaTableDelete
+            | KeySequenceAction::SchemaTableName => {
+                let Some(ctx) = completed.context else {
+                    return;
+                };
+
+                let sql = match completed.action {
+                    KeySequenceAction::SchemaTableSelect => self.build_select_template(&ctx),
+                    KeySequenceAction::SchemaTableInsert => self.build_insert_template(&ctx),
+                    KeySequenceAction::SchemaTableUpdate => self.build_update_template(&ctx),
+                    KeySequenceAction::SchemaTableDelete => self.build_delete_template(&ctx),
+                    KeySequenceAction::SchemaTableName => {
+                        self.format_table_ref(&ctx.schema, &ctx.table)
+                    }
+                    _ => return,
+                };
+
+                self.insert_into_editor_and_focus(&sql);
             }
         }
     }

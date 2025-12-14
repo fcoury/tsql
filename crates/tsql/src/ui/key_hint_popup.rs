@@ -38,6 +38,15 @@ const G_HINTS: &[KeyHint] = &[
     KeyHint::new("r", "results"),
 ];
 
+/// Hints for schema table actions (started by Enter on a table in the schema panel)
+const SCHEMA_TABLE_HINTS: &[KeyHint] = &[
+    KeyHint::new("s", "select"),
+    KeyHint::new("i", "insert"),
+    KeyHint::new("u", "update"),
+    KeyHint::new("d", "delete"),
+    KeyHint::new("n", "name"),
+];
+
 /// The key hint popup widget.
 pub struct KeyHintPopup {
     /// The currently pending key
@@ -54,6 +63,7 @@ impl KeyHintPopup {
     fn hints(&self) -> &'static [KeyHint] {
         match self.pending_key {
             PendingKey::G => G_HINTS,
+            PendingKey::SchemaTable => SCHEMA_TABLE_HINTS,
         }
     }
 
@@ -171,9 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_table_hints() {
+        let popup = KeyHintPopup::new(PendingKey::SchemaTable);
+        let hints = popup.hints();
+
+        assert_eq!(hints.len(), 5);
+        assert_eq!(hints[0].key, "s");
+        assert_eq!(hints[0].description, "select");
+        assert_eq!(hints[1].key, "i");
+        assert_eq!(hints[4].key, "n");
+    }
+
+    #[test]
     fn test_title_char() {
         let popup = KeyHintPopup::new(PendingKey::G);
         assert_eq!(popup.title_char(), 'g');
+    }
+
+    #[test]
+    fn test_title_char_schema_table() {
+        let popup = KeyHintPopup::new(PendingKey::SchemaTable);
+        assert_eq!(popup.title_char(), '⏎');
     }
 
     #[test]
