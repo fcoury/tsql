@@ -63,6 +63,7 @@ pub fn load_session() -> Result<SessionState> {
 }
 
 /// Load session state from a specific path.
+/// Returns default state if file is missing or corrupted (graceful degradation).
 pub fn load_session_from_path(path: &Path) -> Result<SessionState> {
     if !path.exists() {
         return Ok(SessionState::default());
@@ -71,8 +72,14 @@ pub fn load_session_from_path(path: &Path) -> Result<SessionState> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read session file: {}", path.display()))?;
 
-    let file: SessionFile = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse session file: {}", path.display()))?;
+    // Parse errors are treated as corrupted file - return default state
+    let file: SessionFile = match serde_json::from_str(&content) {
+        Ok(f) => f,
+        Err(_) => {
+            // Corrupted session file - treat as missing and return default
+            return Ok(SessionState::default());
+        }
+    };
 
     // Handle future version migrations here if needed.
     if file.version > SESSION_VERSION {
@@ -122,6 +129,13 @@ pub fn save_session_to_path(state: &SessionState, path: &Path) -> Result<()> {
     tmp.persist(path)
         .map_err(|e| anyhow::anyhow!("Failed to persist session file: {}", e))?;
 
+    // Set restrictive permissions on Unix (best-effort, queries can be sensitive)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+
     Ok(())
 }
 
@@ -166,13 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupted_file_returns_error() {
+    fn test_corrupted_file_returns_default() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("session.json");
         fs::write(&path, "not valid json {{{").unwrap();
 
-        let result = load_session_from_path(&path);
-        assert!(result.is_err());
+        // Corrupted files should gracefully return default state
+        let state = load_session_from_path(&path).unwrap();
+        assert!(state.connection_name.is_none());
+        assert!(state.editor_content.is_empty());
+        assert!(!state.sidebar_visible);
     }
 
     #[test]
