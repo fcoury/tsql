@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use super::mouse_util::is_inside;
+use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 
 /// Result of handling a key event in the help popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,14 +357,14 @@ impl HelpPopup {
             MouseEventKind::ScrollUp => {
                 // Only scroll if mouse is inside popup
                 if self.is_mouse_inside(x, y) {
-                    self.scroll_up(3);
+                    self.scroll_up(MOUSE_SCROLL_LINES);
                 }
                 HelpAction::Continue
             }
             MouseEventKind::ScrollDown => {
                 // Only scroll if mouse is inside popup
                 if self.is_mouse_inside(x, y) {
-                    self.scroll_down(3);
+                    self.scroll_down(MOUSE_SCROLL_LINES);
                 }
                 HelpAction::Continue
             }

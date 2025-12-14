@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-use super::mouse_util::is_inside;
+use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 
 /// Result of handling a key event in the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,7 +277,7 @@ impl<T: Clone> FuzzyPicker<T> {
             MouseEventKind::ScrollUp => {
                 // Only scroll if mouse is inside popup
                 if self.is_mouse_inside(x, y) {
-                    for _ in 0..3 {
+                    for _ in 0..MOUSE_SCROLL_LINES {
                         self.move_up();
                     }
                 }
@@ -286,7 +286,7 @@ impl<T: Clone> FuzzyPicker<T> {
             MouseEventKind::ScrollDown => {
                 // Only scroll if mouse is inside popup
                 if self.is_mouse_inside(x, y) {
-                    for _ in 0..3 {
+                    for _ in 0..MOUSE_SCROLL_LINES {
                         self.move_down();
                     }
                 }

@@ -2,6 +2,10 @@
 
 use ratatui::layout::Rect;
 
+/// Default number of lines to scroll on mouse wheel events.
+/// Used across all components for consistent UX.
+pub const MOUSE_SCROLL_LINES: usize = 3;
+
 /// Check if coordinates are inside a rectangle.
 ///
 /// Uses u32 arithmetic internally to prevent overflow when adding

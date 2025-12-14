@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
-use super::mouse_util::is_inside;
+use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 use crate::app::SidebarSection;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
@@ -349,11 +349,11 @@ impl Sidebar {
             MouseEventKind::ScrollUp => {
                 if self.is_over_connections(x, y) {
                     let total_count = connections.sorted().len();
-                    self.connections_up_by(total_count, 3);
+                    self.connections_up_by(total_count, MOUSE_SCROLL_LINES);
                     return (None, Some(SidebarSection::Connections));
                 }
                 if self.is_over_schema(x, y) {
-                    for _ in 0..3 {
+                    for _ in 0..MOUSE_SCROLL_LINES {
                         self.schema_up();
                     }
                     return (None, Some(SidebarSection::Schema));
@@ -362,11 +362,11 @@ impl Sidebar {
             MouseEventKind::ScrollDown => {
                 if self.is_over_connections(x, y) {
                     let total_count = connections.sorted().len();
-                    self.connections_down_by(total_count, 3);
+                    self.connections_down_by(total_count, MOUSE_SCROLL_LINES);
                     return (None, Some(SidebarSection::Connections));
                 }
                 if self.is_over_schema(x, y) {
-                    for _ in 0..3 {
+                    for _ in 0..MOUSE_SCROLL_LINES {
                         self.schema_down();
                     }
                     return (None, Some(SidebarSection::Schema));

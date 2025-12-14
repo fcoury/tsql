@@ -28,13 +28,13 @@ use crate::config::{
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
-    ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
-    ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
-    GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
-    JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
-    RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder,
-    StatusSegment, TableInfo,
+    is_inside, quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup,
+    ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
+    ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker,
+    GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
+    JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction,
+    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
+    StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -1901,12 +1901,7 @@ impl App {
         // Check if mouse is over sidebar first
         if self.sidebar_visible {
             if let Some(sidebar_area) = self.render_sidebar_area {
-                let (x, y) = (mouse.column, mouse.row);
-                if x >= sidebar_area.x
-                    && x < sidebar_area.x + sidebar_area.width
-                    && y >= sidebar_area.y
-                    && y < sidebar_area.y + sidebar_area.height
-                {
+                if is_inside(mouse.column, mouse.row, sidebar_area) {
                     // Delegate to sidebar mouse handler
                     let (action, section) = self.sidebar.handle_mouse(mouse, &self.connections);
 
