@@ -39,6 +39,9 @@ keyring.workspace = true
 # URL parsing
 url.workspace = true
 
+# Percent encoding for safe identifier serialization
+percent-encoding.workspace = true
+
 # Tree widget for sidebar
 tui-tree-widget.workspace = true
 
