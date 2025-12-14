@@ -1380,7 +1380,7 @@ impl App {
                 }
 
                 // Render confirmation prompt if active (topmost layer)
-                if let Some(ref prompt) = self.confirm_prompt {
+                if let Some(ref mut prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
                 }
             })?;
@@ -1414,7 +1414,7 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // Handle confirmation prompt when active (highest priority)
-        if let Some(prompt) = self.confirm_prompt.take() {
+        if let Some(mut prompt) = self.confirm_prompt.take() {
             match prompt.handle_key(key) {
                 ConfirmResult::Confirmed => {
                     return self.handle_confirm_confirmed(prompt.context().clone());
@@ -1939,6 +1939,25 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) {
         // Route mouse events to modals in priority order
 
+        // Confirmation prompt has highest priority (topmost modal)
+        if let Some(mut prompt) = self.confirm_prompt.take() {
+            match prompt.handle_mouse(mouse) {
+                ConfirmResult::Confirmed => {
+                    self.handle_confirm_confirmed(prompt.context().clone());
+                    return;
+                }
+                ConfirmResult::Cancelled => {
+                    self.handle_confirm_cancelled(prompt.context().clone());
+                    return;
+                }
+                ConfirmResult::Pending => {
+                    // Put it back, wait for valid input
+                    self.confirm_prompt = Some(prompt);
+                    return;
+                }
+            }
+        }
+
         // Help popup has mouse support
         if let Some(ref mut help_popup) = self.help_popup {
             let action = help_popup.handle_mouse(mouse);
@@ -2006,10 +2025,7 @@ impl App {
         }
 
         // Don't process mouse events for other modals without mouse support
-        if self.confirm_prompt.is_some()
-            || self.json_editor.is_some()
-            || self.row_detail.is_some()
-            || self.connection_form.is_some()
+        if self.json_editor.is_some() || self.row_detail.is_some() || self.connection_form.is_some()
         {
             return;
         }
