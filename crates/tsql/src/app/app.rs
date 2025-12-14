@@ -1840,10 +1840,11 @@ impl App {
             let action = picker.handle_mouse(mouse);
             match action {
                 PickerAction::Selected(entry) => {
+                    // Load selected query into editor (mirror keyboard path)
+                    self.editor.set_text(entry.query);
+                    self.editor.mark_saved(); // Mark as unmodified since it's loaded content
                     self.history_picker = None;
-                    self.editor.textarea.select_all();
-                    self.editor.textarea.cut();
-                    self.editor.textarea.insert_str(&entry.query);
+                    self.last_status = Some("Loaded from history".to_string());
                 }
                 PickerAction::Cancelled => {
                     self.history_picker = None;
