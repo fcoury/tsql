@@ -106,16 +106,22 @@ impl KeyHintPopup {
         let width = desired_width
             .max(MIN_WIDTH)
             .min(max_available_width)
-            .min(frame_area.width); // Final safety clamp
+            .min(frame_area.width)
+            .max(1); // Ensure non-zero for valid rendering
 
         let height = desired_height
             .max(MIN_HEIGHT)
             .min(max_available_height)
-            .min(frame_area.height); // Final safety clamp
+            .min(frame_area.height)
+            .max(1); // Ensure non-zero for valid rendering
 
-        // Position in bottom-right with padding
-        let x = frame_area.width.saturating_sub(width + PADDING);
-        let y = frame_area.height.saturating_sub(height + PADDING);
+        // Position in bottom-right with padding (respecting frame_area origin)
+        let x = frame_area
+            .x
+            .saturating_add(frame_area.width.saturating_sub(width + PADDING));
+        let y = frame_area
+            .y
+            .saturating_add(frame_area.height.saturating_sub(height + PADDING));
 
         Rect::new(x, y, width, height)
     }
