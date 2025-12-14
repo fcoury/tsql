@@ -5168,17 +5168,12 @@ impl App {
                 // Mark the query as "saved" since it was successfully executed
                 self.editor.mark_saved();
 
-                let mut msg = String::new();
-                if let Some(tag) = result.command_tag {
-                    msg.push_str(&tag);
-                } else {
-                    msg.push_str("Query complete");
-                }
-                msg.push_str(&format!(" ({} ms)", result.elapsed.as_millis()));
+                // Set status - timing info is already shown in the status bar via timing_info segment
                 if result.truncated {
-                    msg.push_str(" [truncated]");
+                    self.last_status = Some("[truncated]".to_string());
+                } else {
+                    self.last_status = Some("Ready".to_string());
                 }
-                self.last_status = Some(msg);
             }
             DbEvent::QueryError { error } => {
                 self.db.running = false;
