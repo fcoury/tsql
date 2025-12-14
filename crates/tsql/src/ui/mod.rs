@@ -8,6 +8,8 @@ mod grid;
 mod help_popup;
 mod highlighted_editor;
 mod json_editor;
+mod key_hint_popup;
+mod key_sequence;
 mod mouse_util;
 pub use mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 mod row_detail;
@@ -30,6 +32,8 @@ pub use grid::{
 pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, HighlightedTextArea};
 pub use json_editor::{JsonEditorAction, JsonEditorModal};
+pub use key_hint_popup::KeyHintPopup;
+pub use key_sequence::{KeySequenceAction, KeySequenceHandler, KeySequenceResult, PendingKey};
 pub use row_detail::{RowDetailAction, RowDetailModal};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};

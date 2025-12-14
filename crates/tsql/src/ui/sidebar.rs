@@ -269,6 +269,12 @@ impl Sidebar {
         self.connections_down_by(total_count, 1);
     }
 
+    /// Select the first connection in the list
+    pub fn select_first_connection(&mut self) {
+        self.connections_state.select(Some(0));
+        self.selected_connection = Some(0);
+    }
+
     /// Get selected connection name
     pub fn get_selected_connection<'a>(
         &self,

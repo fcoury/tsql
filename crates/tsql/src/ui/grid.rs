@@ -45,6 +45,8 @@ pub enum GridKeyResult {
     OpenRowDetail { row: usize },
     /// Display a status message.
     StatusMessage(String),
+    /// Go to the first row (from `gg` sequence, handled at app level).
+    GotoFirstRow,
 }
 
 /// A match location in the grid (row, column).
@@ -213,7 +215,7 @@ impl GridState {
                     self.cursor_row = (self.cursor_row + 10).min(row_count - 1);
                 }
             }
-            (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+            (KeyCode::Home, _) => {
                 self.cursor_row = 0;
             }
             (KeyCode::End, _) | (KeyCode::Char('G'), _) => {

@@ -77,6 +77,18 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("?", "Toggle this help"),
         KeyBinding::new("Ctrl+O", "Open connection picker"),
         KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
+        KeyBinding::new("Ctrl+B", "Toggle sidebar"),
+    ],
+);
+
+const GOTO: HelpSection = HelpSection::new(
+    "Go To (g prefix)",
+    &[
+        KeyBinding::new("gg", "Go to first row / document start"),
+        KeyBinding::new("ge", "Go to editor"),
+        KeyBinding::new("gc", "Go to connections sidebar"),
+        KeyBinding::new("gt", "Go to tables/schema sidebar"),
+        KeyBinding::new("gr", "Go to results grid"),
     ],
 );
 
@@ -207,6 +219,7 @@ const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
 
 const ALL_SECTIONS: &[HelpSection] = &[
     GLOBAL,
+    GOTO,
     QUERY_NAVIGATION,
     QUERY_EDITING,
     QUERY_VISUAL,

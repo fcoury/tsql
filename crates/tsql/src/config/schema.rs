@@ -128,6 +128,8 @@ impl Default for ConnectionConfig {
 pub struct KeymapConfig {
     /// Use vim-style keybindings
     pub vim_mode: bool,
+    /// Timeout in milliseconds before showing key sequence hints (e.g., after pressing 'g')
+    pub key_sequence_timeout_ms: u64,
     /// Custom keybindings for normal mode
     #[serde(default)]
     pub normal: Vec<CustomKeyBinding>,
@@ -149,6 +151,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             vim_mode: true,
+            key_sequence_timeout_ms: 500,
             normal: Vec::new(),
             insert: Vec::new(),
             visual: Vec::new(),
