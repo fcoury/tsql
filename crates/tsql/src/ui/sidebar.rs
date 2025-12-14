@@ -219,7 +219,7 @@ impl Sidebar {
             .expect("valid tree items")
             .block(block)
             .highlight_style(highlight_style)
-            .highlight_symbol("▶ ");
+            .highlight_symbol("› ");
 
         frame.render_stateful_widget(tree, area, &mut self.schema_state);
     }
@@ -324,6 +324,13 @@ impl Sidebar {
     /// Get the selected schema item identifier (for inserting into query)
     pub fn get_selected_schema_name(&self) -> Option<String> {
         self.schema_state.selected().last().cloned()
+    }
+
+    /// Select the first item in the schema tree if nothing is selected
+    pub fn select_first_schema_if_empty(&mut self) {
+        if self.schema_state.selected().is_empty() {
+            self.schema_state.select_first();
+        }
     }
 
     /// Handle mouse events in the sidebar
