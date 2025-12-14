@@ -420,17 +420,13 @@ impl Sidebar {
         &mut self,
         x: u16,
         y: u16,
-        schema_area: Rect,
+        _schema_area: Rect,
     ) -> (Option<SidebarAction>, Option<SidebarSection>) {
-        // Calculate position relative to the schema area's inner content
-        // (accounting for border)
-        let rel_x = x.saturating_sub(schema_area.x + 1);
-        let rel_y = y.saturating_sub(schema_area.y + 1);
-
-        // Use TreeState's click_at method which properly handles scroll offset
-        // click_at takes a Position relative to the tree widget's render area
+        // TreeState's click_at expects absolute screen coordinates, not relative ones.
+        // The tree widget stores absolute y positions in last_rendered_identifiers
+        // during render, so we pass the mouse coordinates directly.
         use ratatui::layout::Position;
-        self.schema_state.click_at(Position::new(rel_x, rel_y));
+        self.schema_state.click_at(Position::new(x, y));
 
         (None, Some(SidebarSection::Schema))
     }
