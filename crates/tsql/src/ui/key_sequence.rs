@@ -122,13 +122,16 @@ impl KeySequenceHandler {
 
     /// Cancels the current sequence and clears any pending state.
     pub fn cancel(&mut self) {
-        self.pending = None;
-        self.pending_since = None;
-        self.hint_shown = false;
+        self.clear_state();
     }
 
     /// Completes the sequence and clears the pending state.
     fn complete(&mut self) {
+        self.clear_state();
+    }
+
+    /// Clears all pending state. Used by both cancel() and complete().
+    fn clear_state(&mut self) {
         self.pending = None;
         self.pending_since = None;
         self.hint_shown = false;
@@ -136,7 +139,13 @@ impl KeySequenceHandler {
 
     /// Process the first key of a potential sequence.
     /// Returns `Started` if this key begins a sequence, `NotConsumed` otherwise.
+    /// If a sequence is already pending, it is cancelled first (cancel+restart behavior).
     pub fn process_first_key(&mut self, c: char) -> KeySequenceResult {
+        // Cancel any existing pending sequence before starting a new one
+        if self.pending.is_some() {
+            self.cancel();
+        }
+
         match c {
             'g' => {
                 self.start(PendingKey::G);
@@ -289,12 +298,13 @@ mod tests {
 
     #[test]
     fn test_should_show_hint_after_timeout() {
-        let mut handler = KeySequenceHandler::new(10); // 10ms timeout for quick test
+        let mut handler = KeySequenceHandler::new(50); // 50ms timeout for test
 
         handler.process_first_key('g');
         assert!(!handler.should_show_hint());
 
-        sleep(Duration::from_millis(50));
+        // Use larger margin (200ms sleep vs 50ms timeout) to reduce CI flakiness
+        sleep(Duration::from_millis(200));
         assert!(handler.should_show_hint());
     }
 

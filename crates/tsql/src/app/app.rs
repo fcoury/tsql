@@ -839,6 +839,11 @@ impl App {
                         .collect()
                 });
 
+            // Compute hint visibility once per tick to avoid time-based state
+            // flipping between calls during the same render cycle.
+            let show_key_hint = self.key_sequence.should_show_hint();
+            let pending_key_for_hint = self.key_sequence.pending();
+
             terminal.draw(|frame| {
                 let size = frame.area();
 
@@ -1368,8 +1373,8 @@ impl App {
                 }
 
                 // Render key hint popup if active (shows after timeout when 'g' is pending)
-                if self.key_sequence.should_show_hint() {
-                    if let Some(pending_key) = self.key_sequence.pending() {
+                if show_key_hint {
+                    if let Some(pending_key) = pending_key_for_hint {
                         let hint_popup = KeyHintPopup::new(pending_key);
                         hint_popup.render(frame, size);
                     }
@@ -1382,7 +1387,7 @@ impl App {
             })?;
 
             // Mark hint as shown after rendering (must be outside draw closure)
-            if self.key_sequence.should_show_hint() && !self.key_sequence.is_hint_shown() {
+            if show_key_hint && !self.key_sequence.is_hint_shown() {
                 self.key_sequence.mark_hint_shown();
             }
 
@@ -1603,8 +1608,10 @@ impl App {
                                 return false;
                             }
                             KeySequenceResult::Cancelled => {
-                                // Invalid second key - cancel and let it fall through
-                                // (but it was already cancelled by process_second_key)
+                                // Invalid second key - cancel and let it fall through to normal handling.
+                                // UX decision: 'g' acts as a "hard prefix" that consumes the first key,
+                                // but invalid second keys fall through so users don't "lose" the keystroke.
+                                // (The sequence was already cancelled by process_second_key)
                             }
                             _ => {}
                         }
@@ -1612,12 +1619,9 @@ impl App {
                         // Modifier key pressed - cancel sequence
                         self.key_sequence.cancel();
                     }
-                } else if key.code == KeyCode::Esc {
-                    // Esc cancels the pending sequence
-                    self.key_sequence.cancel();
-                    return false;
                 } else {
-                    // Non-char key pressed - cancel sequence
+                    // Non-char key pressed (arrows, etc.) - cancel sequence
+                    // Note: Esc is handled earlier in on_key() at the global Esc handler
                     self.key_sequence.cancel();
                 }
             }
@@ -1752,10 +1756,7 @@ impl App {
                             }
                             Action::ToggleSidebar => {
                                 self.sidebar_visible = !self.sidebar_visible;
-                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_))
-                                {
-                                    self.focus = Focus::Query;
-                                }
+                                // Note: No need to change focus here - we're already in Focus::Grid
                                 GridKeyResult::None
                             }
                             // Goto navigation (custom keybindings for navigation)
