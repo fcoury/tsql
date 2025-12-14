@@ -16,6 +16,9 @@ use tui_confirm_dialog::{ConfirmDialog, ConfirmDialogState};
 
 use crate::config::ConnectionEntry;
 
+/// Widget ID for the confirmation dialog (only one dialog is used at a time).
+const CONFIRM_DIALOG_ID: u16 = 0;
+
 /// Result of handling input in the confirmation prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmResult {
@@ -58,7 +61,7 @@ impl ConfirmPrompt {
     /// Create a new confirmation prompt.
     pub fn new(message: impl Into<String>, context: ConfirmContext) -> Self {
         let title = Self::title_for_context(&context);
-        let mut state = ConfirmDialogState::new(0, title, message.into());
+        let mut state = ConfirmDialogState::new(CONFIRM_DIALOG_ID, title, message.into());
         state.open();
         Self { state, context }
     }

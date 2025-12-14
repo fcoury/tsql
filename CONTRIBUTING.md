@@ -14,6 +14,7 @@ Thank you for your interest in contributing to tsql! This document provides guid
 ```bash
 git clone https://github.com/fcoury/tsql.git
 cd tsql
+git submodule update --init --recursive
 cargo build
 ```
 
@@ -75,6 +76,8 @@ tsql/
 │           ├── languages/ # Language configurations
 │           ├── themes/    # Color themes
 │           └── ...
+├── vendor/                # Vendored dependencies (git submodules)
+│   └── tui-confirm-dialog # Confirm dialog widget with mouse support
 ├── tests/                 # Integration tests
 ├── assets/                # Screenshots and images
 └── docs/                  # Documentation
