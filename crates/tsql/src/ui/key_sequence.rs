@@ -379,4 +379,138 @@ mod tests {
         assert!(!handler.is_waiting());
         assert!(!handler.should_show_hint());
     }
+
+    #[test]
+    fn test_schema_table_sequence_select() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "my_table".to_string());
+        assert!(handler.is_waiting());
+
+        let result = handler.process_second_key('s');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::SchemaTableSelect,
+                context: Some("my_table".to_string())
+            })
+        );
+        assert!(!handler.is_waiting());
+    }
+
+    #[test]
+    fn test_schema_table_sequence_insert() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "users".to_string());
+        let result = handler.process_second_key('i');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::SchemaTableInsert,
+                context: Some("users".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn test_schema_table_sequence_update() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "orders".to_string());
+        let result = handler.process_second_key('u');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::SchemaTableUpdate,
+                context: Some("orders".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn test_schema_table_sequence_delete() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "temp".to_string());
+        let result = handler.process_second_key('d');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::SchemaTableDelete,
+                context: Some("temp".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn test_schema_table_sequence_name() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "products".to_string());
+        let result = handler.process_second_key('n');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::SchemaTableName,
+                context: Some("products".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn test_schema_table_sequence_invalid_key() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "table".to_string());
+        let result = handler.process_second_key('x'); // Invalid key
+        assert_eq!(result, KeySequenceResult::Cancelled);
+        assert!(!handler.is_waiting());
+    }
+
+    #[test]
+    fn test_context_cleared_after_completion() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "table1".to_string());
+        handler.process_second_key('s');
+
+        // Start a new sequence without context
+        handler.start(PendingKey::G);
+        let result = handler.process_second_key('g');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoFirst,
+                context: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_context_cleared_after_cancel() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "table1".to_string());
+        handler.cancel();
+
+        // Start a new sequence - context should be cleared
+        handler.start(PendingKey::G);
+        let result = handler.process_second_key('g');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoFirst,
+                context: None
+            })
+        );
+    }
 }

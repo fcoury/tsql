@@ -21,7 +21,7 @@
 - Integration tests (requires Postgres):  
   `TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres cargo test -p tsql --test integration_tests`
 - Format: `cargo fmt --all`
-- Lint (treat warnings as errors): `cargo clippy --all-targets --all-features -- -D warnings`
+- Lint (treat warnings as errors): `cargo clippy --all --all-targets -- -D warnings`
 
 ## Coding Style & Naming Conventions
 
