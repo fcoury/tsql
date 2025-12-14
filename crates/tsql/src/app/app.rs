@@ -1,12 +1,14 @@
-use std::io::Stdout;
+use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use crossterm::execute;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -32,9 +34,9 @@ use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
     quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
     ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
-    ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
-    GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
-    JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
+    ConnectionManagerAction, ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker,
+    GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
+    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
     KeySequenceHandlerWithContext, KeySequenceResult, PendingKey, PickerAction, Priority,
     QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
     SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
@@ -982,6 +984,17 @@ impl App {
             let show_key_hint = self.key_sequence.should_show_hint();
             let pending_key_for_hint = self.key_sequence.pending();
 
+            // Set terminal cursor style based on vim mode
+            // Only show terminal cursor when in Insert mode (Bar) or when cursor is needed
+            let cursor_style = match (self.focus, self.mode) {
+                (Focus::Query, Mode::Insert) => SetCursorStyle::BlinkingBar,
+                (Focus::Query, Mode::Normal) | (Focus::Query, Mode::Visual) => {
+                    SetCursorStyle::SteadyBlock
+                }
+                _ => SetCursorStyle::SteadyBlock,
+            };
+            let _ = execute!(io::stdout(), cursor_style);
+
             terminal.draw(|frame| {
                 let size = frame.area();
 
@@ -1093,12 +1106,31 @@ impl App {
                     .title(query_title.as_str())
                     .border_style(query_border);
 
+                // Choose cursor shape based on vim mode
+                let cursor_shape = match self.mode {
+                    Mode::Normal | Mode::Visual => CursorShape::Block,
+                    Mode::Insert => CursorShape::Bar,
+                };
+
+                let is_editor_focused = matches!(self.focus, Focus::Query);
                 let highlighted_editor =
                     HighlightedTextArea::new(&self.editor.textarea, highlighted_lines.clone())
                         .block(query_block.clone())
-                        .scroll(self.editor_scroll);
+                        .scroll(self.editor_scroll)
+                        .show_cursor(is_editor_focused)
+                        .cursor_shape(cursor_shape);
+
+                // Get cursor screen position before rendering (for Bar/Underline cursors)
+                let cursor_pos = highlighted_editor.cursor_screen_position(query_area);
 
                 frame.render_widget(highlighted_editor, query_area);
+
+                // For Bar/Underline cursor shapes, use the terminal's native cursor
+                if is_editor_focused && cursor_shape != CursorShape::Block {
+                    if let Some(pos) = cursor_pos {
+                        frame.set_cursor_position(pos);
+                    }
+                }
 
                 // Update editor scroll based on cursor position
                 // The inner area height is query_area.height - 2 (for borders)
