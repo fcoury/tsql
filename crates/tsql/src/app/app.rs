@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tui_textarea::{CursorMove, Input};
 
-use super::state::{DbStatus, Focus, Mode, SearchTarget, SidebarSection};
+use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::config::{
     load_connections, save_connections, Action, Config, ConnectionEntry, ConnectionsFile,
     KeyBinding, Keymap,
@@ -1899,6 +1899,12 @@ impl App {
                     }
                     return false;
                 }
+                // Ctrl+HJKL: Directional panel navigation
+                (KeyCode::Char('h' | 'j' | 'k' | 'l'), KeyModifiers::CONTROL) => {
+                    if self.handle_panel_navigation(&key) {
+                        return false;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2022,6 +2028,83 @@ impl App {
         }
 
         false
+    }
+
+    /// Handle directional panel navigation (Ctrl+HJKL).
+    /// Returns true if a navigation key was handled (even if no-op).
+    fn handle_panel_navigation(&mut self, key: &KeyEvent) -> bool {
+        // Only handle Ctrl+HJKL
+        if key.modifiers != KeyModifiers::CONTROL {
+            return false;
+        }
+
+        let direction = match key.code {
+            KeyCode::Char('h') => PanelDirection::Left,
+            KeyCode::Char('j') => PanelDirection::Down,
+            KeyCode::Char('k') => PanelDirection::Up,
+            KeyCode::Char('l') => PanelDirection::Right,
+            _ => return false,
+        };
+
+        // Calculate new focus based on direction and current state
+        let new_focus = self.calculate_focus_for_direction(direction);
+
+        if let Some(focus) = new_focus {
+            self.focus = focus;
+            // Update sidebar focus if moving to sidebar
+            if let Focus::Sidebar(section) = focus {
+                self.sidebar_focus = section;
+            }
+        }
+
+        true // Key was handled (even if no-op)
+    }
+
+    /// Calculate the target focus for a given direction.
+    /// Returns None if there is no panel in that direction (boundary/no-op).
+    fn calculate_focus_for_direction(&self, direction: PanelDirection) -> Option<Focus> {
+        // If sidebar hidden, Ctrl+H/L do nothing
+        if !self.sidebar_visible
+            && matches!(direction, PanelDirection::Left | PanelDirection::Right)
+        {
+            return None;
+        }
+
+        // Navigation is spatially precise based on vertical alignment:
+        // ┌─────────────────┬──────────────────┐
+        // │  Connections    │  Query Editor    │  ← Top row
+        // ├─────────────────┼──────────────────┤
+        // │  Schema         │  Results Grid    │  ← Bottom row
+        // └─────────────────┴──────────────────┘
+
+        match (&self.focus, direction) {
+            // From Query (top-right) - aligned with Connections
+            (Focus::Query, PanelDirection::Left) => {
+                Some(Focus::Sidebar(SidebarSection::Connections))
+            }
+            (Focus::Query, PanelDirection::Down) => Some(Focus::Grid),
+
+            // From Grid (bottom-right) - aligned with Schema
+            (Focus::Grid, PanelDirection::Left) => Some(Focus::Sidebar(SidebarSection::Schema)),
+            (Focus::Grid, PanelDirection::Up) => Some(Focus::Query),
+
+            // From Sidebar(Connections) (top-left) - aligned with Query
+            (Focus::Sidebar(SidebarSection::Connections), PanelDirection::Down) => {
+                Some(Focus::Sidebar(SidebarSection::Schema))
+            }
+            (Focus::Sidebar(SidebarSection::Connections), PanelDirection::Right) => {
+                Some(Focus::Query)
+            }
+
+            // From Sidebar(Schema) (bottom-left) - aligned with Grid
+            (Focus::Sidebar(SidebarSection::Schema), PanelDirection::Up) => {
+                Some(Focus::Sidebar(SidebarSection::Connections))
+            }
+            (Focus::Sidebar(SidebarSection::Schema), PanelDirection::Right) => Some(Focus::Grid),
+
+            // All other combinations are no-ops (at boundary)
+            _ => None,
+        }
     }
 
     /// Handle key events when sidebar is focused
@@ -6537,6 +6620,453 @@ mod tests {
             app.sidebar_focus,
             SidebarSection::Schema,
             "sidebar_focus should be updated to Schema"
+        );
+    }
+
+    // ========== Panel Navigation Tests (Ctrl+HJKL) ==========
+
+    #[test]
+    #[serial]
+    fn test_ctrl_h_from_query_moves_to_sidebar_connections() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        // Close auto-opened pickers
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Query;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Connections),
+            "Ctrl+H from Query should move to Sidebar(Connections)"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Connections,
+            "sidebar_focus should be updated"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_h_from_grid_moves_to_sidebar_schema() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Grid;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "Ctrl+H from Grid should move to Sidebar(Schema)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_h_noop_when_sidebar_hidden() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Query;
+        app.sidebar_visible = false;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "Ctrl+H should be no-op when sidebar is hidden"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_j_from_query_moves_to_grid() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Grid,
+            "Ctrl+J from Query should move to Grid"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_k_from_grid_moves_to_query() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Grid;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "Ctrl+K from Grid should move to Query"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_l_from_sidebar_connections_moves_to_query() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.sidebar_focus = SidebarSection::Connections;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "Ctrl+L from Sidebar(Connections) should move to Query"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_l_from_sidebar_schema_moves_to_grid() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.sidebar_focus = SidebarSection::Schema;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Grid,
+            "Ctrl+L from Sidebar(Schema) should move to Grid"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_j_within_sidebar_moves_to_schema() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.sidebar_focus = SidebarSection::Connections;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "Ctrl+J from Sidebar(Connections) should move to Sidebar(Schema)"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Schema,
+            "sidebar_focus should be updated"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_k_within_sidebar_moves_to_connections() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.sidebar_focus = SidebarSection::Schema;
+        app.sidebar_visible = true;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Connections),
+            "Ctrl+K from Sidebar(Schema) should move to Sidebar(Connections)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_hjkl_noop_in_insert_mode() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Query;
+        app.sidebar_visible = true;
+        app.mode = Mode::Insert; // Insert mode should not handle Ctrl+HJKL
+
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "Ctrl+H should be no-op in Insert mode"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_boundary_noop_ctrl_k_from_query() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+
+        // Ctrl+K from Query (nothing above) should be no-op
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "Ctrl+K from Query should be no-op (at boundary)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_boundary_noop_ctrl_j_from_grid() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.focus = Focus::Grid;
+        app.mode = Mode::Normal;
+
+        // Ctrl+J from Grid (nothing below) should be no-op
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert_eq!(
+            app.focus,
+            Focus::Grid,
+            "Ctrl+J from Grid should be no-op (at boundary)"
         );
     }
 }
