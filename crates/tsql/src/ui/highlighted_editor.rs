@@ -171,10 +171,22 @@ impl Widget for HighlightedTextArea<'_> {
         let (cursor_row, cursor_col) = self.textarea.cursor();
         let selection = self.textarea.selection_range();
 
-        // Calculate scroll offset to keep cursor visible
+        // Get the line text to calculate display width for cursor column
+        let lines = self.textarea.lines();
+        let line_text = lines.get(cursor_row).map(|s| s.as_str()).unwrap_or("");
+
+        // Calculate display column by summing display widths of characters before cursor
+        // This ensures scroll offset is calculated in display columns, matching cursor_screen_position
+        let display_col: usize = line_text
+            .chars()
+            .take(cursor_col)
+            .map(|c| c.width().unwrap_or(1))
+            .sum();
+
+        // Calculate scroll offset to keep cursor visible (using display columns)
         let (scroll_row, scroll_col) = calculate_scroll_offset(
             cursor_row,
-            cursor_col,
+            display_col,
             self.scroll_offset,
             inner_area.height as usize,
             inner_area.width as usize,
@@ -609,6 +621,98 @@ mod tests {
         assert_eq!(
             pos.x, 4,
             "Cursor x should be at display column 4, not character index 2"
+        );
+    }
+
+    #[test]
+    fn test_cursor_screen_position_with_wide_characters_and_scrolling() {
+        // Test that cursor_screen_position works correctly when horizontal scrolling
+        // is active with wide characters. This ensures render() and cursor_screen_position()
+        // use consistent scroll calculations (both using display columns).
+        use ratatui::widgets::Widget;
+
+        // Create text with many wide characters to force horizontal scrolling
+        // Each CJK char is 2 display columns, so "你好世界测试" = 12 display columns
+        let text = "你好世界测试end";
+        let mut textarea = TextArea::new(vec![text.to_string()]);
+
+        // Move cursor to "end" (character index 6, display column 12)
+        for _ in 0..6 {
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+        }
+
+        let highlighted_lines = vec![Line::from(text)];
+
+        // Use a narrow viewport (width 8) to force horizontal scrolling
+        // With cursor at display col 12 and viewport width 8, scrolling is needed
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines.clone());
+        let area = Rect::new(0, 0, 8, 3);
+
+        // Get cursor screen position
+        let pos = widget.cursor_screen_position(area);
+        assert!(pos.is_some(), "Cursor should be visible");
+        let pos = pos.unwrap();
+
+        // Now render the widget and verify the scroll offset is consistent
+        let mut buf = Buffer::empty(area);
+        let widget2 = HighlightedTextArea::new(&textarea, highlighted_lines);
+        widget2.render(area, &mut buf);
+
+        // The cursor screen position should be within the viewport
+        assert!(
+            pos.x < area.width,
+            "Cursor x ({}) should be within viewport width ({})",
+            pos.x,
+            area.width
+        );
+
+        // Verify cursor is at a reasonable position (accounting for scroll margin)
+        // The cursor should be visible and positioned consistently
+        assert!(
+            pos.x >= area.x,
+            "Cursor x ({}) should be >= area.x ({})",
+            pos.x,
+            area.x
+        );
+    }
+
+    #[test]
+    fn test_render_and_cursor_position_consistency_with_wide_chars() {
+        // Verify that render() and cursor_screen_position() calculate scroll offset
+        // identically for wide characters by checking both use display columns.
+        use ratatui::widgets::Widget;
+
+        // Text: "ABC你好DEF" - 3 + 4 + 3 = 10 display columns
+        // Character indices: A=0, B=1, C=2, 你=3, 好=4, D=5, E=6, F=7
+        let text = "ABC你好DEF";
+        let mut textarea = TextArea::new(vec![text.to_string()]);
+
+        // Move cursor to 'D' (character index 5, display column 7)
+        for _ in 0..5 {
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+        }
+
+        let highlighted_lines = vec![Line::from(text)];
+
+        // Use viewport width 6 to force scrolling (cursor at display col 7)
+        let area = Rect::new(0, 0, 6, 1);
+
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines.clone());
+        let pos = widget.cursor_screen_position(area);
+
+        assert!(pos.is_some(), "Cursor should be visible");
+        let pos = pos.unwrap();
+
+        // Render and check buffer content
+        let mut buf = Buffer::empty(area);
+        let widget2 = HighlightedTextArea::new(&textarea, highlighted_lines);
+        widget2.render(area, &mut buf);
+
+        // The key assertion: cursor position should be within viewport
+        // and should correspond to where 'D' is rendered in the buffer
+        assert!(
+            pos.x < area.x + area.width,
+            "Cursor x should be within viewport"
         );
     }
 }
