@@ -444,4 +444,18 @@ impl Sidebar {
             .map(|area| is_inside(x, y, area))
             .unwrap_or(false)
     }
+
+    /// Get all currently expanded node paths from the schema tree.
+    /// Returns a Vec of identifier paths for serialization.
+    pub fn get_expanded_nodes(&self) -> Vec<Vec<String>> {
+        self.schema_state.opened().iter().cloned().collect()
+    }
+
+    /// Restore expanded nodes from saved state.
+    /// Opens each node path in the tree.
+    pub fn restore_expanded_nodes(&mut self, paths: &[Vec<String>]) {
+        for path in paths {
+            self.schema_state.open(path.clone());
+        }
+    }
 }

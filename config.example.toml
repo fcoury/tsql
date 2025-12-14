@@ -66,6 +66,11 @@ completion_delay_ms = 100
 # Maximum history entries to keep
 max_history = 1000
 
+# Persist session state between launches (query, connection, UI state)
+# When enabled, tsql remembers your query, active connection, sidebar
+# visibility, and expanded schema nodes when you quit
+persist_session = true
+
 # Connection settings
 [connection]
 # Default database URL (can be overridden by DATABASE_URL env var or CLI arg)

@@ -13,7 +13,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use tsql::app::App;
-use tsql::config;
+use tsql::config::{self, load_connections};
+use tsql::session::load_session;
 use tsql::ui::GridModel;
 
 fn print_version() {
@@ -68,6 +69,16 @@ fn main() -> Result<()> {
         config::Config::default()
     });
 
+    // Load session state if persistence is enabled
+    let session = if cfg.editor.persist_session {
+        load_session().unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to load session: {}", e);
+            Default::default()
+        })
+    } else {
+        Default::default()
+    };
+
     // Connection string priority: CLI arg > DATABASE_URL env var > config file
     let conn_str = if args.len() > 1 && !args[1].starts_with('-') {
         // First argument is the connection string
@@ -88,9 +99,35 @@ fn main() -> Result<()> {
         rt.handle().clone(),
         db_events_tx,
         db_events_rx,
-        conn_str,
+        conn_str.clone(),
         cfg,
     );
+
+    // Apply session state (editor content, sidebar visibility, pending schema expanded)
+    let session_connection = app.apply_session_state(session);
+
+    // Auto-connect from session if no CLI/env connection was specified
+    if conn_str.is_none() {
+        if let Some(conn_name) = session_connection {
+            // Verify connection still exists
+            let connections = load_connections().unwrap_or_default();
+            if let Some(entry) = connections.find_by_name(&conn_name) {
+                // Check if password is available (not requiring prompt)
+                match entry.get_password() {
+                    Ok(Some(_)) | Ok(None) => {
+                        // Password available or not needed - auto-connect
+                        app.connect_to_entry(entry.clone());
+                    }
+                    Err(_) => {
+                        // Password retrieval failed - skip auto-connect
+                        // User can manually connect
+                    }
+                }
+            }
+            // If connection doesn't exist, silently skip auto-connect
+        }
+    }
+
     let res = app.run(&mut terminal);
 
     restore_terminal(terminal)?;
