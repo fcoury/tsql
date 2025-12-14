@@ -2768,6 +2768,11 @@ impl App {
             return false;
         }
 
+        // Handle numeric commands (:N to go to row N)
+        if let Ok(row_num) = cmd.parse::<usize>() {
+            return self.goto_result_row(row_num);
+        }
+
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         let command = parts[0];
         let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -2848,6 +2853,28 @@ impl App {
             }
         }
 
+        false
+    }
+
+    fn goto_result_row(&mut self, row_num: usize) -> bool {
+        if self.grid.rows.is_empty() {
+            self.last_status = Some("No results to navigate".to_string());
+            return false;
+        }
+
+        let target_row = if row_num == 0 {
+            0
+        } else {
+            (row_num - 1).min(self.grid.rows.len() - 1)
+        };
+
+        self.grid_state.cursor_row = target_row;
+        self.focus = Focus::Grid;
+        self.last_status = Some(format!(
+            "Row {} of {}",
+            target_row + 1,
+            self.grid.rows.len()
+        ));
         false
     }
 
