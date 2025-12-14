@@ -723,10 +723,8 @@ pub struct App {
     /// Uses a simple enum since SetCursorStyle doesn't implement PartialEq.
     last_cursor_style: Option<CachedCursorStyle>,
 
-    /// Throbber animation state for loading indicator.
-    throbber_state: ThrobberState,
-    /// When the current query started (for elapsed time display).
-    query_start_time: Option<Instant>,
+    /// Query execution UI state (spinner animation, timing).
+    query_ui: QueryRunUi,
 }
 
 /// Local enum to track cursor style changes (SetCursorStyle doesn't implement PartialEq).
@@ -734,6 +732,33 @@ pub struct App {
 enum CachedCursorStyle {
     BlinkingBar,
     SteadyBlock,
+}
+
+/// Groups spinner and timing state for query execution UI.
+/// Keeps the large App struct more maintainable.
+#[derive(Default)]
+struct QueryRunUi {
+    /// Throbber animation state for loading indicator.
+    throbber_state: ThrobberState,
+    /// When the current query started (for elapsed time display).
+    start_time: Option<Instant>,
+}
+
+impl QueryRunUi {
+    /// Clears the query timing state.
+    fn clear(&mut self) {
+        self.start_time = None;
+    }
+
+    /// Marks the start of a new query.
+    fn start(&mut self) {
+        self.start_time = Some(Instant::now());
+    }
+
+    /// Advances the throbber animation.
+    fn tick(&mut self) {
+        self.throbber_state.calc_next();
+    }
 }
 
 impl App {
@@ -841,8 +866,7 @@ impl App {
             pending_schema_expanded: None,
             last_cursor_style: None,
 
-            throbber_state: ThrobberState::default(),
-            query_start_time: None,
+            query_ui: QueryRunUi::default(),
         };
 
         // Load saved connections
@@ -989,7 +1013,7 @@ impl App {
 
             // Advance throbber animation when query is running
             if self.db.running {
-                self.throbber_state.calc_next();
+                self.query_ui.tick();
             }
 
             // Pre-compute highlighted lines before the draw closure
@@ -1299,10 +1323,14 @@ impl App {
                         )
                         .throbber_set(BRAILLE_SIX);
 
-                    frame.render_stateful_widget(throbber, chunks[0], &mut self.throbber_state);
+                    frame.render_stateful_widget(
+                        throbber,
+                        chunks[0],
+                        &mut self.query_ui.throbber_state,
+                    );
 
                     // Render elapsed time
-                    if let Some(start_time) = self.query_start_time {
+                    if let Some(start_time) = self.query_ui.start_time {
                         let elapsed = start_time.elapsed();
                         let elapsed_text = format!("{:.1}s elapsed", elapsed.as_secs_f64());
                         let elapsed_widget = Paragraph::new(elapsed_text)
@@ -1655,7 +1683,7 @@ impl App {
             let poll_duration = if self.db.running {
                 Duration::from_millis(16) // ~60 FPS when query running
             } else {
-                Duration::from_millis(50) // Normal 20 FPS when idle
+                Duration::from_millis(100) // 10 FPS when idle (reduces CPU usage)
             };
 
             if event::poll(poll_duration)? {
@@ -3025,7 +3053,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Updating...".to_string());
-        self.query_start_time = Some(Instant::now());
+        self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
 
@@ -3178,6 +3206,7 @@ impl App {
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
+                self.query_ui.clear();
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
@@ -3284,7 +3313,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
-        self.query_start_time = Some(Instant::now());
+        self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
         let started = Instant::now();
@@ -4279,6 +4308,7 @@ impl App {
         self.db.conn_str = Some(conn_str.clone());
         self.db.client = None;
         self.db.running = false;
+        self.query_ui.clear();
 
         self.last_status = Some("Connecting...".to_string());
 
@@ -4962,7 +4992,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
-        self.query_start_time = Some(Instant::now());
+        self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
         let started = Instant::now();
@@ -5116,6 +5146,7 @@ impl App {
                 self.db.client = Some(client);
                 self.db.cancel_token = Some(cancel_token);
                 self.db.running = false;
+                self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
                 // Load schema for completion
                 self.load_schema();
@@ -5124,6 +5155,7 @@ impl App {
                 self.db.status = DbStatus::Error;
                 self.db.client = None;
                 self.db.running = false;
+                self.query_ui.clear();
                 self.current_connection_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
@@ -5132,13 +5164,14 @@ impl App {
                 self.db.status = DbStatus::Error;
                 self.db.client = None;
                 self.db.running = false;
+                self.query_ui.clear();
                 self.current_connection_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
             DbEvent::QueryFinished { result } => {
                 self.db.running = false;
-                self.query_start_time = None;
+                self.query_ui.clear();
                 self.db.last_command_tag = result.command_tag.clone();
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
@@ -5177,13 +5210,13 @@ impl App {
             }
             DbEvent::QueryError { error } => {
                 self.db.running = false;
-                self.query_start_time = None;
+                self.query_ui.clear();
                 self.last_status = Some("Query error (see above)".to_string());
                 self.last_error = Some(error);
             }
             DbEvent::QueryCancelled => {
                 self.db.running = false;
-                self.query_start_time = None;
+                self.query_ui.clear();
                 self.last_status = Some("Query cancelled".to_string());
             }
             DbEvent::SchemaLoaded { tables } => {
@@ -5198,7 +5231,7 @@ impl App {
             }
             DbEvent::CellUpdated { row, col, value } => {
                 self.db.running = false;
-                self.query_start_time = None;
+                self.query_ui.clear();
                 // Update the grid cell
                 if let Some(grid_row) = self.grid.rows.get_mut(row) {
                     if let Some(cell) = grid_row.get_mut(col) {
