@@ -115,7 +115,7 @@ impl<'a> JsonEditorModal<'a> {
             highlighter,
             column_name,
             column_type,
-            original_value: value,
+            original_value: formatted_value,
             row,
             col,
             is_valid_json: is_valid,
@@ -951,8 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn test_json_editor_modified_after_formatting() {
-        // Unformatted JSON gets pretty-printed, so it differs from original
+    fn test_json_editor_not_modified_after_auto_formatting() {
+        // Unformatted JSON gets pretty-printed on open, but should NOT be marked as modified
+        // The original_value should be stored as the formatted value, not the input value
         let unformatted = r#"{"key":"value"}"#;
         let editor = JsonEditorModal::new(
             unformatted.to_string(),
@@ -962,14 +963,15 @@ mod tests {
             0,
         );
 
-        // After formatting, content differs from original
+        // After formatting, content differs from the input
         assert!(
             editor.content() != unformatted,
-            "Formatted content should differ from unformatted original"
+            "Formatted content should differ from unformatted input"
         );
+        // But the editor should NOT be marked as modified since no user changes were made
         assert!(
-            editor.is_modified(),
-            "Editor should be modified when content was formatted"
+            !editor.is_modified(),
+            "Editor should NOT be modified on first open, even after auto-formatting"
         );
     }
 
@@ -1021,21 +1023,37 @@ mod tests {
     fn test_json_editor_esc_with_changes_returns_request_close() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        // Unformatted JSON will be auto-formatted, making it modified
         let mut editor = JsonEditorModal::new(
-            r#"{"key":"value"}"#.to_string(),
-            "data".to_string(),
-            "jsonb".to_string(),
+            "hello".to_string(),
+            "notes".to_string(),
+            "text".to_string(),
             0,
             0,
         );
 
-        // Verify it's modified (due to formatting)
+        // Should start unmodified
+        assert!(!editor.is_modified());
+
+        // Enter insert mode and make a change
+        let i_key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        editor.handle_key(i_key);
+        assert_eq!(editor.mode, VimMode::Insert);
+
+        // Type some text
+        let x_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        editor.handle_key(x_key);
+
+        // Exit insert mode
+        let esc1 = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        editor.handle_key(esc1);
+        assert_eq!(editor.mode, VimMode::Normal);
+
+        // Now verify it's modified
         assert!(editor.is_modified());
 
         // Press Esc in Normal mode with changes
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        let result = editor.handle_key(esc);
+        let esc2 = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = editor.handle_key(esc2);
 
         match result {
             JsonEditorAction::RequestClose { row, col } => {
@@ -1076,13 +1094,29 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut editor = JsonEditorModal::new(
-            r#"{"key":"value"}"#.to_string(),
-            "data".to_string(),
-            "jsonb".to_string(),
+            "hello".to_string(),
+            "notes".to_string(),
+            "text".to_string(),
             0,
             0,
         );
 
+        // Should start unmodified
+        assert!(!editor.is_modified());
+
+        // Enter insert mode and make a change
+        let i_key = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        editor.handle_key(i_key);
+
+        // Type some text
+        let x_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        editor.handle_key(x_key);
+
+        // Exit insert mode
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        editor.handle_key(esc);
+
+        // Now verify it's modified
         assert!(editor.is_modified());
 
         let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
