@@ -4108,12 +4108,7 @@ impl App {
                 Self::quote_identifier_always(table)
             ),
             IdentifierStyle::Minimal => {
-                // Heuristic: omit schema qualification for the common "public" schema.
-                if schema == "public" {
-                    quote_identifier(table)
-                } else {
-                    format!("{}.{}", quote_identifier(schema), quote_identifier(table))
-                }
+                format!("{}.{}", quote_identifier(schema), quote_identifier(table))
             }
         }
     }
