@@ -1380,7 +1380,7 @@ impl App {
                 }
 
                 // Render confirmation prompt if active (topmost layer)
-                if let Some(ref prompt) = self.confirm_prompt {
+                if let Some(ref mut prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
                 }
             })?;
@@ -1402,7 +1402,9 @@ impl App {
                         }
                     }
                     Event::Mouse(mouse) => {
-                        self.on_mouse(mouse);
+                        if self.on_mouse(mouse) {
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -1414,7 +1416,7 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // Handle confirmation prompt when active (highest priority)
-        if let Some(prompt) = self.confirm_prompt.take() {
+        if let Some(mut prompt) = self.confirm_prompt.take() {
             match prompt.handle_key(key) {
                 ConfirmResult::Confirmed => {
                     return self.handle_confirm_confirmed(prompt.context().clone());
@@ -1941,9 +1943,27 @@ impl App {
         }
     }
 
-    /// Handle mouse events
-    fn on_mouse(&mut self, mouse: MouseEvent) {
+    /// Handle mouse events. Returns true if the app should quit.
+    fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         // Route mouse events to modals in priority order
+
+        // Confirmation prompt has highest priority (topmost modal)
+        if let Some(mut prompt) = self.confirm_prompt.take() {
+            match prompt.handle_mouse(mouse) {
+                ConfirmResult::Confirmed => {
+                    return self.handle_confirm_confirmed(prompt.context().clone());
+                }
+                ConfirmResult::Cancelled => {
+                    self.handle_confirm_cancelled(prompt.context().clone());
+                    return false;
+                }
+                ConfirmResult::Pending => {
+                    // Put it back, wait for valid input
+                    self.confirm_prompt = Some(prompt);
+                    return false;
+                }
+            }
+        }
 
         // Help popup has mouse support
         if let Some(ref mut help_popup) = self.help_popup {
@@ -1954,7 +1974,7 @@ impl App {
                 }
                 HelpAction::Continue => {}
             }
-            return;
+            return false;
         }
 
         // History picker has mouse support
@@ -1973,7 +1993,7 @@ impl App {
                 }
                 PickerAction::Continue => {}
             }
-            return;
+            return false;
         }
 
         // Connection picker has mouse support
@@ -1998,7 +2018,7 @@ impl App {
                 }
                 PickerAction::Continue => {}
             }
-            return;
+            return false;
         }
 
         // Connection manager has mouse support (but not if connection_form is open on top)
@@ -2007,17 +2027,14 @@ impl App {
                 let action = manager.handle_mouse(mouse);
                 // Handle action (the method already exists)
                 self.handle_connection_manager_action(action);
-                return;
+                return false;
             }
         }
 
         // Don't process mouse events for other modals without mouse support
-        if self.confirm_prompt.is_some()
-            || self.json_editor.is_some()
-            || self.row_detail.is_some()
-            || self.connection_form.is_some()
+        if self.json_editor.is_some() || self.row_detail.is_some() || self.connection_form.is_some()
         {
-            return;
+            return false;
         }
 
         // Check if mouse is over sidebar first
@@ -2037,7 +2054,7 @@ impl App {
                     if let Some(action) = action {
                         self.handle_sidebar_action(action);
                     }
-                    return;
+                    return false;
                 }
             }
         }
@@ -2055,6 +2072,7 @@ impl App {
             }
             _ => {}
         }
+        false
     }
 
     /// Handle a mouse click at the given position

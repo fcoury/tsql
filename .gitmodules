@@ -1,0 +1,3 @@
+[submodule "vendor/tui-confirm-dialog"]
+	path = vendor/tui-confirm-dialog
+	url = git@github.com:fcoury/tui-confirm-dialog.git

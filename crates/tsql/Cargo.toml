@@ -42,6 +42,9 @@ url.workspace = true
 # Tree widget for sidebar
 tui-tree-widget.workspace = true
 
+# Confirm dialog widget
+tui_confirm_dialog.workspace = true
+
 # Internal crate
 tui-syntax = { path = "../tui-syntax", version = "0.1.0" }
 
