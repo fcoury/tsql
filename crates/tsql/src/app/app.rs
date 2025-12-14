@@ -27,6 +27,7 @@ use crate::config::{
     KeyBinding, Keymap,
 };
 use crate::history::{History, HistoryEntry};
+use crate::session::{save_session, SessionState};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
     quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
@@ -712,6 +713,8 @@ pub struct App {
     pub sidebar_focus: SidebarSection,
     /// Sidebar width in characters.
     pub sidebar_width: u16,
+    /// Pending schema expanded paths to apply after schema loads.
+    pending_schema_expanded: Option<Vec<Vec<String>>>,
 }
 
 impl App {
@@ -816,6 +819,7 @@ impl App {
             sidebar_visible: false,
             sidebar_focus: SidebarSection::Connections,
             sidebar_width: 30,
+            pending_schema_expanded: None,
         };
 
         // Load saved connections
@@ -846,6 +850,50 @@ impl App {
         }
 
         app
+    }
+
+    /// Capture current session state for persistence.
+    pub fn capture_session_state(&self) -> SessionState {
+        SessionState {
+            connection_name: self.current_connection_name.clone(),
+            editor_content: self.editor.text(),
+            schema_expanded: self.sidebar.get_expanded_nodes(),
+            sidebar_visible: self.sidebar_visible,
+        }
+    }
+
+    /// Save session state to disk.
+    pub fn save_session(&self) -> Result<()> {
+        let state = self.capture_session_state();
+        save_session(&state)
+    }
+
+    /// Apply restored session state.
+    /// Returns the connection name to auto-connect to, if any.
+    pub fn apply_session_state(&mut self, state: SessionState) -> Option<String> {
+        // Restore editor content
+        if !state.editor_content.is_empty() {
+            self.editor.set_text(state.editor_content);
+            self.editor.mark_saved();
+        }
+
+        // Restore sidebar visibility
+        self.sidebar_visible = state.sidebar_visible;
+
+        // Store pending schema expanded for later application when schema loads
+        if !state.schema_expanded.is_empty() {
+            self.pending_schema_expanded = Some(state.schema_expanded);
+        }
+
+        // Return connection name for auto-connect handling
+        state.connection_name
+    }
+
+    /// Apply pending schema expanded state after schema loads.
+    fn apply_pending_schema_expanded(&mut self) {
+        if let Some(paths) = self.pending_schema_expanded.take() {
+            self.sidebar.restore_expanded_nodes(&paths);
+        }
     }
 
     /// Build the grid keymap from defaults + config overrides
@@ -1499,6 +1547,13 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // Save session state before exiting (if enabled)
+        if self.config.editor.persist_session {
+            if let Err(e) = self.save_session() {
+                eprintln!("Warning: Failed to save session: {}", e);
             }
         }
 
@@ -4040,7 +4095,7 @@ impl App {
     }
 
     /// Connect to a saved connection entry.
-    fn connect_to_entry(&mut self, entry: ConnectionEntry) {
+    pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
         // Try to get the password
         let password = match entry.get_password() {
             Ok(Some(pwd)) => Some(pwd),
@@ -4915,6 +4970,8 @@ impl App {
             DbEvent::SchemaLoaded { tables } => {
                 self.schema_cache.tables = tables;
                 self.schema_cache.loaded = true;
+                // Apply any pending schema expanded state from session restore
+                self.apply_pending_schema_expanded();
                 self.last_status = Some(format!(
                     "Schema loaded: {} tables",
                     self.schema_cache.tables.len()

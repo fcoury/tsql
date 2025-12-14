@@ -79,6 +79,8 @@ pub struct EditorConfig {
     pub completion_delay_ms: u32,
     /// Maximum history entries to keep
     pub max_history: usize,
+    /// Persist session state (query, connection, UI state) between launches
+    pub persist_session: bool,
 }
 
 impl Default for EditorConfig {
@@ -92,6 +94,7 @@ impl Default for EditorConfig {
             auto_completion: true,
             completion_delay_ms: 100,
             max_history: 1000,
+            persist_session: true,
         }
     }
 }
