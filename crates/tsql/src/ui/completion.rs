@@ -204,8 +204,12 @@ impl SchemaCache {
         }
     }
 
-    /// Build a tree structure for the sidebar schema browser
+    /// Build a tree structure for the sidebar schema browser.
+    ///
+    /// Identifier encoding: components are percent-encoded to allow `:` in names.
+    /// Format: `prefix:encoded_schema:encoded_table:encoded_column`
     pub fn build_tree_items(&self) -> Vec<tui_tree_widget::TreeItem<'static, String>> {
+        use crate::app::encode_schema_id_component;
         use std::collections::BTreeMap;
         use tui_tree_widget::TreeItem;
 
@@ -224,19 +228,22 @@ impl SchemaCache {
         let mut tree_items = Vec::new();
 
         for (schema_name, tables) in schemas {
-            let schema_id = format!("schema:{}", schema_name);
+            let enc_schema = encode_schema_id_component(&schema_name);
+            let schema_id = format!("schema:{}", enc_schema);
 
             // Build table items with their columns
             let mut table_items = Vec::new();
             for table in tables {
-                let table_id = format!("table:{}:{}", schema_name, table.name);
+                let enc_table = encode_schema_id_component(&table.name);
+                let table_id = format!("table:{}:{}", enc_schema, enc_table);
 
                 // Build column items
                 let column_items: Vec<TreeItem<'static, String>> = table
                     .columns
                     .iter()
                     .map(|col| {
-                        let col_id = format!("column:{}:{}:{}", schema_name, table.name, col.name);
+                        let enc_col = encode_schema_id_component(&col.name);
+                        let col_id = format!("column:{}:{}:{}", enc_schema, enc_table, enc_col);
                         TreeItem::new_leaf(col_id, col.name.clone())
                     })
                     .collect();

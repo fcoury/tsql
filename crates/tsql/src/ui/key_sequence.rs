@@ -16,11 +16,13 @@ pub enum PendingKey {
 }
 
 impl PendingKey {
-    /// Returns the display character for this pending key
+    /// Returns the display character for this pending key.
+    /// Uses ASCII-safe characters to avoid terminal width issues.
     pub fn display_char(&self) -> char {
         match self {
             PendingKey::G => 'g',
-            PendingKey::SchemaTable => '⏎',
+            // Use 'E' (Enter) instead of '⏎' to avoid ambiguous-width rendering
+            PendingKey::SchemaTable => 'E',
         }
     }
 }

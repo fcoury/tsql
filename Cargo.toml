@@ -46,6 +46,9 @@ keyring = "3"
 # URL parsing
 url = "2"
 
+# Percent encoding for safe identifier serialization
+percent-encoding = "2"
+
 # Tree widget for sidebar
 tui-tree-widget = "0.23"
 

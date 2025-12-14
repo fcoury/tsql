@@ -1922,6 +1922,7 @@ dependencies = [
  "dotenvy",
  "keyring",
  "nucleo-matcher",
+ "percent-encoding",
  "ratatui",
  "serde",
  "serde_json",

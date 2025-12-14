@@ -7,6 +7,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -66,35 +67,61 @@ enum SchemaTreeSelection {
     },
 }
 
+/// Characters to percent-encode in schema tree identifiers (`:` is the delimiter).
+const SCHEMA_ID_ENCODE_SET: &AsciiSet = &CONTROLS.add(b':').add(b'%');
+
+/// Percent-encode a component for use in schema tree identifiers.
+pub fn encode_schema_id_component(s: &str) -> String {
+    utf8_percent_encode(s, SCHEMA_ID_ENCODE_SET).to_string()
+}
+
+/// Percent-decode a component from a schema tree identifier.
+fn decode_schema_id_component(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
 fn parse_schema_tree_identifier(identifier: &str) -> SchemaTreeSelection {
     if let Some(schema) = identifier.strip_prefix("schema:") {
-        return SchemaTreeSelection::Schema {
-            schema: schema.to_string(),
-        };
+        let schema = decode_schema_id_component(schema);
+        if !schema.is_empty() {
+            return SchemaTreeSelection::Schema { schema };
+        }
     }
 
     if let Some(rest) = identifier.strip_prefix("table:") {
         let mut parts = rest.splitn(2, ':');
-        let schema = parts.next().unwrap_or_default();
-        let table = parts.next().unwrap_or_default();
+        let schema = parts
+            .next()
+            .map(decode_schema_id_component)
+            .unwrap_or_default();
+        let table = parts
+            .next()
+            .map(decode_schema_id_component)
+            .unwrap_or_default();
         if !schema.is_empty() && !table.is_empty() {
-            return SchemaTreeSelection::Table {
-                schema: schema.to_string(),
-                table: table.to_string(),
-            };
+            return SchemaTreeSelection::Table { schema, table };
         }
     }
 
     if let Some(rest) = identifier.strip_prefix("column:") {
         let mut parts = rest.splitn(3, ':');
-        let schema = parts.next().unwrap_or_default();
-        let table = parts.next().unwrap_or_default();
-        let column = parts.next().unwrap_or_default();
+        let schema = parts
+            .next()
+            .map(decode_schema_id_component)
+            .unwrap_or_default();
+        let table = parts
+            .next()
+            .map(decode_schema_id_component)
+            .unwrap_or_default();
+        let column = parts
+            .next()
+            .map(decode_schema_id_component)
+            .unwrap_or_default();
         if !schema.is_empty() && !table.is_empty() && !column.is_empty() {
             return SchemaTreeSelection::Column {
-                schema: schema.to_string(),
-                table: table.to_string(),
-                column: column.to_string(),
+                schema,
+                table,
+                column,
             };
         }
     }
@@ -1699,7 +1726,8 @@ impl App {
                             return false;
                         }
                         KeySequenceResult::Cancelled => {
-                            // Invalid second key - let it fall through to normal handling.
+                            // Invalid second key - show feedback and let it fall through.
+                            self.last_status = Some("Invalid key sequence".to_string());
                         }
                         _ => {}
                     }
@@ -4095,6 +4123,16 @@ impl App {
         }
     }
 
+    /// Format just the table name (without schema qualification).
+    fn format_table_name_only(&self, table: &str) -> String {
+        use crate::config::IdentifierStyle;
+
+        match self.config.sql.identifier_style {
+            IdentifierStyle::QualifiedQuoted => Self::quote_identifier_always(table),
+            IdentifierStyle::Minimal => quote_identifier(table),
+        }
+    }
+
     fn schema_table_columns(&self, schema: &str, table: &str) -> Option<Vec<String>> {
         self.schema_cache
             .tables
@@ -4229,9 +4267,7 @@ impl App {
                     KeySequenceAction::SchemaTableInsert => self.build_insert_template(&ctx),
                     KeySequenceAction::SchemaTableUpdate => self.build_update_template(&ctx),
                     KeySequenceAction::SchemaTableDelete => self.build_delete_template(&ctx),
-                    KeySequenceAction::SchemaTableName => {
-                        self.format_table_ref(&ctx.schema, &ctx.table)
-                    }
+                    KeySequenceAction::SchemaTableName => self.format_table_name_only(&ctx.table),
                     _ => return,
                 };
 
