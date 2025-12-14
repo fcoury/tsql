@@ -1466,26 +1466,54 @@ impl App {
             return false;
         }
 
-        // Esc: cancel running query, or return to Normal, close help, dismiss errors.
+        // Esc: cancel running query, close popups, or quit if nothing is open.
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
             if self.db.running {
                 self.cancel_query();
                 return false;
             }
 
-            // Cancel any pending multi-key sequence (e.g., started with 'g')
-            self.key_sequence.cancel();
+            // Check if anything is open that needs to be closed
+            let has_open_ui = self.help_popup.is_some()
+                || self.search.active
+                || self.command.active
+                || self.completion.active
+                || self.cell_editor.active
+                || self.history_picker.is_some()
+                || self.connection_picker.is_some()
+                || self.pending_key.is_some()
+                || self.last_error.is_some()
+                || self.key_sequence.is_waiting()
+                || self.mode != Mode::Normal;
 
-            self.help_popup = None;
-            self.search.close();
-            self.command.close();
-            self.completion.close();
-            self.cell_editor.close();
-            self.history_picker = None;
-            self.connection_picker = None;
-            self.pending_key = None;
-            self.last_error = None;
-            self.mode = Mode::Normal;
+            if has_open_ui {
+                // Cancel any pending multi-key sequence (e.g., started with 'g')
+                self.key_sequence.cancel();
+
+                self.help_popup = None;
+                self.search.close();
+                self.command.close();
+                self.completion.close();
+                self.cell_editor.close();
+                self.history_picker = None;
+                self.connection_picker = None;
+                self.pending_key = None;
+                self.last_error = None;
+                self.mode = Mode::Normal;
+            } else {
+                // Nothing open - behave like 'q' and show quit confirmation
+                if self.editor.is_modified() {
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "You have unsaved changes. Quit anyway?",
+                        ConfirmContext::QuitApp,
+                    ));
+                } else {
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "Are you sure you want to quit?",
+                        ConfirmContext::QuitAppClean,
+                    ));
+                }
+            }
             return false;
         }
 
