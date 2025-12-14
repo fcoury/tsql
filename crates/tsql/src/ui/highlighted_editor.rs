@@ -227,17 +227,6 @@ impl Widget for HighlightedTextArea<'_> {
             final_lines.push(result_line);
         }
 
-        // Handle completely empty editor - show block cursor on empty line (only if cursor is visible)
-        // Bar and Underline cursors use the terminal's native cursor
-        if final_lines.is_empty() {
-            if self.show_cursor && self.cursor_shape == CursorShape::Block {
-                let cursor_span = Span::styled(" ", self.cursor_style);
-                final_lines.push(Line::from(vec![cursor_span]));
-            } else {
-                final_lines.push(Line::from(vec![]));
-            }
-        }
-
         // Render the highlighted text as a Paragraph with scroll offset
         let paragraph = Paragraph::new(final_lines).scroll((scroll_row as u16, scroll_col as u16));
         paragraph.render(inner_area, buf);

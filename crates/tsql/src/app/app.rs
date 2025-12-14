@@ -717,6 +717,16 @@ pub struct App {
     pub sidebar_width: u16,
     /// Pending schema expanded paths to apply after schema loads.
     pending_schema_expanded: Option<Vec<Vec<String>>>,
+    /// Cached cursor style to avoid redundant terminal updates.
+    /// Uses a simple enum since SetCursorStyle doesn't implement PartialEq.
+    last_cursor_style: Option<CachedCursorStyle>,
+}
+
+/// Local enum to track cursor style changes (SetCursorStyle doesn't implement PartialEq).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedCursorStyle {
+    BlinkingBar,
+    SteadyBlock,
 }
 
 impl App {
@@ -822,6 +832,7 @@ impl App {
             sidebar_focus: SidebarSection::Connections,
             sidebar_width: 30,
             pending_schema_expanded: None,
+            last_cursor_style: None,
         };
 
         // Load saved connections
@@ -984,16 +995,19 @@ impl App {
             let show_key_hint = self.key_sequence.should_show_hint();
             let pending_key_for_hint = self.key_sequence.pending();
 
-            // Set terminal cursor style based on vim mode
-            // Only show terminal cursor when in Insert mode (Bar) or when cursor is needed
-            let cursor_style = match (self.focus, self.mode) {
-                (Focus::Query, Mode::Insert) => SetCursorStyle::BlinkingBar,
-                (Focus::Query, Mode::Normal) | (Focus::Query, Mode::Visual) => {
-                    SetCursorStyle::SteadyBlock
-                }
-                _ => SetCursorStyle::SteadyBlock,
+            // Set terminal cursor style based on vim mode (only when changed)
+            let cached_style = match (self.focus, self.mode) {
+                (Focus::Query, Mode::Insert) => CachedCursorStyle::BlinkingBar,
+                _ => CachedCursorStyle::SteadyBlock,
             };
-            let _ = execute!(io::stdout(), cursor_style);
+            if self.last_cursor_style != Some(cached_style) {
+                let cursor_style = match cached_style {
+                    CachedCursorStyle::BlinkingBar => SetCursorStyle::BlinkingBar,
+                    CachedCursorStyle::SteadyBlock => SetCursorStyle::SteadyBlock,
+                };
+                let _ = execute!(io::stdout(), cursor_style);
+                self.last_cursor_style = Some(cached_style);
+            }
 
             terminal.draw(|frame| {
                 let size = frame.area();
