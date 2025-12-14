@@ -342,7 +342,7 @@ impl Sidebar {
                 // Check schema area
                 if let Some(schema_area) = self.schema_area {
                     if is_inside(x, y, schema_area) {
-                        return self.handle_schema_click(y, schema_area);
+                        return self.handle_schema_click(x, y, schema_area);
                     }
                 }
             }
@@ -385,14 +385,19 @@ impl Sidebar {
         conn_area: Rect,
         connections: &ConnectionsFile,
     ) -> (Option<SidebarAction>, Option<SidebarSection>) {
-        // Calculate which row was clicked (subtract 1 for border)
-        let row = y.saturating_sub(conn_area.y + 1) as usize;
+        // Calculate visual row within the list (subtract 1 for border)
+        let visual_row = y.saturating_sub(conn_area.y + 1) as usize;
+
+        // Add scroll offset to get actual index into the list
+        let scroll_offset = self.connections_state.offset();
+        let actual_index = scroll_offset + visual_row;
+
         let sorted = connections.sorted();
 
-        if row < sorted.len() {
-            self.connections_state.select(Some(row));
-            self.selected_connection = Some(row);
-            let name = sorted[row].name.clone();
+        if actual_index < sorted.len() {
+            self.connections_state.select(Some(actual_index));
+            self.selected_connection = Some(actual_index);
+            let name = sorted[actual_index].name.clone();
             return (
                 Some(SidebarAction::Connect(name)),
                 Some(SidebarSection::Connections),
@@ -406,24 +411,19 @@ impl Sidebar {
     /// Handle click in the schema area
     fn handle_schema_click(
         &mut self,
+        x: u16,
         y: u16,
         schema_area: Rect,
     ) -> (Option<SidebarAction>, Option<SidebarSection>) {
-        // Calculate which row was clicked (subtract 1 for border)
-        let row = y.saturating_sub(schema_area.y + 1) as usize;
+        // Calculate position relative to the schema area's inner content
+        // (accounting for border)
+        let rel_x = x.saturating_sub(schema_area.x + 1);
+        let rel_y = y.saturating_sub(schema_area.y + 1);
 
-        // Navigate to the clicked row using key_down from the current position
-        // First, we need to find the currently selected row
-        // TreeState doesn't expose scroll offset directly, so we'll use key navigation
-        // to move to approximately the right position
-
-        // For now, just toggle if we click anywhere in the schema
-        // More sophisticated click-to-select would require tree widget changes
-        // Move down 'row' times from the top (reset first)
-        self.schema_state.select_first();
-        for _ in 0..row {
-            self.schema_state.key_down();
-        }
+        // Use TreeState's click_at method which properly handles scroll offset
+        // click_at takes a Position relative to the tree widget's render area
+        use ratatui::layout::Position;
+        self.schema_state.click_at(Position::new(rel_x, rel_y));
 
         (None, Some(SidebarSection::Schema))
     }
