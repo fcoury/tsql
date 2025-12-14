@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use tui_syntax::{sql, themes, Highlighter};
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthChar;
 
 /// The shape of the cursor to display.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,7 +93,11 @@ impl<'a> HighlightedTextArea<'a> {
 
     /// Calculate the screen position of the cursor for use with frame.set_cursor_position().
     /// Returns None if the cursor is not visible (scrolled out of view or show_cursor is false).
-    /// The returned position is relative to the widget's area (including block borders).
+    /// The returned position is an absolute screen position (frame coordinates) within the
+    /// widget's area.
+    ///
+    /// This method correctly handles wide characters (CJK, emoji) by calculating the display
+    /// width of characters before the cursor position.
     pub fn cursor_screen_position(&self, area: Rect) -> Option<Position> {
         if !self.show_cursor {
             return None;
@@ -111,18 +116,29 @@ impl<'a> HighlightedTextArea<'a> {
 
         let (cursor_row, cursor_col) = self.textarea.cursor();
 
-        // Calculate scroll offset
+        // Get the line text to calculate display width
+        let lines = self.textarea.lines();
+        let line_text = lines.get(cursor_row).map(|s| s.as_str()).unwrap_or("");
+
+        // Calculate display column by summing display widths of characters before cursor
+        let display_col: usize = line_text
+            .chars()
+            .take(cursor_col)
+            .map(|c| c.width().unwrap_or(1))
+            .sum();
+
+        // Calculate scroll offset using display column
         let (scroll_row, scroll_col) = calculate_scroll_offset(
             cursor_row,
-            cursor_col,
+            display_col,
             self.scroll_offset,
             inner_area.height as usize,
             inner_area.width as usize,
         );
 
-        // Calculate cursor position on screen
+        // Calculate cursor position on screen using display column
         let screen_row = cursor_row.saturating_sub(scroll_row);
-        let screen_col = cursor_col.saturating_sub(scroll_col);
+        let screen_col = display_col.saturating_sub(scroll_col);
 
         // Check if cursor is within visible area
         if screen_row >= inner_area.height as usize || screen_col >= inner_area.width as usize {
@@ -521,6 +537,89 @@ mod tests {
         assert!(
             cell.modifier.contains(Modifier::REVERSED),
             "Cursor should have REVERSED modifier"
+        );
+    }
+
+    #[test]
+    fn test_cursor_with_wide_characters() {
+        // Test that cursor positioning accounts for display width of wide characters.
+        // CJK characters like '你' take 2 display columns each.
+        // If we have text "你好world" and cursor is at character index 2 (the 'w'),
+        // the cursor should be at display column 4 (2+2 for the two CJK chars).
+
+        let spans = vec![Span::raw("你好world")];
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+
+        // Cursor at character index 2 (the 'w' in "world")
+        let result = apply_cursor_to_spans(spans, 2, cursor_style);
+
+        // The cursor should highlight 'w', not a CJK character
+        // Find the span with cursor style
+        let cursor_span = result.iter().find(|s| s.style == cursor_style).unwrap();
+        assert_eq!(
+            cursor_span.content.as_ref(),
+            "w",
+            "Cursor should be on 'w', not on a wide character"
+        );
+    }
+
+    #[test]
+    fn test_cursor_on_wide_character() {
+        // Test cursor directly on a wide character
+        let spans = vec![Span::raw("你好world")];
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+
+        // Cursor at character index 0 (first CJK char '你')
+        let result = apply_cursor_to_spans(spans, 0, cursor_style);
+
+        let cursor_span = result.iter().find(|s| s.style == cursor_style).unwrap();
+        assert_eq!(
+            cursor_span.content.as_ref(),
+            "你",
+            "Cursor should highlight the wide character"
+        );
+    }
+
+    #[test]
+    fn test_cursor_on_second_wide_character() {
+        // Test cursor on second wide character
+        let spans = vec![Span::raw("你好world")];
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+
+        // Cursor at character index 1 (second CJK char '好')
+        let result = apply_cursor_to_spans(spans, 1, cursor_style);
+
+        let cursor_span = result.iter().find(|s| s.style == cursor_style).unwrap();
+        assert_eq!(
+            cursor_span.content.as_ref(),
+            "好",
+            "Cursor should highlight the second wide character"
+        );
+    }
+
+    #[test]
+    fn test_cursor_screen_position_with_wide_characters() {
+        // Test that cursor_screen_position returns the correct display column
+        // for text with wide characters.
+
+        let mut textarea = TextArea::new(vec!["你好world".to_string()]);
+        // Move cursor to the 'w' (character index 2, but display column 4)
+        textarea.move_cursor(tui_textarea::CursorMove::Forward); // pos 1
+        textarea.move_cursor(tui_textarea::CursorMove::Forward); // pos 2
+
+        let highlighted_lines = vec![Line::from("你好world")];
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines);
+
+        let area = Rect::new(0, 0, 20, 5);
+        let pos = widget.cursor_screen_position(area);
+
+        // The cursor is at character index 2, but the display column should be 4
+        // because each CJK character takes 2 columns
+        assert!(pos.is_some());
+        let pos = pos.unwrap();
+        assert_eq!(
+            pos.x, 4,
+            "Cursor x should be at display column 4, not character index 2"
         );
     }
 }
