@@ -98,12 +98,12 @@ impl ConfirmPrompt {
     }
 
     /// Convert the library's result format to our ConfirmResult.
+    /// Note: None is treated as Cancelled to avoid dead-state if dialog closes unexpectedly.
     fn result_from_last(last_result: Option<Option<bool>>) -> ConfirmResult {
         match last_result {
             Some(Some(true)) => ConfirmResult::Confirmed,
             Some(Some(false)) => ConfirmResult::Cancelled,
-            Some(None) => ConfirmResult::Cancelled, // Esc or click outside
-            None => ConfirmResult::Pending,
+            Some(None) | None => ConfirmResult::Cancelled, // Esc, click outside, or unexpected close
         }
     }
 
