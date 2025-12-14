@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "tsql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "tui-syntax"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ratatui",
  "serde",

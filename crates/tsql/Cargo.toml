@@ -46,7 +46,7 @@ tui-tree-widget.workspace = true
 tui_confirm_dialog.workspace = true
 
 # Internal crate
-tui-syntax = { path = "../tui-syntax", version = "0.1.0" }
+tui-syntax = { path = "../tui-syntax", version = "0.2.0" }
 
 [dev-dependencies]
 dotenvy.workspace = true
