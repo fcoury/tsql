@@ -1685,12 +1685,14 @@ impl App {
                         Focus::Query => Focus::Grid,
                         Focus::Grid => {
                             if self.sidebar_visible {
+                                self.sidebar_focus = SidebarSection::Connections;
                                 Focus::Sidebar(SidebarSection::Connections)
                             } else {
                                 Focus::Query
                             }
                         }
                         Focus::Sidebar(SidebarSection::Connections) => {
+                            self.sidebar_focus = SidebarSection::Schema;
                             Focus::Sidebar(SidebarSection::Schema)
                         }
                         Focus::Sidebar(SidebarSection::Schema) => Focus::Query,
@@ -1701,6 +1703,7 @@ impl App {
                     self.focus = match self.focus {
                         Focus::Query => {
                             if self.sidebar_visible {
+                                self.sidebar_focus = SidebarSection::Schema;
                                 Focus::Sidebar(SidebarSection::Schema)
                             } else {
                                 Focus::Grid
@@ -1708,6 +1711,7 @@ impl App {
                         }
                         Focus::Grid => Focus::Query,
                         Focus::Sidebar(SidebarSection::Schema) => {
+                            self.sidebar_focus = SidebarSection::Connections;
                             Focus::Sidebar(SidebarSection::Connections)
                         }
                         Focus::Sidebar(SidebarSection::Connections) => Focus::Grid,
@@ -6027,5 +6031,151 @@ mod tests {
 
         let ctrl_r = KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         assert_eq!(app.grid_keymap.get(&ctrl_r), Some(&Action::GotoResults));
+    }
+
+    // ========== Tab Cycling Focus Tests ==========
+
+    #[test]
+    fn test_tab_from_connections_to_schema_updates_sidebar_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Close connection manager that auto-opens
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        // Make sidebar visible and set focus to Connections
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.sidebar_focus = SidebarSection::Connections;
+
+        // Press Tab to move from Connections to Schema
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        app.on_key(key);
+
+        // Both focus and sidebar_focus should be updated to Schema
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "focus should move to Schema"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Schema,
+            "sidebar_focus should also be updated to Schema"
+        );
+    }
+
+    #[test]
+    fn test_shift_tab_from_schema_to_connections_updates_sidebar_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Close connection manager that auto-opens
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        // Make sidebar visible and set focus to Schema
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.sidebar_focus = SidebarSection::Schema;
+
+        // Press Shift+Tab to move from Schema to Connections
+        let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        app.on_key(key);
+
+        // Both focus and sidebar_focus should be updated to Connections
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Connections),
+            "focus should move to Connections"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Connections,
+            "sidebar_focus should also be updated to Connections"
+        );
+    }
+
+    #[test]
+    fn test_tab_from_grid_to_connections_updates_sidebar_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Close connection manager that auto-opens
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        // Make sidebar visible, set focus to Grid, sidebar_focus to Schema (mismatched)
+        app.sidebar_visible = true;
+        app.focus = Focus::Grid;
+        app.sidebar_focus = SidebarSection::Schema; // This simulates the bug condition
+
+        // Press Tab to move from Grid to Connections
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        app.on_key(key);
+
+        // Both focus and sidebar_focus should be Connections
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Connections),
+            "focus should move to Connections"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Connections,
+            "sidebar_focus should be updated to Connections"
+        );
+    }
+
+    #[test]
+    fn test_shift_tab_from_query_to_schema_updates_sidebar_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        // Close connection manager that auto-opens
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        // Make sidebar visible, set focus to Query, sidebar_focus to Connections (mismatched)
+        app.sidebar_visible = true;
+        app.focus = Focus::Query;
+        app.sidebar_focus = SidebarSection::Connections; // This simulates the bug condition
+
+        // Press Shift+Tab to move from Query to Schema
+        let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        app.on_key(key);
+
+        // Both focus and sidebar_focus should be Schema
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "focus should move to Schema"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Schema,
+            "sidebar_focus should be updated to Schema"
+        );
     }
 }
