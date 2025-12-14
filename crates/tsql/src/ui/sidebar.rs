@@ -1,5 +1,6 @@
 //! Sidebar component with connections list and schema tree.
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -7,6 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
+use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 use crate::app::SidebarSection;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
@@ -35,6 +37,10 @@ pub struct Sidebar {
     pub schema_state: TreeState<String>,
     /// Currently selected connection index
     pub selected_connection: Option<usize>,
+    /// Area of the connections section (for mouse hit testing)
+    connections_area: Option<Rect>,
+    /// Area of the schema section (for mouse hit testing)
+    schema_area: Option<Rect>,
 }
 
 impl Default for Sidebar {
@@ -49,6 +55,8 @@ impl Sidebar {
             connections_state: ListState::default(),
             schema_state: TreeState::default(),
             selected_connection: None,
+            connections_area: None,
+            schema_area: None,
         }
     }
 
@@ -67,11 +75,12 @@ impl Sidebar {
         has_focus: bool,
     ) {
         // Split sidebar into connections (30%) and schema (70%)
-        let chunks = Layout::vertical([
-            Constraint::Percentage(30),
-            Constraint::Percentage(70),
-        ])
-        .split(area);
+        let chunks =
+            Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
+
+        // Store areas for mouse hit testing
+        self.connections_area = Some(chunks[0]);
+        self.schema_area = Some(chunks[1]);
 
         self.render_connections(
             frame,
@@ -215,25 +224,38 @@ impl Sidebar {
         frame.render_stateful_widget(tree, area, &mut self.schema_state);
     }
 
-    /// Move selection up in connections list
-    pub fn connections_up(&mut self, count: usize) {
+    /// Move selection up in connections list by the specified amount.
+    ///
+    /// # Arguments
+    /// * `total_count` - Total number of connections (for bounds checking)
+    /// * `amount` - Number of items to move up (default 1)
+    pub fn connections_up_by(&mut self, total_count: usize, amount: usize) {
         if let Some(selected) = self.connections_state.selected() {
-            let new_selected = selected.saturating_sub(1);
+            let new_selected = selected.saturating_sub(amount);
             self.connections_state.select(Some(new_selected));
             self.selected_connection = Some(new_selected);
-        } else if count > 0 {
+        } else if total_count > 0 {
             self.connections_state.select(Some(0));
             self.selected_connection = Some(0);
         }
     }
 
-    /// Move selection down in connections list
-    pub fn connections_down(&mut self, count: usize) {
-        if count == 0 {
+    /// Move selection up in connections list by 1.
+    pub fn connections_up(&mut self, total_count: usize) {
+        self.connections_up_by(total_count, 1);
+    }
+
+    /// Move selection down in connections list by the specified amount.
+    ///
+    /// # Arguments
+    /// * `total_count` - Total number of connections (for bounds checking)
+    /// * `amount` - Number of items to move down (default 1)
+    pub fn connections_down_by(&mut self, total_count: usize, amount: usize) {
+        if total_count == 0 {
             return;
         }
         if let Some(selected) = self.connections_state.selected() {
-            let new_selected = (selected + 1).min(count - 1);
+            let new_selected = (selected + amount).min(total_count - 1);
             self.connections_state.select(Some(new_selected));
             self.selected_connection = Some(new_selected);
         } else {
@@ -242,8 +264,16 @@ impl Sidebar {
         }
     }
 
+    /// Move selection down in connections list by 1.
+    pub fn connections_down(&mut self, total_count: usize) {
+        self.connections_down_by(total_count, 1);
+    }
+
     /// Get selected connection name
-    pub fn get_selected_connection<'a>(&self, connections: &'a ConnectionsFile) -> Option<&'a ConnectionEntry> {
+    pub fn get_selected_connection<'a>(
+        &self,
+        connections: &'a ConnectionsFile,
+    ) -> Option<&'a ConnectionEntry> {
         let sorted = connections.sorted();
         self.connections_state
             .selected()
@@ -288,5 +318,128 @@ impl Sidebar {
     /// Get the selected schema item identifier (for inserting into query)
     pub fn get_selected_schema_name(&self) -> Option<String> {
         self.schema_state.selected().last().cloned()
+    }
+
+    /// Handle mouse events in the sidebar
+    ///
+    /// Returns a tuple of (action, which_section_was_clicked)
+    /// The section is returned so the caller can update focus appropriately
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        connections: &ConnectionsFile,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        let (x, y) = (mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check connections area
+                if let Some(conn_area) = self.connections_area {
+                    if is_inside(x, y, conn_area) {
+                        return self.handle_connections_click(y, conn_area, connections);
+                    }
+                }
+
+                // Check schema area
+                if let Some(schema_area) = self.schema_area {
+                    if is_inside(x, y, schema_area) {
+                        return self.handle_schema_click(x, y, schema_area);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.is_over_connections(x, y) {
+                    let total_count = connections.sorted().len();
+                    self.connections_up_by(total_count, MOUSE_SCROLL_LINES);
+                    return (None, Some(SidebarSection::Connections));
+                }
+                if self.is_over_schema(x, y) {
+                    for _ in 0..MOUSE_SCROLL_LINES {
+                        self.schema_up();
+                    }
+                    return (None, Some(SidebarSection::Schema));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.is_over_connections(x, y) {
+                    let total_count = connections.sorted().len();
+                    self.connections_down_by(total_count, MOUSE_SCROLL_LINES);
+                    return (None, Some(SidebarSection::Connections));
+                }
+                if self.is_over_schema(x, y) {
+                    for _ in 0..MOUSE_SCROLL_LINES {
+                        self.schema_down();
+                    }
+                    return (None, Some(SidebarSection::Schema));
+                }
+            }
+            _ => {}
+        }
+
+        (None, None)
+    }
+
+    /// Handle click in the connections area
+    fn handle_connections_click(
+        &mut self,
+        y: u16,
+        conn_area: Rect,
+        connections: &ConnectionsFile,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        // Calculate visual row within the list (subtract 1 for border)
+        let visual_row = y.saturating_sub(conn_area.y + 1) as usize;
+
+        // Add scroll offset to get actual index into the list
+        let scroll_offset = self.connections_state.offset();
+        let actual_index = scroll_offset + visual_row;
+
+        let sorted = connections.sorted();
+
+        if actual_index < sorted.len() {
+            self.connections_state.select(Some(actual_index));
+            self.selected_connection = Some(actual_index);
+            let name = sorted[actual_index].name.clone();
+            return (
+                Some(SidebarAction::Connect(name)),
+                Some(SidebarSection::Connections),
+            );
+        }
+
+        // Clicked in area but not on an item - just focus
+        (None, Some(SidebarSection::Connections))
+    }
+
+    /// Handle click in the schema area
+    fn handle_schema_click(
+        &mut self,
+        x: u16,
+        y: u16,
+        schema_area: Rect,
+    ) -> (Option<SidebarAction>, Option<SidebarSection>) {
+        // Calculate position relative to the schema area's inner content
+        // (accounting for border)
+        let rel_x = x.saturating_sub(schema_area.x + 1);
+        let rel_y = y.saturating_sub(schema_area.y + 1);
+
+        // Use TreeState's click_at method which properly handles scroll offset
+        // click_at takes a Position relative to the tree widget's render area
+        use ratatui::layout::Position;
+        self.schema_state.click_at(Position::new(rel_x, rel_y));
+
+        (None, Some(SidebarSection::Schema))
+    }
+
+    /// Check if mouse is over the connections section
+    fn is_over_connections(&self, x: u16, y: u16) -> bool {
+        self.connections_area
+            .map(|area| is_inside(x, y, area))
+            .unwrap_or(false)
+    }
+
+    /// Check if mouse is over the schema section
+    fn is_over_schema(&self, x: u16, y: u16) -> bool {
+        self.schema_area
+            .map(|area| is_inside(x, y, area))
+            .unwrap_or(false)
     }
 }

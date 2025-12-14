@@ -8,6 +8,8 @@ mod grid;
 mod help_popup;
 mod highlighted_editor;
 mod json_editor;
+mod mouse_util;
+pub use mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 mod row_detail;
 pub mod sidebar;
 mod status_line;

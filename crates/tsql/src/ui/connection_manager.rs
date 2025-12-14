@@ -6,7 +6,7 @@
 //! - Actions: connect, add, edit, delete, set favorite
 //! - Visual indicators for connected state and favorites
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,6 +16,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
 /// Result of handling a key event in the connection manager.
@@ -65,6 +66,10 @@ pub struct ConnectionManagerModal {
     connected_name: Option<String>,
     /// Visible height (set during render)
     visible_height: usize,
+    /// Modal area (set during render, used for mouse hit testing)
+    modal_area: Option<Rect>,
+    /// List area (set during render, used for mouse item selection)
+    list_area: Option<Rect>,
 }
 
 impl ConnectionManagerModal {
@@ -80,6 +85,8 @@ impl ConnectionManagerModal {
             scroll_offset: 0,
             connected_name,
             visible_height: 10,
+            modal_area: None,
+            list_area: None,
         }
     }
 
@@ -284,6 +291,67 @@ impl ConnectionManagerModal {
         }
     }
 
+    /// Handle a mouse event and return the resulting action.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ConnectionManagerAction {
+        let (x, y) = (mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check if click is outside modal - close if so
+                if let Some(modal) = self.modal_area {
+                    if !is_inside(x, y, modal) {
+                        return ConnectionManagerAction::Close;
+                    }
+                }
+
+                // Check if click is in list area - select and connect
+                if let Some(list_area) = self.list_area {
+                    if is_inside(x, y, list_area) && !self.connections.is_empty() {
+                        // Calculate which row was clicked
+                        let row_in_list = (y - list_area.y) as usize;
+                        let clicked_index = self.scroll_offset + row_in_list;
+
+                        if clicked_index < self.connections.len() {
+                            // Select the item and connect
+                            self.selected = clicked_index;
+                            return ConnectionManagerAction::Connect {
+                                entry: self.connections[clicked_index].clone(),
+                            };
+                        }
+                    }
+                }
+
+                ConnectionManagerAction::Continue
+            }
+            MouseEventKind::ScrollUp => {
+                // Only scroll if mouse is inside modal
+                if self.is_mouse_inside(x, y) {
+                    for _ in 0..MOUSE_SCROLL_LINES {
+                        self.move_up();
+                    }
+                }
+                ConnectionManagerAction::Continue
+            }
+            MouseEventKind::ScrollDown => {
+                // Only scroll if mouse is inside modal
+                if self.is_mouse_inside(x, y) {
+                    for _ in 0..MOUSE_SCROLL_LINES {
+                        self.move_down();
+                    }
+                }
+                ConnectionManagerAction::Continue
+            }
+            _ => ConnectionManagerAction::Continue,
+        }
+    }
+
+    /// Check if mouse coordinates are inside the modal.
+    fn is_mouse_inside(&self, x: u16, y: u16) -> bool {
+        self.modal_area
+            .map(|modal| is_inside(x, y, modal))
+            .unwrap_or(false)
+    }
+
     /// Render the connection manager modal.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Calculate modal size (70% width, 60% height)
@@ -298,6 +366,9 @@ impl ConnectionManagerModal {
             width: modal_width,
             height: modal_height,
         };
+
+        // Store modal area for mouse hit testing
+        self.modal_area = Some(modal_area);
 
         // Clear the background
         frame.render_widget(Clear, modal_area);
@@ -371,6 +442,9 @@ impl ConnectionManagerModal {
         } else {
             (area, None)
         };
+
+        // Store the actual clickable list area (excluding scrollbar) for mouse hit testing
+        self.list_area = Some(list_area);
 
         // Build list items
         let items: Vec<ListItem> = self

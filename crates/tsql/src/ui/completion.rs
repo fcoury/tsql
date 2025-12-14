@@ -218,10 +218,7 @@ impl SchemaCache {
         let mut schemas: BTreeMap<String, Vec<&TableInfo>> = BTreeMap::new();
 
         for table in &self.tables {
-            schemas
-                .entry(table.schema.clone())
-                .or_default()
-                .push(table);
+            schemas.entry(table.schema.clone()).or_default().push(table);
         }
 
         let mut tree_items = Vec::new();
@@ -249,8 +246,8 @@ impl SchemaCache {
                 table_items.push(table_item);
             }
 
-            let schema_item = TreeItem::new(schema_id, schema_name, table_items)
-                .expect("valid schema tree item");
+            let schema_item =
+                TreeItem::new(schema_id, schema_name, table_items).expect("valid schema tree item");
             tree_items.push(schema_item);
         }
 

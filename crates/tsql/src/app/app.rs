@@ -28,12 +28,13 @@ use crate::config::{
 use crate::history::{History, HistoryEntry};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
-    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
-    ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
-    ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker, GridKeyResult,
-    GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
-    JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction,
-    RowDetailModal, SchemaCache, SearchPrompt, Sidebar, StatusLineBuilder, StatusSegment, TableInfo,
+    is_inside, quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup,
+    ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
+    ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, DataGrid, FuzzyPicker,
+    GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
+    JsonEditorAction, JsonEditorModal, PickerAction, Priority, QueryEditor, ResizeAction,
+    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
+    StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -596,6 +597,8 @@ pub struct App {
     render_query_area: Option<Rect>,
     /// Last rendered area for results grid (for mouse click handling).
     render_grid_area: Option<Rect>,
+    /// Last rendered area for sidebar (for mouse click handling).
+    render_sidebar_area: Option<Rect>,
 
     /// Saved database connections.
     pub connections: ConnectionsFile,
@@ -706,6 +709,7 @@ impl App {
 
             render_query_area: None,
             render_grid_area: None,
+            render_sidebar_area: None,
 
             connections: ConnectionsFile::new(),
             current_connection_name: None,
@@ -851,6 +855,9 @@ impl App {
 
                 // Render sidebar if visible
                 if self.sidebar_visible && sidebar_area.width > 0 {
+                    // Store sidebar area for mouse click handling
+                    self.render_sidebar_area = Some(sidebar_area);
+
                     let schema_items = self.schema_cache.build_tree_items();
                     let has_focus = matches!(self.focus, Focus::Sidebar(_));
 
@@ -865,6 +872,8 @@ impl App {
                         self.sidebar_focus,
                         has_focus,
                     );
+                } else {
+                    self.render_sidebar_area = None;
                 }
 
                 // Determine if we have an error to show.
@@ -898,7 +907,9 @@ impl App {
                     (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
                     (Focus::Query, Mode::Insert) => Style::default().fg(Color::Green),
                     (Focus::Query, Mode::Visual) => Style::default().fg(Color::Yellow),
-                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => Style::default().fg(Color::DarkGray),
+                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => {
+                        Style::default().fg(Color::DarkGray)
+                    }
                 };
 
                 // Build query title with [+] indicator if modified
@@ -1671,7 +1682,8 @@ impl App {
                             }
                             Action::ToggleSidebar => {
                                 self.sidebar_visible = !self.sidebar_visible;
-                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
+                                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_))
+                                {
                                     self.focus = Focus::Query;
                                 }
                                 GridKeyResult::None
@@ -1733,11 +1745,15 @@ impl App {
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE, SidebarSection::Connections) => {
                 self.sidebar.connections_up(self.connections.sorted().len());
             }
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE, SidebarSection::Connections) => {
+            (
+                KeyCode::Down | KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                SidebarSection::Connections,
+            ) => {
                 // Check if at bottom of connections list - if so, move to schema section
                 let count = self.connections.sorted().len();
-                let at_bottom = self.sidebar.connections_state.selected()
-                    == Some(count.saturating_sub(1));
+                let at_bottom =
+                    self.sidebar.connections_state.selected() == Some(count.saturating_sub(1));
                 if at_bottom && count > 0 {
                     self.sidebar_focus = SidebarSection::Schema;
                     self.focus = Focus::Sidebar(SidebarSection::Schema);
@@ -1752,7 +1768,11 @@ impl App {
                 }
             }
             // 'a' or 'e' to open connection manager
-            (KeyCode::Char('a') | KeyCode::Char('e'), KeyModifiers::NONE, SidebarSection::Connections) => {
+            (
+                KeyCode::Char('a') | KeyCode::Char('e'),
+                KeyModifiers::NONE,
+                SidebarSection::Connections,
+            ) => {
                 self.open_connection_manager();
             }
 
@@ -1815,17 +1835,106 @@ impl App {
 
     /// Handle mouse events
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        // Don't process mouse events when modals are open
+        // Route mouse events to modals in priority order
+
+        // Help popup has mouse support
+        if let Some(ref mut help_popup) = self.help_popup {
+            let action = help_popup.handle_mouse(mouse);
+            match action {
+                HelpAction::Close => {
+                    self.help_popup = None;
+                }
+                HelpAction::Continue => {}
+            }
+            return;
+        }
+
+        // History picker has mouse support
+        if let Some(ref mut picker) = self.history_picker {
+            let action = picker.handle_mouse(mouse);
+            match action {
+                PickerAction::Selected(entry) => {
+                    // Load selected query into editor (mirror keyboard path)
+                    self.editor.set_text(entry.query);
+                    self.editor.mark_saved(); // Mark as unmodified since it's loaded content
+                    self.history_picker = None;
+                    self.last_status = Some("Loaded from history".to_string());
+                }
+                PickerAction::Cancelled => {
+                    self.history_picker = None;
+                }
+                PickerAction::Continue => {}
+            }
+            return;
+        }
+
+        // Connection picker has mouse support
+        if let Some(ref mut picker) = self.connection_picker {
+            let action = picker.handle_mouse(mouse);
+            match action {
+                PickerAction::Selected(entry) => {
+                    self.connection_picker = None;
+                    self.last_error = None;
+                    if self.editor.is_modified() {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "You have unsaved changes. Switch connection anyway?",
+                            ConfirmContext::SwitchConnection { entry },
+                        ));
+                    } else {
+                        self.connect_to_entry(entry);
+                    }
+                }
+                PickerAction::Cancelled => {
+                    self.connection_picker = None;
+                    self.last_error = None;
+                }
+                PickerAction::Continue => {}
+            }
+            return;
+        }
+
+        // Connection manager has mouse support (but not if connection_form is open on top)
+        if self.connection_form.is_none() {
+            if let Some(ref mut manager) = self.connection_manager {
+                let action = manager.handle_mouse(mouse);
+                // Handle action (the method already exists)
+                self.handle_connection_manager_action(action);
+                return;
+            }
+        }
+
+        // Don't process mouse events for other modals without mouse support
         if self.confirm_prompt.is_some()
             || self.json_editor.is_some()
             || self.row_detail.is_some()
-            || self.help_popup.is_some()
-            || self.history_picker.is_some()
-            || self.connection_picker.is_some()
+            || self.connection_form.is_some()
         {
             return;
         }
 
+        // Check if mouse is over sidebar first
+        if self.sidebar_visible {
+            if let Some(sidebar_area) = self.render_sidebar_area {
+                if is_inside(mouse.column, mouse.row, sidebar_area) {
+                    // Delegate to sidebar mouse handler
+                    let (action, section) = self.sidebar.handle_mouse(mouse, &self.connections);
+
+                    // Update focus to sidebar if a section was clicked
+                    if let Some(section) = section {
+                        self.focus = Focus::Sidebar(section);
+                        self.sidebar_focus = section;
+                    }
+
+                    // Handle any action from the sidebar
+                    if let Some(action) = action {
+                        self.handle_sidebar_action(action);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Handle mouse for main UI (query editor / grid)
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_mouse_click(mouse.column, mouse.row);
@@ -1865,6 +1974,16 @@ impl App {
                 && y >= grid_area.y
                 && y < grid_area.y + grid_area.height
             {
+                // Ignore clicks on the top border/header row(s)
+                if y <= grid_area.y + 1 {
+                    // Still focus the grid, just don't select a row
+                    if self.focus != Focus::Grid {
+                        self.focus = Focus::Grid;
+                        self.mode = Mode::Normal;
+                    }
+                    return;
+                }
+
                 // Click in grid - focus it and try to select the row
                 if self.focus != Focus::Grid {
                     self.focus = Focus::Grid;
@@ -1921,7 +2040,8 @@ impl App {
                         if delta < 0 {
                             self.sidebar.connections_up(self.connections.sorted().len());
                         } else {
-                            self.sidebar.connections_down(self.connections.sorted().len());
+                            self.sidebar
+                                .connections_down(self.connections.sorted().len());
                         }
                     }
                     SidebarSection::Schema => {
@@ -3681,7 +3801,14 @@ impl App {
             }
             ConnectionManagerAction::Connect { entry } => {
                 self.connection_manager = None;
-                self.connect_to_entry(entry);
+                if self.editor.is_modified() {
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "You have unsaved changes. Switch connection anyway?",
+                        ConfirmContext::SwitchConnection { entry },
+                    ));
+                } else {
+                    self.connect_to_entry(entry);
+                }
             }
             ConnectionManagerAction::Add => {
                 self.connection_form = Some(ConnectionFormModal::with_keymap(
@@ -3726,6 +3853,66 @@ impl App {
             }
             ConnectionManagerAction::StatusMessage(msg) => {
                 self.last_status = Some(msg);
+            }
+        }
+    }
+
+    /// Handle sidebar actions (from mouse clicks or keyboard).
+    fn handle_sidebar_action(&mut self, action: SidebarAction) {
+        match action {
+            SidebarAction::Connect(name) => {
+                // Find the connection entry and connect
+                if let Some(entry) = self
+                    .connections
+                    .sorted()
+                    .into_iter()
+                    .find(|e| e.name == name)
+                {
+                    if self.editor.is_modified() {
+                        self.confirm_prompt = Some(ConfirmPrompt::new(
+                            "You have unsaved changes. Switch connection anyway?",
+                            ConfirmContext::SwitchConnection {
+                                entry: entry.clone(),
+                            },
+                        ));
+                    } else {
+                        self.connect_to_entry(entry.clone());
+                    }
+                }
+            }
+            SidebarAction::InsertText(text) => {
+                // Insert text into query editor
+                self.editor.textarea.insert_str(&text);
+                self.focus = Focus::Query;
+            }
+            SidebarAction::OpenAddConnection => {
+                self.connection_form = Some(ConnectionFormModal::with_keymap(
+                    self.connection_form_keymap.clone(),
+                ));
+            }
+            SidebarAction::OpenEditConnection(name) => {
+                if let Some(entry) = self
+                    .connections
+                    .sorted()
+                    .into_iter()
+                    .find(|e| e.name == name)
+                {
+                    let password = entry.get_password().ok().flatten();
+                    self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
+                        entry,
+                        password,
+                        self.connection_form_keymap.clone(),
+                    ));
+                }
+            }
+            SidebarAction::RefreshSchema => {
+                if self.db.status == DbStatus::Connected {
+                    self.schema_cache.loaded = false;
+                    self.load_schema();
+                }
+            }
+            SidebarAction::FocusEditor => {
+                self.focus = Focus::Query;
             }
         }
     }
@@ -4457,7 +4644,9 @@ mod tests {
         fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             std::env::set_var("TSQL_CONFIG_DIR", temp_dir.path());
-            Self { _temp_dir: temp_dir }
+            Self {
+                _temp_dir: temp_dir,
+            }
         }
     }
 
