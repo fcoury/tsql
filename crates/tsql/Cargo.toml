@@ -43,7 +43,7 @@ url.workspace = true
 tui-tree-widget.workspace = true
 
 # Confirm dialog widget
-tui_confirm_dialog.workspace = true
+tui_confirm_dialog_with_mouse.workspace = true
 
 # Internal crate
 tui-syntax = { path = "../tui-syntax", version = "0.2.0" }

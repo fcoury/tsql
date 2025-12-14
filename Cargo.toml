@@ -49,8 +49,8 @@ url = "2"
 # Tree widget for sidebar
 tui-tree-widget = "0.23"
 
-# Confirm dialog widget (vendored with mouse support)
-tui_confirm_dialog = { path = "vendor/tui-confirm-dialog" }
+# Confirm dialog widget
+tui_confirm_dialog_with_mouse = "0.3.1"
 
 # Dev dependencies
 dotenvy = "0.15"

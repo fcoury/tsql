@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{BorderType, Borders};
 use ratatui::Frame;
-use tui_confirm_dialog::{ConfirmDialog, ConfirmDialogState};
+use tui_confirm_dialog_with_mouse::{ConfirmDialog, ConfirmDialogState};
 
 use crate::config::ConnectionEntry;
 

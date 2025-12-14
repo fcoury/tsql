@@ -1933,7 +1933,7 @@ dependencies = [
  "tui-syntax",
  "tui-textarea",
  "tui-tree-widget",
- "tui_confirm_dialog",
+ "tui_confirm_dialog_with_mouse",
  "unicode-width 0.2.0",
  "url",
  "uuid",
@@ -1976,8 +1976,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tui_confirm_dialog"
+name = "tui_confirm_dialog_with_mouse"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaa316a028becd2f2cdd0f702d762c4847a908b4a37e193e5f45555f2d09c145"
 dependencies = [
  "rand",
  "ratatui",
