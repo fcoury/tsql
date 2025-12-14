@@ -828,7 +828,7 @@ impl App {
             ConnectionsFile::new()
         });
 
-        // Handle connection on startup
+        // Handle connection on startup (only if explicit connection specified)
         if let Some(url) = effective_conn_str {
             // Check if this looks like a connection name (no :// scheme)
             if !url.contains("://") {
@@ -844,10 +844,9 @@ impl App {
                 // It's a URL, connect directly
                 app.start_connect(url);
             }
-        } else {
-            // No URL specified - open connection picker (falls back to manager if empty)
-            app.open_connection_picker();
         }
+        // Note: connection picker is NOT opened here when no URL specified.
+        // This allows main.rs to first check session state for auto-reconnect.
 
         app
     }
@@ -4114,7 +4113,7 @@ impl App {
     }
 
     /// Open the connection picker (fuzzy finder for quick connection selection).
-    fn open_connection_picker(&mut self) {
+    pub fn open_connection_picker(&mut self) {
         // Reload connections from disk to pick up changes from other instances
         if let Ok(connections) = load_connections() {
             self.connections = connections;

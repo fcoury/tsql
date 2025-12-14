@@ -107,6 +107,7 @@ fn main() -> Result<()> {
     let session_connection = app.apply_session_state(session);
 
     // Auto-connect from session if no CLI/env connection was specified
+    let mut session_reconnected = false;
     if conn_str.is_none() {
         if let Some(conn_name) = session_connection {
             // Verify connection still exists
@@ -117,6 +118,7 @@ fn main() -> Result<()> {
                     Ok(Some(_)) | Ok(None) => {
                         // Password available or not needed - auto-connect
                         app.connect_to_entry(entry.clone());
+                        session_reconnected = true;
                     }
                     Err(_) => {
                         // Password retrieval failed - skip auto-connect
@@ -125,6 +127,12 @@ fn main() -> Result<()> {
                 }
             }
             // If connection doesn't exist, silently skip auto-connect
+        }
+
+        // Only open connection picker if no connection was established
+        // (no CLI/env URL and no session reconnection)
+        if !session_reconnected {
+            app.open_connection_picker();
         }
     }
 
