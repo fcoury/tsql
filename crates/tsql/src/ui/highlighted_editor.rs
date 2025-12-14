@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use tui_syntax::{sql, themes, Highlighter};
 use tui_textarea::TextArea;
 
@@ -73,6 +73,9 @@ impl Widget for HighlightedTextArea<'_> {
             return;
         }
 
+        // Clear the inner area to prevent underlying content from bleeding through
+        Clear.render(inner_area, buf);
+
         // Get cursor position and selection from textarea
         let (cursor_row, cursor_col) = self.textarea.cursor();
         let selection = self.textarea.selection_range();
@@ -105,8 +108,19 @@ impl Widget for HighlightedTextArea<'_> {
         for (row_idx, line) in highlighted_lines.into_iter().enumerate() {
             let is_cursor_line = row_idx == cursor_row;
 
-            // Convert Line to mutable spans for manipulation
-            let mut line_spans: Vec<Span<'static>> = line.spans;
+            // Convert Line to mutable spans for manipulation, replacing tabs with spaces
+            // Tab characters can cause rendering issues as they may not fill cells consistently
+            let mut line_spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    if span.content.contains('\t') {
+                        Span::styled(span.content.replace('\t', "    "), span.style)
+                    } else {
+                        span
+                    }
+                })
+                .collect();
 
             // Apply selection highlighting if this line is in the selection range
             if let Some(((start_row, start_col), (end_row, end_col))) = selection {
@@ -438,5 +452,172 @@ mod tests {
             cell.modifier.contains(Modifier::REVERSED),
             "Cursor should have REVERSED modifier"
         );
+    }
+
+    #[test]
+    fn test_widget_clears_background_for_short_lines() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        // This test reproduces the issue where content from the underlying buffer
+        // bleeds through when the editor content lines are shorter than the viewport width.
+
+        // Create a textarea with short content
+        let textarea = TextArea::new(vec!["Hi".to_string()]);
+
+        let highlighted_lines = vec![Line::from("Hi")];
+
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines);
+
+        // Create a buffer pre-filled with content (simulating underlying grid data)
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+
+        // Fill buffer with "garbage" content that should be cleared
+        for y in 0..area.height {
+            for x in 0..area.width {
+                buf.cell_mut((x, y)).unwrap().set_symbol("X");
+            }
+        }
+
+        // Verify buffer is filled with X's before rendering
+        assert_eq!(buf.cell((5, 0)).unwrap().symbol(), "X");
+        assert_eq!(buf.cell((10, 0)).unwrap().symbol(), "X");
+
+        widget.render(area, &mut buf);
+
+        // After rendering, the area AFTER the content ("Hi" + cursor space) should be cleared
+        // Row 0: "Hi " (with cursor space at position 2), rest should be spaces not "X"
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "H");
+        assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "i");
+        // Position 2 should be cursor (space with reversed style)
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), " ");
+
+        // Positions 3 onwards should be cleared (spaces), not "X"
+        // This is the bug: without proper clearing, these would still be "X"
+        assert_eq!(
+            buf.cell((3, 0)).unwrap().symbol(),
+            " ",
+            "Position 3 should be cleared to space, not show underlying content"
+        );
+        assert_eq!(
+            buf.cell((10, 0)).unwrap().symbol(),
+            " ",
+            "Position 10 should be cleared to space, not show underlying content"
+        );
+
+        // Row 1 should also be fully cleared (no content on this row)
+        assert_eq!(
+            buf.cell((0, 1)).unwrap().symbol(),
+            " ",
+            "Empty row should be cleared"
+        );
+        assert_eq!(
+            buf.cell((10, 1)).unwrap().symbol(),
+            " ",
+            "Empty row position 10 should be cleared"
+        );
+    }
+
+    #[test]
+    fn test_widget_clears_background_with_block() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::{Borders, Widget};
+
+        // Similar test but with a block (borders) - testing inner area clearing
+        let textarea = TextArea::new(vec!["Hi".to_string()]);
+        let highlighted_lines = vec![Line::from("Hi")];
+
+        let block = Block::default().borders(Borders::ALL).title("Test");
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines).block(block);
+
+        // Create a buffer pre-filled with content
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+
+        // Fill buffer with "garbage" content
+        for y in 0..area.height {
+            for x in 0..area.width {
+                buf.cell_mut((x, y)).unwrap().set_symbol("X");
+            }
+        }
+
+        widget.render(area, &mut buf);
+
+        // Inner area starts at (1,1) due to borders
+        // Row 1 (first inner row): "Hi " followed by spaces
+        assert_eq!(buf.cell((1, 1)).unwrap().symbol(), "H");
+        assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "i");
+        // Cursor space at position 3
+        assert_eq!(buf.cell((3, 1)).unwrap().symbol(), " ");
+
+        // Position 4 onwards in the inner area should be cleared
+        // Inner area width is 20 - 2 (borders) = 18, so inner right edge is at x=18
+        assert_eq!(
+            buf.cell((5, 1)).unwrap().symbol(),
+            " ",
+            "Inner position 5 should be cleared"
+        );
+        assert_eq!(
+            buf.cell((10, 1)).unwrap().symbol(),
+            " ",
+            "Inner position 10 should be cleared"
+        );
+
+        // Row 2 (second inner row) should also be cleared
+        assert_eq!(
+            buf.cell((1, 2)).unwrap().symbol(),
+            " ",
+            "Second inner row should be cleared"
+        );
+    }
+
+    #[test]
+    fn test_widget_replaces_tabs_with_spaces() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        // Test that tab characters are replaced with spaces to avoid rendering issues
+        let textarea = TextArea::new(vec!["A\tB".to_string()]);
+
+        // Create highlighted lines with a tab character
+        let highlighted_lines = vec![Line::from("A\tB")];
+
+        let widget = HighlightedTextArea::new(&textarea, highlighted_lines);
+
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+
+        // Tab should be replaced with 4 spaces, so:
+        // Position 0: 'A'
+        // Position 1-4: spaces (tab expanded)
+        // Position 5: 'B'
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "A");
+        assert_eq!(
+            buf.cell((1, 0)).unwrap().symbol(),
+            " ",
+            "Tab should be replaced with space"
+        );
+        assert_eq!(
+            buf.cell((2, 0)).unwrap().symbol(),
+            " ",
+            "Tab should be replaced with space"
+        );
+        assert_eq!(
+            buf.cell((3, 0)).unwrap().symbol(),
+            " ",
+            "Tab should be replaced with space"
+        );
+        assert_eq!(
+            buf.cell((4, 0)).unwrap().symbol(),
+            " ",
+            "Tab should be replaced with space"
+        );
+        assert_eq!(buf.cell((5, 0)).unwrap().symbol(), "B");
     }
 }

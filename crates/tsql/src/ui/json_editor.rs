@@ -90,7 +90,11 @@ impl<'a> JsonEditorModal<'a> {
         let is_valid = is_valid_json(&formatted_value);
 
         // Create textarea with the formatted value
-        let lines: Vec<String> = formatted_value.lines().map(|s| s.to_string()).collect();
+        // Replace tabs with spaces to avoid rendering issues in the terminal
+        let lines: Vec<String> = formatted_value
+            .lines()
+            .map(|s| s.replace('\t', "    "))
+            .collect();
         let lines = if lines.is_empty() {
             vec![String::new()]
         } else {
@@ -1126,5 +1130,117 @@ mod tests {
             matches!(result, JsonEditorAction::RequestClose { .. }),
             "'q' with changes should return RequestClose"
         );
+    }
+
+    // ========== Rendering Tests ==========
+
+    #[test]
+    fn test_json_editor_modal_with_large_html_file() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Load the actual problematic HTML file or create synthetic content
+        let html_content = std::fs::read_to_string("tests/fixtures/large_html.html")
+            .unwrap_or_else(|_| {
+                // Fallback: create synthetic content with a very long line (like minified JS)
+                let long_line = "x".repeat(60000);
+                format!(
+                    "<!DOCTYPE html>\n<html>\n<head>\n<script>{}</script>\n</head>\n</html>",
+                    long_line
+                )
+            });
+
+        // Create a terminal with test backend
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // First, fill the terminal buffer with "garbage" to simulate underlying grid content
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let buf = frame.buffer_mut();
+                for y in 0..area.height {
+                    for x in 0..area.width {
+                        // Simulate grid row numbers and content like "64|15<data..."
+                        let pattern = format!("{:02}|{:02}", y, x % 100);
+                        if let Some(ch) = pattern.chars().nth((x % 5) as usize) {
+                            buf[(x, y)].set_symbol(&ch.to_string());
+                        }
+                    }
+                }
+            })
+            .unwrap();
+
+        // Verify garbage is in the buffer
+        {
+            let backend = terminal.backend();
+            let buf = backend.buffer();
+            // Check that garbage pattern exists at various positions
+            assert_ne!(buf[(10, 10)].symbol(), " ");
+            assert_ne!(buf[(50, 20)].symbol(), " ");
+        }
+
+        // Now render the JSON editor modal with the large HTML content
+        let mut editor = JsonEditorModal::new(
+            html_content,
+            "raw_contents".to_string(),
+            "text".to_string(),
+            0,
+            0,
+        );
+
+        terminal
+            .draw(|frame| {
+                editor.render(frame, frame.area());
+            })
+            .unwrap();
+
+        // Check that the modal area is properly cleared
+        let backend = terminal.backend();
+        let buf = backend.buffer();
+
+        // The modal is 80% of 120 = 96 wide, centered at x = (120-96)/2 = 12
+        // The modal is 80% of 40 = 32 tall, centered at y = (40-32)/2 = 4
+        let modal_x = 12;
+        let modal_y = 4;
+        let inner_x = modal_x + 1;
+        let inner_y = modal_y + 1;
+
+        // First character should be '<' from "<!DOCTYPE html>"
+        assert_eq!(
+            buf[(inner_x, inner_y)].symbol(),
+            "<",
+            "First char should be '<' from HTML content, not garbage. Got: '{}'",
+            buf[(inner_x, inner_y)].symbol()
+        );
+
+        // Check multiple positions across the inner area - they should NOT have garbage
+        // Test middle of a row that should have content cleared
+        let test_positions = [
+            (inner_x + 20, inner_y),     // After "<!DOCTYPE html>" on first line
+            (inner_x + 50, inner_y),     // Further right on first line
+            (inner_x + 5, inner_y + 5),  // On a later line
+            (inner_x + 30, inner_y + 5), // Middle of a later line
+            (inner_x + 70, inner_y + 5), // Right side of a later line
+        ];
+
+        for (x, y) in test_positions {
+            let symbol = buf[(x, y)].symbol();
+            // Should NOT be the garbage pattern (digits followed by pipe)
+            let is_garbage = symbol
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+                && buf
+                    .cell((x + 1, y))
+                    .map(|c| c.symbol() == "|")
+                    .unwrap_or(false);
+            assert!(
+                !is_garbage,
+                "Position ({}, {}) should not have garbage pattern, got: '{}'",
+                x, y, symbol,
+            );
+        }
     }
 }
