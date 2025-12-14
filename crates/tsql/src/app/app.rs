@@ -11,8 +11,9 @@ use crossterm::event::{
 use crossterm::execute;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -43,6 +44,7 @@ use crate::ui::{
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
+use throbber_widgets_tui::{Throbber, ThrobberState, BRAILLE_SIX};
 use tui_syntax::Highlighter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,6 +722,11 @@ pub struct App {
     /// Cached cursor style to avoid redundant terminal updates.
     /// Uses a simple enum since SetCursorStyle doesn't implement PartialEq.
     last_cursor_style: Option<CachedCursorStyle>,
+
+    /// Throbber animation state for loading indicator.
+    throbber_state: ThrobberState,
+    /// When the current query started (for elapsed time display).
+    query_start_time: Option<Instant>,
 }
 
 /// Local enum to track cursor style changes (SetCursorStyle doesn't implement PartialEq).
@@ -833,6 +840,9 @@ impl App {
             sidebar_width: 30,
             pending_schema_expanded: None,
             last_cursor_style: None,
+
+            throbber_state: ThrobberState::default(),
+            query_start_time: None,
         };
 
         // Load saved connections
@@ -976,6 +986,11 @@ impl App {
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             self.drain_db_events();
+
+            // Advance throbber animation when query is running
+            if self.db.running {
+                self.throbber_state.calc_next();
+            }
 
             // Pre-compute highlighted lines before the draw closure
             let query_text = self.editor.text();
@@ -1235,6 +1250,67 @@ impl App {
                     show_scrollbar: true,
                 };
                 frame.render_widget(grid_widget, grid_area);
+
+                // Loading overlay when query is running
+                if self.db.running {
+                    // Calculate centered overlay area (40% width, minimum 20 chars, 5 lines height)
+                    let overlay_width = (grid_area.width * 40 / 100).max(20).min(grid_area.width);
+                    let overlay_height = 5u16.min(grid_area.height);
+                    let overlay_x =
+                        grid_area.x + (grid_area.width.saturating_sub(overlay_width)) / 2;
+                    let overlay_y =
+                        grid_area.y + (grid_area.height.saturating_sub(overlay_height)) / 2;
+                    let overlay_area = Rect {
+                        x: overlay_x,
+                        y: overlay_y,
+                        width: overlay_width,
+                        height: overlay_height,
+                    };
+
+                    // Clear the overlay area
+                    frame.render_widget(Clear, overlay_area);
+
+                    // Create bordered block
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .style(Style::default().bg(Color::Black));
+
+                    let inner = block.inner(overlay_area);
+                    frame.render_widget(block, overlay_area);
+
+                    // Layout for spinner and elapsed time
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1), // Spinner with label
+                            Constraint::Length(1), // Elapsed time
+                        ])
+                        .split(inner);
+
+                    // Render spinner with label
+                    let throbber = Throbber::default()
+                        .label(" Executing...")
+                        .style(Style::default().fg(Color::White))
+                        .throbber_style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .throbber_set(BRAILLE_SIX);
+
+                    frame.render_stateful_widget(throbber, chunks[0], &mut self.throbber_state);
+
+                    // Render elapsed time
+                    if let Some(start_time) = self.query_start_time {
+                        let elapsed = start_time.elapsed();
+                        let elapsed_text = format!("{:.1}s elapsed", elapsed.as_secs_f64());
+                        let elapsed_widget = Paragraph::new(elapsed_text)
+                            .style(Style::default().fg(Color::DarkGray))
+                            .alignment(Alignment::Center);
+                        frame.render_widget(elapsed_widget, chunks[1]);
+                    }
+                }
 
                 // Status.
                 frame.render_widget(self.status_line(status_area.width), status_area);
@@ -1575,7 +1651,14 @@ impl App {
                 self.key_sequence.mark_hint_shown();
             }
 
-            if event::poll(Duration::from_millis(50))? {
+            // Use faster polling when query is running to keep UI responsive
+            let poll_duration = if self.db.running {
+                Duration::from_millis(16) // ~60 FPS when query running
+            } else {
+                Duration::from_millis(50) // Normal 20 FPS when idle
+            };
+
+            if event::poll(poll_duration)? {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind != KeyEventKind::Press {
@@ -4877,6 +4960,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
+        self.query_start_time = Some(Instant::now());
 
         let tx = self.db_events_tx.clone();
         let started = Instant::now();
@@ -5052,6 +5136,7 @@ impl App {
             }
             DbEvent::QueryFinished { result } => {
                 self.db.running = false;
+                self.query_start_time = None;
                 self.db.last_command_tag = result.command_tag.clone();
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
@@ -5095,11 +5180,13 @@ impl App {
             }
             DbEvent::QueryError { error } => {
                 self.db.running = false;
+                self.query_start_time = None;
                 self.last_status = Some("Query error (see above)".to_string());
                 self.last_error = Some(error);
             }
             DbEvent::QueryCancelled => {
                 self.db.running = false;
+                self.query_start_time = None;
                 self.last_status = Some("Query cancelled".to_string());
             }
             DbEvent::SchemaLoaded { tables } => {
@@ -5220,11 +5307,15 @@ impl App {
                     .style(conn_style)
                     .min_width(40),
             )
-            // High: Running indicator (if running)
+            // Critical: Running indicator (if running) - always visible
             .segment_if(
                 running_indicator.is_some(),
-                StatusSegment::new(running_indicator.unwrap_or_default(), Priority::High)
-                    .style(Style::default().fg(Color::Yellow)),
+                StatusSegment::new(running_indicator.unwrap_or_default(), Priority::Critical)
+                    .style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
             )
             // High: Transaction indicator (if in transaction)
             .segment_if(

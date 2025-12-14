@@ -52,6 +52,9 @@ percent-encoding = "2"
 # Tree widget for sidebar
 tui-tree-widget = "0.23"
 
+# Spinner/throbber for loading indicators
+throbber-widgets-tui = "0.9"
+
 # Confirm dialog widget
 tui_confirm_dialog_with_mouse = "0.3.1"
 
