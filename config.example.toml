@@ -30,6 +30,16 @@ show_borders = true
 # Theme name (reserved for future use)
 theme = "default"
 
+# SQL generation settings (used by Schema panel templates, etc.)
+[sql]
+# Identifier formatting strategy for generated SQL:
+# - "minimal": quote only when needed; schema-qualify only when needed
+# - "qualified_quoted": always schema-qualify and quote identifiers
+identifier_style = "minimal"
+
+# Default LIMIT for generated SELECT templates
+default_select_limit = 100
+
 # Editor settings
 [editor]
 # Tab size in spaces
