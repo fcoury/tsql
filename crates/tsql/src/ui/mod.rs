@@ -30,7 +30,7 @@ pub use grid::{
     ResizeAction,
 };
 pub use help_popup::{HelpAction, HelpPopup};
-pub use highlighted_editor::{create_sql_highlighter, HighlightedTextArea};
+pub use highlighted_editor::{create_sql_highlighter, CursorShape, HighlightedTextArea};
 pub use json_editor::{JsonEditorAction, JsonEditorModal};
 pub use key_hint_popup::KeyHintPopup;
 pub use key_sequence::{

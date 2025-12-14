@@ -1,12 +1,27 @@
 //! Highlighted editor widget that combines tui-textarea editing with tui-syntax highlighting.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use tui_syntax::{sql, themes, Highlighter};
 use tui_textarea::TextArea;
+
+/// The shape of the cursor to display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorShape {
+    /// Block cursor (full character highlight, default for normal mode)
+    /// This is rendered by highlighting the character under the cursor.
+    #[default]
+    Block,
+    /// Bar cursor (thin vertical line before character, default for insert mode)
+    /// This should use the terminal's native cursor via frame.set_cursor_position().
+    Bar,
+    /// Underline cursor (line under the character)
+    /// This should use the terminal's native cursor via frame.set_cursor_position().
+    Underline,
+}
 
 /// A widget that renders a TextArea with syntax highlighting.
 ///
@@ -22,6 +37,10 @@ pub struct HighlightedTextArea<'a> {
     selection_style: Style,
     /// Current scroll offset (row, col). Updated during render.
     scroll_offset: (u16, u16),
+    /// Whether to show the cursor. Defaults to true.
+    show_cursor: bool,
+    /// The shape of the cursor. Defaults to Block.
+    cursor_shape: CursorShape,
 }
 
 impl<'a> HighlightedTextArea<'a> {
@@ -33,6 +52,8 @@ impl<'a> HighlightedTextArea<'a> {
             cursor_style: Style::default().add_modifier(Modifier::REVERSED),
             selection_style: Style::default().bg(Color::Blue),
             scroll_offset: (0, 0),
+            show_cursor: true,
+            cursor_shape: CursorShape::Block,
         }
     }
 
@@ -55,6 +76,63 @@ impl<'a> HighlightedTextArea<'a> {
     pub fn scroll(mut self, offset: (u16, u16)) -> Self {
         self.scroll_offset = offset;
         self
+    }
+
+    /// Set whether to show the cursor. Defaults to true.
+    pub fn show_cursor(mut self, show: bool) -> Self {
+        self.show_cursor = show;
+        self
+    }
+
+    /// Set the cursor shape. Defaults to Block.
+    pub fn cursor_shape(mut self, shape: CursorShape) -> Self {
+        self.cursor_shape = shape;
+        self
+    }
+
+    /// Calculate the screen position of the cursor for use with frame.set_cursor_position().
+    /// Returns None if the cursor is not visible (scrolled out of view or show_cursor is false).
+    /// The returned position is relative to the widget's area (including block borders).
+    pub fn cursor_screen_position(&self, area: Rect) -> Option<Position> {
+        if !self.show_cursor {
+            return None;
+        }
+
+        // Get the inner area (accounting for block borders)
+        let inner_area = if let Some(ref block) = self.block {
+            block.inner(area)
+        } else {
+            area
+        };
+
+        if inner_area.width == 0 || inner_area.height == 0 {
+            return None;
+        }
+
+        let (cursor_row, cursor_col) = self.textarea.cursor();
+
+        // Calculate scroll offset
+        let (scroll_row, scroll_col) = calculate_scroll_offset(
+            cursor_row,
+            cursor_col,
+            self.scroll_offset,
+            inner_area.height as usize,
+            inner_area.width as usize,
+        );
+
+        // Calculate cursor position on screen
+        let screen_row = cursor_row.saturating_sub(scroll_row);
+        let screen_col = cursor_col.saturating_sub(scroll_col);
+
+        // Check if cursor is within visible area
+        if screen_row >= inner_area.height as usize || screen_col >= inner_area.width as usize {
+            return None;
+        }
+
+        Some(Position {
+            x: inner_area.x + screen_col as u16,
+            y: inner_area.y + screen_row as u16,
+        })
     }
 }
 
@@ -123,8 +201,9 @@ impl Widget for HighlightedTextArea<'_> {
                 }
             }
 
-            // Apply cursor highlighting (use original cursor_col for span manipulation)
-            if is_cursor_line {
+            // Apply cursor highlighting only for Block cursor shape
+            // Bar and Underline cursors use the terminal's native cursor
+            if is_cursor_line && self.show_cursor && self.cursor_shape == CursorShape::Block {
                 line_spans = apply_cursor_to_spans(line_spans, cursor_col, self.cursor_style);
             }
 
@@ -132,10 +211,15 @@ impl Widget for HighlightedTextArea<'_> {
             final_lines.push(result_line);
         }
 
-        // Handle completely empty editor - show cursor on empty line
+        // Handle completely empty editor - show block cursor on empty line (only if cursor is visible)
+        // Bar and Underline cursors use the terminal's native cursor
         if final_lines.is_empty() {
-            let cursor_span = Span::styled(" ", self.cursor_style);
-            final_lines.push(Line::from(vec![cursor_span]));
+            if self.show_cursor && self.cursor_shape == CursorShape::Block {
+                let cursor_span = Span::styled(" ", self.cursor_style);
+                final_lines.push(Line::from(vec![cursor_span]));
+            } else {
+                final_lines.push(Line::from(vec![]));
+            }
         }
 
         // Render the highlighted text as a Paragraph with scroll offset
@@ -207,7 +291,8 @@ fn apply_selection_to_spans(
     apply_style_to_range(spans, line_start, line_end, selection_style)
 }
 
-/// Apply cursor highlighting to spans at a specific column.
+/// Apply block cursor highlighting to spans at a specific column.
+/// This highlights the character at the cursor position with the cursor style.
 fn apply_cursor_to_spans(
     spans: Vec<Span<'static>>,
     cursor_col: usize,
@@ -234,12 +319,11 @@ fn apply_cursor_to_spans(
                 result.push(Span::styled(before, span.style));
             }
 
-            // Cursor character
+            // Block cursor: apply style to the character
             if char_offset < chars.len() {
                 let cursor_char: String = chars[char_offset..char_offset + 1].iter().collect();
                 result.push(Span::styled(cursor_char, cursor_style));
             } else {
-                // Cursor at end of span - add a space as cursor
                 result.push(Span::styled(" ", cursor_style));
             }
 
@@ -257,7 +341,7 @@ fn apply_cursor_to_spans(
         current_col = span_end;
     }
 
-    // If cursor is past all spans (at end of line), add a cursor space
+    // If cursor is past all spans (at end of line), add a block cursor space
     if !cursor_applied {
         result.push(Span::styled(" ", cursor_style));
     }
