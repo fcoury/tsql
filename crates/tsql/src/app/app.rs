@@ -3792,7 +3792,14 @@ impl App {
             }
             ConnectionManagerAction::Connect { entry } => {
                 self.connection_manager = None;
-                self.connect_to_entry(entry);
+                if self.editor.is_modified() {
+                    self.confirm_prompt = Some(ConfirmPrompt::new(
+                        "You have unsaved changes. Switch connection anyway?",
+                        ConfirmContext::SwitchConnection { entry },
+                    ));
+                } else {
+                    self.connect_to_entry(entry);
+                }
             }
             ConnectionManagerAction::Add => {
                 self.connection_form = Some(ConnectionFormModal::with_keymap(
