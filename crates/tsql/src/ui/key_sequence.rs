@@ -139,19 +139,20 @@ impl<C> KeySequenceHandlerWithContext<C> {
     }
 
     /// Starts a new key sequence with caller-provided context.
+    /// Cancels any existing pending sequence first (cancel+restart behavior).
     pub fn start_with_context(&mut self, key: PendingKey, context: C) {
+        self.clear_state();
         self.pending = Some(key);
         self.pending_since = Some(Instant::now());
-        self.hint_shown = false;
         self.pending_context = Some(context);
     }
 
     /// Starts a new key sequence.
+    /// Cancels any existing pending sequence first (cancel+restart behavior).
     pub fn start(&mut self, key: PendingKey) {
+        self.clear_state();
         self.pending = Some(key);
         self.pending_since = Some(Instant::now());
-        self.hint_shown = false;
-        self.pending_context = None;
     }
 
     /// Cancels the current sequence and clears any pending state.
@@ -504,6 +505,27 @@ mod tests {
 
         // Start a new sequence - context should be cleared
         handler.start(PendingKey::G);
+        let result = handler.process_second_key('g');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoFirst,
+                context: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_process_first_key_cancels_schema_table_context() {
+        let mut handler: KeySequenceHandlerWithContext<String> =
+            KeySequenceHandlerWithContext::new(500);
+
+        handler.start_with_context(PendingKey::SchemaTable, "table1".to_string());
+
+        // Starting a new sequence via process_first_key should cancel prior pending state (and its context)
+        let result = handler.process_first_key('g');
+        assert_eq!(result, KeySequenceResult::Started(PendingKey::G));
+
         let result = handler.process_second_key('g');
         assert_eq!(
             result,
