@@ -1,10 +1,12 @@
 //! Session state persistence for restoring app state between launches.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use crate::config::config_dir;
 
@@ -103,12 +105,15 @@ pub fn save_session(state: &SessionState) -> Result<()> {
 }
 
 /// Save session state to a specific path.
+/// Uses atomic write (temp file + rename) to prevent corruption on crash.
 pub fn save_session_to_path(state: &SessionState, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Session path has no parent directory")?;
+
     // Ensure parent directory exists.
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
-    }
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
 
     let file = SessionFile {
         version: SESSION_VERSION,
@@ -117,8 +122,20 @@ pub fn save_session_to_path(state: &SessionState, path: &Path) -> Result<()> {
 
     let content = serde_json::to_string_pretty(&file).context("Failed to serialize session")?;
 
-    fs::write(path, content)
-        .with_context(|| format!("Failed to write session file: {}", path.display()))?;
+    // Atomic write: temp file in same directory + rename.
+    let mut tmp = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temp session file in: {}",
+            parent.display()
+        )
+    })?;
+
+    tmp.write_all(content.as_bytes())
+        .context("Failed to write temp session file")?;
+    tmp.flush().context("Failed to flush temp session file")?;
+
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("Failed to persist session file: {}", e))?;
 
     Ok(())
 }
@@ -214,6 +231,24 @@ mod tests {
         assert_eq!(loaded.editor_content, "SELECT 1");
         assert!(loaded.schema_expanded.is_empty());
         assert!(loaded.sidebar_visible); // default
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_future_version_returns_defaults() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+
+        // Write a session with a future version number.
+        let content = r#"{"version": 999, "editor_content": "SELECT 1", "sidebar_visible": false}"#;
+        fs::write(&path, content).unwrap();
+
+        // Future version should return defaults for safety.
+        let loaded = load_session_from_path(&path).unwrap();
+        assert!(loaded.connection_name.is_none());
+        assert!(loaded.editor_content.is_empty()); // default, not "SELECT 1"
+        assert!(loaded.sidebar_visible); // default true, not false
 
         fs::remove_file(&path).ok();
     }

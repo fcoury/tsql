@@ -871,11 +871,9 @@ impl App {
     /// Apply restored session state.
     /// Returns the connection name to auto-connect to, if any.
     pub fn apply_session_state(&mut self, state: SessionState) -> Option<String> {
-        // Restore editor content
-        if !state.editor_content.is_empty() {
-            self.editor.set_text(state.editor_content);
-            self.editor.mark_saved();
-        }
+        // Restore editor content (apply exactly, even if empty)
+        self.editor.set_text(state.editor_content);
+        self.editor.mark_saved();
 
         // Restore sidebar visibility
         self.sidebar_visible = state.sidebar_visible;
