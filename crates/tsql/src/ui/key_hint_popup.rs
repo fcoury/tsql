@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn test_title_char_schema_table() {
         let popup = KeyHintPopup::new(PendingKey::SchemaTable);
-        assert_eq!(popup.title_char(), 'E');
+        assert_eq!(popup.title_char(), '⏎');
     }
 
     #[test]
