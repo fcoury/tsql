@@ -55,7 +55,7 @@ tui_confirm_dialog_with_mouse.workspace = true
 tempfile.workspace = true
 
 # Internal crate
-tui-syntax = { path = "../tui-syntax", version = "0.2.0" }
+tui-syntax = { path = "../tui-syntax", version = "0.3.0" }
 
 [dev-dependencies]
 dotenvy.workspace = true
