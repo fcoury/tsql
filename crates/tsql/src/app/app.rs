@@ -1688,7 +1688,10 @@ impl App {
                                 Focus::Query
                             }
                         }
-                        Focus::Sidebar(_) => Focus::Query,
+                        Focus::Sidebar(SidebarSection::Connections) => {
+                            Focus::Sidebar(SidebarSection::Schema)
+                        }
+                        Focus::Sidebar(SidebarSection::Schema) => Focus::Query,
                     };
                     return false;
                 }
@@ -1702,7 +1705,10 @@ impl App {
                             }
                         }
                         Focus::Grid => Focus::Query,
-                        Focus::Sidebar(_) => Focus::Grid,
+                        Focus::Sidebar(SidebarSection::Schema) => {
+                            Focus::Sidebar(SidebarSection::Connections)
+                        }
+                        Focus::Sidebar(SidebarSection::Connections) => Focus::Grid,
                     };
                     return false;
                 }
