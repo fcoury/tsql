@@ -45,6 +45,9 @@ percent-encoding.workspace = true
 # Tree widget for sidebar
 tui-tree-widget.workspace = true
 
+# Spinner/throbber for loading indicators
+throbber-widgets-tui.workspace = true
+
 # Confirm dialog widget
 tui_confirm_dialog_with_mouse.workspace = true
 

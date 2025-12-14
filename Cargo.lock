@@ -1683,6 +1683,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "throbber-widgets-tui"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45e58887883fb0a259717b16d68d251983e40850b4b2f45c2da410f46d4333dc"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "tiff"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1928,6 +1937,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "throbber-widgets-tui",
  "tokio",
  "tokio-postgres",
  "toml",
