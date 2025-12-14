@@ -34,7 +34,7 @@ const G_HINTS: &[KeyHint] = &[
     KeyHint::new("g", "first row"),
     KeyHint::new("e", "editor"),
     KeyHint::new("c", "connections"),
-    KeyHint::new("t", "tables"),
+    KeyHint::new("t/s", "schema"),
     KeyHint::new("r", "results"),
 ];
 

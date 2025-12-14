@@ -202,7 +202,7 @@ impl<C> KeySequenceHandlerWithContext<C> {
                 'g' => Some(KeySequenceAction::GotoFirst),
                 'e' => Some(KeySequenceAction::GotoEditor),
                 'c' => Some(KeySequenceAction::GotoConnections),
-                't' => Some(KeySequenceAction::GotoTables),
+                't' | 's' => Some(KeySequenceAction::GotoTables),
                 'r' => Some(KeySequenceAction::GotoResults),
                 _ => None,
             },
@@ -307,6 +307,21 @@ mod tests {
 
         handler.process_first_key('g');
         let result = handler.process_second_key('t');
+        assert_eq!(
+            result,
+            KeySequenceResult::Completed(KeySequenceCompletion {
+                action: KeySequenceAction::GotoTables,
+                context: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_g_sequence_gs() {
+        let mut handler = KeySequenceHandler::new(500);
+
+        handler.process_first_key('g');
+        let result = handler.process_second_key('s');
         assert_eq!(
             result,
             KeySequenceResult::Completed(KeySequenceCompletion {
