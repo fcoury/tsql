@@ -128,38 +128,23 @@ pub fn save_session_to_path(state: &SessionState, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_path() -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "tsql_session_test_{}_{}.json",
-            std::process::id(),
-            id
-        ));
-        path
-    }
+    use tempfile::tempdir;
 
     #[test]
     fn test_load_missing_file() {
-        let path = temp_path();
-        let _ = fs::remove_file(&path);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
 
         let state = load_session_from_path(&path).unwrap();
         assert!(state.connection_name.is_none());
         assert!(state.editor_content.is_empty());
         assert!(!state.sidebar_visible); // default false
-
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn test_save_and_load() {
-        let path = temp_path();
-        let _ = fs::remove_file(&path);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
 
         let state = SessionState {
             connection_name: Some("myconn".to_string()),
@@ -178,19 +163,16 @@ mod tests {
         assert_eq!(loaded.editor_content, "SELECT * FROM users");
         assert_eq!(loaded.schema_expanded.len(), 2);
         assert!(!loaded.sidebar_visible);
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_corrupted_file_returns_error() {
-        let path = temp_path();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
         fs::write(&path, "not valid json {{{").unwrap();
 
         let result = load_session_from_path(&path);
         assert!(result.is_err());
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -204,8 +186,8 @@ mod tests {
 
     #[test]
     fn test_partial_json_uses_defaults() {
-        let path = temp_path();
-        let _ = fs::remove_file(&path);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
 
         // Write a session with only some fields.
         let content = r#"{"version": 1, "editor_content": "SELECT 1"}"#;
@@ -216,14 +198,12 @@ mod tests {
         assert_eq!(loaded.editor_content, "SELECT 1");
         assert!(loaded.schema_expanded.is_empty());
         assert!(!loaded.sidebar_visible); // default false
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_future_version_returns_defaults() {
-        let path = temp_path();
-        let _ = fs::remove_file(&path);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
 
         // Write a session with a future version number.
         let content = r#"{"version": 999, "editor_content": "SELECT 1", "sidebar_visible": true}"#;
@@ -234,7 +214,5 @@ mod tests {
         assert!(loaded.connection_name.is_none());
         assert!(loaded.editor_content.is_empty()); // default, not "SELECT 1"
         assert!(!loaded.sidebar_visible); // default false, not true
-
-        fs::remove_file(&path).ok();
     }
 }

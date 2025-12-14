@@ -27,7 +27,7 @@ use crate::config::{
     KeyBinding, Keymap,
 };
 use crate::history::{History, HistoryEntry};
-use crate::session::{save_session, SessionState};
+use crate::session::SessionState;
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
     quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
@@ -865,7 +865,7 @@ impl App {
     /// Save session state to disk.
     pub fn save_session(&self) -> Result<()> {
         let state = self.capture_session_state();
-        save_session(&state)
+        crate::session::save_session(&state)
     }
 
     /// Apply restored session state.
@@ -879,9 +879,12 @@ impl App {
         self.sidebar_visible = state.sidebar_visible;
 
         // Store pending schema expanded for later application when schema loads
-        if !state.schema_expanded.is_empty() {
-            self.pending_schema_expanded = Some(state.schema_expanded);
-        }
+        // Always set (even to None) to clear any prior pending paths
+        self.pending_schema_expanded = if state.schema_expanded.is_empty() {
+            None
+        } else {
+            Some(state.schema_expanded)
+        };
 
         // Return connection name for auto-connect handling
         state.connection_name
