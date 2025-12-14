@@ -87,7 +87,7 @@ const GOTO: HelpSection = HelpSection::new(
         KeyBinding::new("gg", "Go to first row / document start"),
         KeyBinding::new("ge", "Go to editor"),
         KeyBinding::new("gc", "Go to connections sidebar"),
-        KeyBinding::new("gt/gs", "Go to schema sidebar"),
+        KeyBinding::new("gs", "Go to schema sidebar"),
         KeyBinding::new("gr", "Go to results grid"),
     ],
 );
