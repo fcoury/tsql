@@ -1758,6 +1758,33 @@ impl App {
                                 }
                                 GridKeyResult::None
                             }
+                            // Goto navigation (custom keybindings for navigation)
+                            Action::GotoFirst => {
+                                // In grid context, go to first row
+                                self.grid_state.cursor_row = 0;
+                                GridKeyResult::None
+                            }
+                            Action::GotoEditor => {
+                                self.focus = Focus::Query;
+                                GridKeyResult::None
+                            }
+                            Action::GotoConnections => {
+                                self.sidebar_visible = true;
+                                self.sidebar_focus = SidebarSection::Connections;
+                                self.focus = Focus::Sidebar(SidebarSection::Connections);
+                                GridKeyResult::None
+                            }
+                            Action::GotoTables => {
+                                self.sidebar_visible = true;
+                                self.sidebar_focus = SidebarSection::Schema;
+                                self.focus = Focus::Sidebar(SidebarSection::Schema);
+                                GridKeyResult::None
+                            }
+                            Action::GotoResults => {
+                                // Already in grid, this is a no-op but keep focus
+                                self.focus = Focus::Grid;
+                                GridKeyResult::None
+                            }
                             _ => {
                                 // Delegate to grid state
                                 self.grid_state.handle_action(action, &self.grid)
@@ -3188,6 +3215,30 @@ impl App {
                 }
             }
 
+            // Goto navigation (custom keybindings for navigation)
+            Action::GotoFirst => {
+                // In editor context, go to document start
+                self.editor.textarea.move_cursor(CursorMove::Top);
+                self.editor.textarea.move_cursor(CursorMove::Head);
+            }
+            Action::GotoEditor => {
+                // Already in editor, this is a no-op but keep focus
+                self.focus = Focus::Query;
+            }
+            Action::GotoConnections => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Connections;
+                self.focus = Focus::Sidebar(SidebarSection::Connections);
+            }
+            Action::GotoTables => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Schema;
+                self.focus = Focus::Sidebar(SidebarSection::Schema);
+            }
+            Action::GotoResults => {
+                self.focus = Focus::Grid;
+            }
+
             // Actions not applicable to editor
             _ => return false,
         }
@@ -3639,6 +3690,32 @@ impl App {
                         }
                         Action::SelectAll => {
                             self.editor.textarea.select_all();
+                            return;
+                        }
+                        // Goto navigation (custom keybindings for navigation)
+                        Action::GotoFirst => {
+                            self.editor.textarea.move_cursor(CursorMove::Top);
+                            self.editor.textarea.move_cursor(CursorMove::Head);
+                            return;
+                        }
+                        Action::GotoEditor => {
+                            // Already in editor
+                            return;
+                        }
+                        Action::GotoConnections => {
+                            self.sidebar_visible = true;
+                            self.sidebar_focus = SidebarSection::Connections;
+                            self.focus = Focus::Sidebar(SidebarSection::Connections);
+                            return;
+                        }
+                        Action::GotoTables => {
+                            self.sidebar_visible = true;
+                            self.sidebar_focus = SidebarSection::Schema;
+                            self.focus = Focus::Sidebar(SidebarSection::Schema);
+                            return;
+                        }
+                        Action::GotoResults => {
+                            self.focus = Focus::Grid;
                             return;
                         }
                         _ => {}
@@ -5860,5 +5937,71 @@ mod tests {
             app.connection_form.is_none(),
             "Unmodified form should close immediately with Esc"
         );
+    }
+
+    // ========== Goto Action Tests ==========
+
+    #[test]
+    fn test_goto_action_bindings_in_grid_keymap() {
+        use crate::config::CustomKeyBinding;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Create config with goto action keybindings
+        let mut config = Config::default();
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+g".to_string(),
+            action: "goto_first".to_string(),
+            description: Some("Go to first row".to_string()),
+        });
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+e".to_string(),
+            action: "goto_editor".to_string(),
+            description: Some("Go to editor".to_string()),
+        });
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+c".to_string(),
+            action: "goto_connections".to_string(),
+            description: Some("Go to connections".to_string()),
+        });
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+t".to_string(),
+            action: "goto_tables".to_string(),
+            description: Some("Go to tables".to_string()),
+        });
+        config.keymap.grid.push(CustomKeyBinding {
+            key: "ctrl+r".to_string(),
+            action: "goto_results".to_string(),
+            description: Some("Go to results".to_string()),
+        });
+
+        let app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        // Verify the goto actions were registered correctly
+        let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_g), Some(&Action::GotoFirst));
+
+        let ctrl_e = KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_e), Some(&Action::GotoEditor));
+
+        let ctrl_c = KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_c), Some(&Action::GotoConnections));
+
+        let ctrl_t = KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_t), Some(&Action::GotoTables));
+
+        let ctrl_r = KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.grid_keymap.get(&ctrl_r), Some(&Action::GotoResults));
     }
 }
