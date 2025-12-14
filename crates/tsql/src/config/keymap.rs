@@ -953,6 +953,19 @@ mod tests {
         // Test case insensitivity
         assert_eq!("MOVE_UP".parse::<Action>().unwrap(), Action::MoveUp);
         assert_eq!("Move_Up".parse::<Action>().unwrap(), Action::MoveUp);
+
+        // Goto sequences
+        assert_eq!("goto_first".parse::<Action>().unwrap(), Action::GotoFirst);
+        assert_eq!("goto_editor".parse::<Action>().unwrap(), Action::GotoEditor);
+        assert_eq!(
+            "goto_connections".parse::<Action>().unwrap(),
+            Action::GotoConnections
+        );
+        assert_eq!("goto_tables".parse::<Action>().unwrap(), Action::GotoTables);
+        assert_eq!(
+            "goto_results".parse::<Action>().unwrap(),
+            Action::GotoResults
+        );
     }
 
     #[test]

@@ -90,7 +90,12 @@ impl KeySequenceHandler {
     /// This becomes true when:
     /// 1. There is a pending key
     /// 2. The timeout has elapsed since the key was pressed
+    /// 3. The hint hasn't already been marked as shown (to avoid re-triggering)
     pub fn should_show_hint(&self) -> bool {
+        // Once hint is shown, keep returning true until sequence completes/cancels
+        if self.hint_shown {
+            return self.pending.is_some();
+        }
         if let (Some(_), Some(since)) = (self.pending, self.pending_since) {
             since.elapsed() >= Duration::from_millis(self.timeout_ms)
         } else {
@@ -170,8 +175,7 @@ impl KeySequenceHandler {
         result
     }
 
-    /// Check if there's a pending key and timeout hasn't been reached.
-    /// Useful for deciding whether to wait for more input.
+    /// Returns true if there is a pending key sequence.
     pub fn is_waiting(&self) -> bool {
         self.pending.is_some()
     }
@@ -290,7 +294,7 @@ mod tests {
         handler.process_first_key('g');
         assert!(!handler.should_show_hint());
 
-        sleep(Duration::from_millis(20));
+        sleep(Duration::from_millis(50));
         assert!(handler.should_show_hint());
     }
 

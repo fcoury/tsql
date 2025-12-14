@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::key_sequence::PendingKey;
 
@@ -65,22 +66,46 @@ impl KeyHintPopup {
     fn popup_area(&self, frame_area: Rect) -> Rect {
         let hints = self.hints();
 
-        // Calculate dimensions based on content
-        // Width: longest hint + padding (key + 2 spaces + description + borders)
-        let max_desc_len = hints
+        // Minimum sensible dimensions
+        const MIN_WIDTH: u16 = 10;
+        const MIN_HEIGHT: u16 = 3;
+        const PADDING: u16 = 2;
+
+        // Calculate dimensions based on content using Unicode display width
+        // Width: " key" (space + key) + "  " (2 spaces) + description + " " (trailing space) + borders (2)
+        let max_content_width = hints
             .iter()
-            .map(|h| h.description.len())
+            .map(|h| {
+                let key_width = 1 + h.key.width(); // leading space + key
+                let desc_width = h.description.width();
+                key_width + 2 + desc_width + 1 // " key" + "  " + desc + " "
+            })
             .max()
             .unwrap_or(10);
-        let width = (3 + max_desc_len + 4) as u16; // "k  description" + borders
+
+        // Add borders (2 chars for left + right)
+        let desired_width = (max_content_width + 2) as u16;
 
         // Height: number of hints + borders (top and bottom)
-        let height = (hints.len() + 2) as u16;
+        let desired_height = (hints.len() + 2) as u16;
 
-        // Position in bottom-right with some padding
-        let padding = 2;
-        let x = frame_area.width.saturating_sub(width + padding);
-        let y = frame_area.height.saturating_sub(height + padding);
+        // Clamp dimensions to fit within frame_area, respecting padding
+        let max_available_width = frame_area.width.saturating_sub(PADDING);
+        let max_available_height = frame_area.height.saturating_sub(PADDING);
+
+        let width = desired_width
+            .max(MIN_WIDTH)
+            .min(max_available_width)
+            .min(frame_area.width); // Final safety clamp
+
+        let height = desired_height
+            .max(MIN_HEIGHT)
+            .min(max_available_height)
+            .min(frame_area.height); // Final safety clamp
+
+        // Position in bottom-right with padding
+        let x = frame_area.width.saturating_sub(width + PADDING);
+        let y = frame_area.height.saturating_sub(height + PADDING);
 
         Rect::new(x, y, width, height)
     }
@@ -164,5 +189,21 @@ mod tests {
         // Should have reasonable size
         assert!(area.width >= 15);
         assert!(area.height == 7); // 5 hints + 2 borders
+    }
+
+    #[test]
+    fn test_popup_area_clamped_on_small_terminal() {
+        let popup = KeyHintPopup::new(PendingKey::G);
+        // Very small terminal
+        let frame_area = Rect::new(0, 0, 15, 5);
+        let area = popup.popup_area(frame_area);
+
+        // Width and height should never exceed frame_area
+        assert!(area.width <= frame_area.width);
+        assert!(area.height <= frame_area.height);
+
+        // Position should be valid (within frame bounds)
+        assert!(area.x + area.width <= frame_area.width);
+        assert!(area.y + area.height <= frame_area.height);
     }
 }

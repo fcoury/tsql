@@ -1381,6 +1381,11 @@ impl App {
                 }
             })?;
 
+            // Mark hint as shown after rendering (must be outside draw closure)
+            if self.key_sequence.should_show_hint() && !self.key_sequence.is_hint_shown() {
+                self.key_sequence.mark_hint_shown();
+            }
+
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => {
@@ -1461,6 +1466,9 @@ impl App {
                 self.cancel_query();
                 return false;
             }
+
+            // Cancel any pending multi-key sequence (e.g., started with 'g')
+            self.key_sequence.cancel();
 
             self.help_popup = None;
             self.search.close();
@@ -1584,6 +1592,8 @@ impl App {
         if self.mode == Mode::Normal {
             // If there's a pending key sequence, process the second key
             if self.key_sequence.is_waiting() {
+                // Prevent legacy operator-pending state from leaking across key sequences.
+                self.pending_key = None;
                 if let KeyCode::Char(c) = key.code {
                     if key.modifiers == KeyModifiers::NONE {
                         let result = self.key_sequence.process_second_key(c);
@@ -1616,6 +1626,8 @@ impl App {
             if !self.key_sequence.is_waiting() {
                 if let KeyCode::Char('g') = key.code {
                     if key.modifiers == KeyModifiers::NONE {
+                        // Starting a global `g*` sequence should cancel any editor operator-pending state.
+                        self.pending_key = None;
                         let result = self.key_sequence.process_first_key('g');
                         if matches!(result, KeySequenceResult::Started(_)) {
                             return false;
