@@ -1251,8 +1251,8 @@ impl App {
                 };
                 frame.render_widget(grid_widget, grid_area);
 
-                // Loading overlay when query is running
-                if self.db.running {
+                // Loading overlay when query is running (only if grid area is large enough)
+                if self.db.running && grid_area.width >= 20 && grid_area.height >= 5 {
                     // Calculate centered overlay area (40% width, minimum 20 chars, 5 lines height)
                     let overlay_width = (grid_area.width * 40 / 100).max(20).min(grid_area.width);
                     let overlay_height = 5u16.min(grid_area.height);
@@ -3025,6 +3025,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Updating...".to_string());
+        self.query_start_time = Some(Instant::now());
 
         let tx = self.db_events_tx.clone();
 
@@ -3283,6 +3284,7 @@ impl App {
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
+        self.query_start_time = Some(Instant::now());
 
         let tx = self.db_events_tx.clone();
         let started = Instant::now();
@@ -5201,6 +5203,7 @@ impl App {
             }
             DbEvent::CellUpdated { row, col, value } => {
                 self.db.running = false;
+                self.query_start_time = None;
                 // Update the grid cell
                 if let Some(grid_row) = self.grid.rows.get_mut(row) {
                     if let Some(cell) = grid_row.get_mut(col) {
