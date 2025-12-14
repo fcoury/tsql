@@ -13,6 +13,15 @@ pub enum Focus {
     Sidebar(SidebarSection),
 }
 
+/// Direction for panel navigation (Ctrl+HJKL)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Normal,
