@@ -7,7 +7,6 @@ A modern, keyboard-first PostgreSQL CLI with a TUI interface.
 [![License](https://img.shields.io/crates/l/tsql.svg)](LICENSE)
 
 ![tsql screenshot](assets/screenshot.png)
-![tsql json editor](assets/screenshot2.png)
 
 ## Features
 
