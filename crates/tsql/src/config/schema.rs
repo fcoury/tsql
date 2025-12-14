@@ -13,6 +13,8 @@ pub struct Config {
     pub editor: EditorConfig,
     /// Connection settings
     pub connection: ConnectionConfig,
+    /// SQL generation / templating settings
+    pub sql: SqlConfig,
     /// Keymap customizations
     pub keymap: KeymapConfig,
 }
@@ -159,6 +161,35 @@ impl Default for KeymapConfig {
             connection_form: Vec::new(),
         }
     }
+}
+
+/// SQL generation / templating settings
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqlConfig {
+    /// How identifiers are formatted in generated SQL.
+    pub identifier_style: IdentifierStyle,
+    /// Default LIMIT for generated SELECT templates.
+    pub default_select_limit: u32,
+}
+
+impl Default for SqlConfig {
+    fn default() -> Self {
+        Self {
+            identifier_style: IdentifierStyle::Minimal,
+            default_select_limit: 100,
+        }
+    }
+}
+
+/// Identifier formatting style used for generated SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentifierStyle {
+    /// Minimal qualification; quote only when required.
+    Minimal,
+    /// Always qualify with schema and quote identifiers.
+    QualifiedQuoted,
 }
 
 /// A custom keybinding definition

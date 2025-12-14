@@ -16,7 +16,8 @@ pub use connections::{
 };
 pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{
-    Config, ConnectionConfig, CustomKeyBinding, DisplayConfig, EditorConfig, KeymapConfig,
+    Config, ConnectionConfig, CustomKeyBinding, DisplayConfig, EditorConfig, IdentifierStyle,
+    KeymapConfig, SqlConfig,
 };
 
 use anyhow::{Context, Result};
