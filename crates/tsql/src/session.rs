@@ -14,7 +14,7 @@ use crate::config::config_dir;
 const SESSION_VERSION: u32 = 1;
 
 /// Serializable session state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     /// Active connection name (if connected via saved connection).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -29,24 +29,9 @@ pub struct SessionState {
     #[serde(default)]
     pub schema_expanded: Vec<Vec<String>>,
 
-    /// Whether sidebar is visible.
-    #[serde(default = "default_sidebar_visible")]
+    /// Whether sidebar is visible (default: false to match App default).
+    #[serde(default)]
     pub sidebar_visible: bool,
-}
-
-fn default_sidebar_visible() -> bool {
-    true
-}
-
-impl Default for SessionState {
-    fn default() -> Self {
-        Self {
-            connection_name: None,
-            editor_content: String::new(),
-            schema_expanded: Vec::new(),
-            sidebar_visible: true,
-        }
-    }
 }
 
 /// The session file format with versioning.
@@ -66,7 +51,7 @@ impl Default for SessionFile {
     }
 }
 
-/// Returns the session file path (~/.config/tsql/session.json).
+/// Returns the session file path (`<config_dir>/session.json`).
 pub fn session_path() -> Option<PathBuf> {
     config_dir().map(|p| p.join("session.json"))
 }
@@ -166,7 +151,7 @@ mod tests {
         let state = load_session_from_path(&path).unwrap();
         assert!(state.connection_name.is_none());
         assert!(state.editor_content.is_empty());
-        assert!(state.sidebar_visible);
+        assert!(!state.sidebar_visible); // default false
 
         let _ = fs::remove_file(&path);
     }
@@ -214,7 +199,7 @@ mod tests {
         assert!(state.connection_name.is_none());
         assert!(state.editor_content.is_empty());
         assert!(state.schema_expanded.is_empty());
-        assert!(state.sidebar_visible);
+        assert!(!state.sidebar_visible); // default false, matches App default
     }
 
     #[test]
@@ -230,7 +215,7 @@ mod tests {
         assert!(loaded.connection_name.is_none());
         assert_eq!(loaded.editor_content, "SELECT 1");
         assert!(loaded.schema_expanded.is_empty());
-        assert!(loaded.sidebar_visible); // default
+        assert!(!loaded.sidebar_visible); // default false
 
         fs::remove_file(&path).ok();
     }
@@ -241,14 +226,14 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         // Write a session with a future version number.
-        let content = r#"{"version": 999, "editor_content": "SELECT 1", "sidebar_visible": false}"#;
+        let content = r#"{"version": 999, "editor_content": "SELECT 1", "sidebar_visible": true}"#;
         fs::write(&path, content).unwrap();
 
         // Future version should return defaults for safety.
         let loaded = load_session_from_path(&path).unwrap();
         assert!(loaded.connection_name.is_none());
         assert!(loaded.editor_content.is_empty()); // default, not "SELECT 1"
-        assert!(loaded.sidebar_visible); // default true, not false
+        assert!(!loaded.sidebar_visible); // default false, not true
 
         fs::remove_file(&path).ok();
     }

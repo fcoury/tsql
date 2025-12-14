@@ -4903,6 +4903,7 @@ impl App {
                 self.db.status = DbStatus::Error;
                 self.db.client = None;
                 self.db.running = false;
+                self.current_connection_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
@@ -4910,6 +4911,7 @@ impl App {
                 self.db.status = DbStatus::Error;
                 self.db.client = None;
                 self.db.running = false;
+                self.current_connection_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
