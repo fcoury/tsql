@@ -5740,7 +5740,9 @@ impl App {
             return;
         };
 
-        if self.db.running {
+        // Check if query is already running OR if we have an active paged cursor
+        // (paged queries keep cursor open even after db.running is cleared)
+        if self.db.running || self.paged_query.is_some() {
             self.last_status = Some("Query already running".to_string());
             return;
         }
@@ -5787,7 +5789,7 @@ impl App {
         &self,
         client: SharedClient,
         query: String,
-        _max_rows: usize, // No longer used - fetch on demand instead
+        max_rows: usize, // Maximum rows to fetch (0 = unlimited)
         page_size: usize,
         source_table: Option<String>,
         tx: mpsc::UnboundedSender<DbEvent>,
@@ -5798,23 +5800,15 @@ impl App {
         self.rt.spawn(async move {
             let guard = client.lock().await;
 
-            // Start transaction and declare cursor
-            let begin_result = guard.simple_query("BEGIN").await;
-            if let Err(e) = begin_result {
-                let _ = tx.send(DbEvent::QueryError {
-                    error: format!("Failed to begin transaction: {}", format_pg_error(&e)),
-                });
-                return;
-            }
-
+            // Declare cursor WITH HOLD so we can commit immediately and avoid
+            // keeping a transaction open while the user scrolls through results.
+            // This prevents holding locks and snapshots for idle paged queries.
             let cursor_query = format!(
-                "DECLARE tsql_cursor NO SCROLL CURSOR FOR {}",
+                "DECLARE tsql_cursor NO SCROLL CURSOR WITH HOLD FOR {}",
                 query.trim().trim_end_matches(';')
             );
             let declare_result = guard.simple_query(&cursor_query).await;
             if let Err(e) = declare_result {
-                // Rollback and report error
-                let _ = guard.simple_query("ROLLBACK").await;
                 let _ = tx.send(DbEvent::QueryError {
                     error: format!("Failed to declare cursor: {}", format_pg_error(&e)),
                 });
@@ -5859,12 +5853,19 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+                    let _ = guard.simple_query("CLOSE tsql_cursor").await;
                     let _ = tx.send(DbEvent::QueryError {
                         error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
                     });
                     return;
                 }
+            }
+
+            // Check if we've hit max_rows limit on first page
+            let mut truncated = false;
+            if max_rows > 0 && total_fetched >= max_rows {
+                done = true;
+                truncated = true;
             }
 
             // Release lock so we can fetch metadata in background
@@ -5887,7 +5888,7 @@ impl App {
                     first_page_rows
                 },
                 command_tag: Some(format!("{} rows", total_fetched)),
-                truncated: false, // Not truncated - more rows available on demand
+                truncated, // Set true if max_rows limit was hit
                 elapsed,
                 source_table: source_table.clone(),
                 primary_keys: Vec::new(), // Will be loaded asynchronously
@@ -5919,15 +5920,15 @@ impl App {
                 });
             }
 
-            // If done with first page (got all rows), close cursor and commit
+            // If done with first page (got all rows or hit max_rows), close cursor
             if done {
                 let guard = client.lock().await;
-                let _ = guard.simple_query("CLOSE tsql_cursor; COMMIT").await;
+                let _ = guard.simple_query("CLOSE tsql_cursor").await;
                 // Send final completion signal so paged_query state is cleared
                 let _ = tx.send(DbEvent::RowsAppended {
                     rows: vec![],
                     done: true,
-                    truncated: false,
+                    truncated,
                 });
                 return;
             }
@@ -5936,6 +5937,18 @@ impl App {
             while let Some(()) = fetch_more_rx.recv().await {
                 // Drain any additional pending requests (user may have scrolled multiple times)
                 while fetch_more_rx.try_recv().is_ok() {}
+
+                // Check if we've already hit max_rows - don't fetch more
+                if max_rows > 0 && total_fetched >= max_rows {
+                    let guard = client.lock().await;
+                    let _ = guard.simple_query("CLOSE tsql_cursor").await;
+                    let _ = tx.send(DbEvent::RowsAppended {
+                        rows: vec![],
+                        done: true,
+                        truncated: true,
+                    });
+                    break;
+                }
 
                 let guard = client.lock().await;
                 match guard.simple_query(&fetch_query).await {
@@ -5949,25 +5962,33 @@ impl App {
                                 }
                                 page_rows.push(out_row);
                                 total_fetched += 1;
+
+                                // Stop collecting if we hit max_rows mid-page
+                                if max_rows > 0 && total_fetched >= max_rows {
+                                    break;
+                                }
                             }
                         }
 
-                        let page_done = page_rows.is_empty() || page_rows.len() < page_size;
+                        // Check if done: no more rows, incomplete page, or hit max_rows
+                        let hit_max = max_rows > 0 && total_fetched >= max_rows;
+                        let page_done =
+                            page_rows.is_empty() || page_rows.len() < page_size || hit_max;
 
                         // Send appended rows
                         let _ = tx.send(DbEvent::RowsAppended {
                             rows: page_rows,
                             done: page_done,
-                            truncated: false,
+                            truncated: hit_max,
                         });
 
                         if page_done {
-                            let _ = guard.simple_query("CLOSE tsql_cursor; COMMIT").await;
+                            let _ = guard.simple_query("CLOSE tsql_cursor").await;
                             break;
                         }
                     }
                     Err(e) => {
-                        let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+                        let _ = guard.simple_query("CLOSE tsql_cursor").await;
                         let _ = tx.send(DbEvent::QueryError {
                             error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
                         });
@@ -5977,9 +5998,9 @@ impl App {
             }
 
             // If we exit because the channel was closed (e.g., new query started),
-            // clean up the cursor
+            // clean up the cursor (WITH HOLD cursors persist until explicitly closed)
             let guard = client.lock().await;
-            let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+            let _ = guard.simple_query("CLOSE tsql_cursor").await;
         });
     }
 
