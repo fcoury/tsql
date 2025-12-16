@@ -2556,6 +2556,22 @@ impl App {
                 self.focus = Focus::Query;
             }
 
+            // Ctrl+B / Ctrl+Shift+B: Toggle sidebar (close it since we're in sidebar)
+            (KeyCode::Char('b') | KeyCode::Char('B'), modifiers, _)
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.sidebar_visible = false;
+                self.focus = Focus::Query;
+            }
+
+            // Ctrl+\ or Ctrl+4: Toggle sidebar
+            (KeyCode::Char('\\') | KeyCode::Char('4'), modifiers, _)
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.sidebar_visible = false;
+                self.focus = Focus::Query;
+            }
+
             _ => {}
         }
     }
@@ -3225,7 +3241,7 @@ impl App {
         };
 
         let where_clause =
-            match self.build_update_where_clause(row, col, Some((&original_value).as_str())) {
+            match self.build_update_where_clause(row, col, Some(original_value.as_str())) {
                 Ok(w) => w,
                 Err(msg) => {
                     self.cell_editor.close();
@@ -4510,6 +4526,21 @@ impl App {
                             self.focus = Focus::Grid;
                             return;
                         }
+                        Action::ToggleSidebar => {
+                            if self.sidebar_visible {
+                                self.sidebar_visible = false;
+                                if matches!(self.focus, Focus::Sidebar(_)) {
+                                    self.focus = Focus::Query;
+                                }
+                            } else {
+                                self.focus_schema();
+                            }
+                            return;
+                        }
+                        Action::ShowHistory => {
+                            self.open_history_picker();
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -5738,6 +5769,7 @@ fn is_double_click(prev: Option<GridCellClick>, row: usize, col: usize, now: Ins
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grid_mouse_target(
     x: u16,
     y: u16,
