@@ -161,7 +161,7 @@ impl Action {
             Action::ClearSearch => "Clear search",
             Action::ResizeColumnLeft => "Make column narrower",
             Action::ResizeColumnRight => "Make column wider",
-            Action::AutoFitColumn => "Auto-fit column width",
+            Action::AutoFitColumn => "Toggle fit/collapse column",
             Action::ToggleUuidExpand => "Toggle UUID expansion",
             Action::Quit => "Quit",
             Action::ForceQuit => "Force quit without saving",

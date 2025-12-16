@@ -16,7 +16,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -676,6 +676,8 @@ pub struct App {
     /// Last known grid viewport dimensions for scroll calculations.
     /// (viewport_rows, viewport_width)
     pub last_grid_viewport: Option<(usize, u16)>,
+    /// Last grid cell click for double-click detection.
+    last_grid_click: Option<GridCellClick>,
 
     /// Help popup (Some when open, None when closed).
     pub help_popup: Option<HelpPopup>,
@@ -719,12 +721,21 @@ pub struct App {
     pub sidebar_width: u16,
     /// Pending schema expanded paths to apply after schema loads.
     pending_schema_expanded: Option<Vec<Vec<String>>>,
+    /// If true, select first schema node once items exist.
+    pending_schema_select_first: bool,
     /// Cached cursor style to avoid redundant terminal updates.
     /// Uses a simple enum since SetCursorStyle doesn't implement PartialEq.
     last_cursor_style: Option<CachedCursorStyle>,
 
     /// Query execution UI state (spinner animation, timing).
     query_ui: QueryRunUi,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GridCellClick {
+    at: Instant,
+    row: usize,
+    col: usize,
 }
 
 /// Local enum to track cursor style changes (SetCursorStyle doesn't implement PartialEq).
@@ -839,6 +850,7 @@ impl App {
             json_editor: None,
 
             last_grid_viewport: None,
+            last_grid_click: None,
 
             help_popup: None,
             row_detail: None,
@@ -864,6 +876,7 @@ impl App {
             sidebar_focus: SidebarSection::Connections,
             sidebar_width: 30,
             pending_schema_expanded: None,
+            pending_schema_select_first: false,
             last_cursor_style: None,
 
             query_ui: QueryRunUi::default(),
@@ -1031,7 +1044,7 @@ impl App {
 
             // Compute hint visibility once per tick to avoid time-based state
             // flipping between calls during the same render cycle.
-            let show_key_hint = self.key_sequence.should_show_hint();
+            let show_key_hint = self.key_sequence.should_show_hint() && self.last_error.is_none();
             let pending_key_for_hint = self.key_sequence.pending();
 
             // Set terminal cursor style based on vim mode (only when changed)
@@ -1074,6 +1087,15 @@ impl App {
 
                     let schema_items = self.schema_cache.build_tree_items();
                     let has_focus = matches!(self.focus, Focus::Sidebar(_));
+                    if self.pending_schema_select_first
+                        && self.sidebar.schema_state.selected().is_empty()
+                        && !schema_items.is_empty()
+                    {
+                        self.sidebar
+                            .schema_state
+                            .select(vec![schema_items[0].identifier().clone()]);
+                        self.pending_schema_select_first = false;
+                    }
 
                     self.sidebar.render(
                         frame,
@@ -1090,27 +1112,18 @@ impl App {
                     self.render_sidebar_area = None;
                 }
 
-                // Determine if we have an error to show.
-                let error_height = if self.last_error.is_some() {
-                    4u16
-                } else {
-                    0u16
-                };
-
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(7),
-                        Constraint::Length(error_height),
                         Constraint::Min(3),
                         Constraint::Length(1),
                     ])
                     .split(main_area);
 
                 let query_area = chunks[0];
-                let error_area = chunks[1];
-                let grid_area = chunks[2];
-                let status_area = chunks[3];
+                let grid_area = chunks[1];
+                let status_area = chunks[2];
 
                 // Store rendered areas for mouse click handling
                 self.render_query_area = Some(query_area);
@@ -1227,21 +1240,6 @@ impl App {
                         ScrollbarState::new(total_lines).position(self.editor_scroll.0 as usize);
 
                     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-                }
-
-                // Error display (if any).
-                if let Some(ref err) = self.last_error {
-                    let error_block = Block::default()
-                        .borders(Borders::ALL)
-                        .title("Error (Enter to dismiss)")
-                        .border_style(Style::default().fg(Color::Red));
-
-                    let error_text = Paragraph::new(err.as_str())
-                        .block(error_block)
-                        .style(Style::default().fg(Color::Red))
-                        .wrap(ratatui::widgets::Wrap { trim: false });
-
-                    frame.render_widget(error_text, error_area);
                 }
 
                 // Calculate grid viewport dimensions for scroll handling
@@ -1668,6 +1666,52 @@ impl App {
                     }
                 }
 
+                // Error popup (modal).
+                if let Some(ref err) = self.last_error {
+                    let has_other_modal = self.help_popup.is_some()
+                        || self.search.active
+                        || self.command.active
+                        || self.completion.active
+                        || self.cell_editor.active
+                        || self.history_picker.is_some()
+                        || self.connection_picker.is_some()
+                        || self.json_editor.is_some()
+                        || self.row_detail.is_some()
+                        || self.connection_manager.is_some()
+                        || self.connection_form.is_some()
+                        || self.confirm_prompt.is_some();
+
+                    if !has_other_modal && size.width >= 20 && size.height >= 5 {
+                        let popup_width = (size.width.saturating_mul(70) / 100)
+                            .clamp(40, size.width.saturating_sub(4));
+                        let desired_height = (err.lines().count() as u16).saturating_add(4);
+                        let popup_height = desired_height
+                            .clamp(5, 12)
+                            .min(size.height.saturating_sub(2));
+
+                        let popup_area = Rect {
+                            x: size.x + (size.width.saturating_sub(popup_width)) / 2,
+                            y: size.y + (size.height.saturating_sub(popup_height)) / 2,
+                            width: popup_width,
+                            height: popup_height,
+                        };
+
+                        let block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Error (Enter/Esc dismiss) ")
+                            .border_style(Style::default().fg(Color::Red));
+
+                        let text = Paragraph::new(err.as_str())
+                            .block(block)
+                            .style(Style::default().fg(Color::White))
+                            .wrap(ratatui::widgets::Wrap { trim: false });
+
+                        frame.render_widget(Clear, popup_area);
+                        frame.render_widget(text, popup_area);
+                    }
+                }
+
                 // Render confirmation prompt if active (topmost layer)
                 if let Some(ref mut prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
@@ -2051,10 +2095,15 @@ impl App {
                 }
                 // Ctrl+B: Toggle sidebar
                 (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                    self.sidebar_visible = !self.sidebar_visible;
-                    // If hiding sidebar and focus was on it, move focus to query
-                    if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
-                        self.focus = Focus::Query;
+                    if self.sidebar_visible {
+                        self.sidebar_visible = false;
+                        // If hiding sidebar and focus was on it, move focus to query
+                        if matches!(self.focus, Focus::Sidebar(_)) {
+                            self.focus = Focus::Query;
+                        }
+                    } else {
+                        // When opening the sidebar, jump straight to Schema.
+                        self.focus_schema();
                     }
                     return false;
                 }
@@ -2398,6 +2447,14 @@ impl App {
             }
         }
 
+        // Error popup is modal: any click dismisses it.
+        if self.last_error.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.last_error = None;
+            }
+            return false;
+        }
+
         // Help popup has mouse support
         if let Some(ref mut help_popup) = self.help_popup {
             let action = help_popup.handle_mouse(mouse);
@@ -2525,6 +2582,7 @@ impl App {
                     self.focus = Focus::Query;
                     self.mode = Mode::Normal;
                 }
+                self.last_grid_click = None;
                 return;
             }
         }
@@ -2536,28 +2594,56 @@ impl App {
                 && y >= grid_area.y
                 && y < grid_area.y + grid_area.height
             {
-                // Ignore clicks on the top border/header row(s)
-                if y <= grid_area.y + 1 {
-                    // Still focus the grid, just don't select a row
-                    if self.focus != Focus::Grid {
-                        self.focus = Focus::Grid;
-                        self.mode = Mode::Normal;
-                    }
-                    return;
-                }
-
                 // Click in grid - focus it and try to select the row
                 if self.focus != Focus::Grid {
                     self.focus = Focus::Grid;
                     self.mode = Mode::Normal;
                 }
 
-                // Calculate which row was clicked (accounting for border and header)
-                let inner_y = y.saturating_sub(grid_area.y + 2); // +2 for border and header
-                let clicked_row = self.grid_state.row_offset + inner_y as usize;
+                if let Some(target) = grid_mouse_target(
+                    x,
+                    y,
+                    grid_area,
+                    self.config.display.show_row_numbers,
+                    self.grid.rows.len(),
+                    self.grid_state.row_offset,
+                    self.grid_state.col_offset,
+                    &self.grid.col_widths,
+                ) {
+                    match target {
+                        GridMouseTarget::Header { col } => {
+                            if let Some(col) = col {
+                                self.grid_state.cursor_col = col;
+                            }
+                            self.last_grid_click = None;
+                        }
+                        GridMouseTarget::Cell { row, col } => {
+                            if row >= self.grid.rows.len() {
+                                self.last_grid_click = None;
+                                return;
+                            }
 
-                if clicked_row < self.grid.rows.len() {
-                    self.grid_state.cursor_row = clicked_row;
+                            self.grid_state.cursor_row = row;
+                            if let Some(col) = col {
+                                self.grid_state.cursor_col = col;
+                            }
+
+                            let Some(col) = col else {
+                                self.last_grid_click = None;
+                                return;
+                            };
+
+                            let now = Instant::now();
+                            if is_double_click(self.last_grid_click, row, col, now) {
+                                self.last_grid_click = None;
+                                self.start_cell_edit(row, col);
+                            } else {
+                                self.last_grid_click = Some(GridCellClick { at: now, row, col });
+                            }
+                        }
+                    }
+                } else {
+                    self.last_grid_click = None;
                 }
             }
         }
@@ -2622,8 +2708,21 @@ impl App {
     fn focus_schema(&mut self) {
         self.sidebar_visible = true;
         self.sidebar_focus = SidebarSection::Schema;
-        self.sidebar.select_first_schema_if_empty();
         self.focus = Focus::Sidebar(SidebarSection::Schema);
+
+        // TreeState::select_first relies on a previous render, so when opening the sidebar
+        // we select the first schema item directly from the current schema cache if possible.
+        if self.sidebar.schema_state.selected().is_empty() {
+            let schema_items = self.schema_cache.build_tree_items();
+            if let Some(first) = schema_items.first() {
+                self.sidebar
+                    .schema_state
+                    .select(vec![first.identifier().clone()]);
+                self.pending_schema_select_first = false;
+            } else {
+                self.pending_schema_select_first = true;
+            }
+        }
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
@@ -5424,6 +5523,133 @@ impl App {
     }
 }
 
+const GRID_DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(400);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridMouseTarget {
+    Header { col: Option<usize> },
+    Cell { row: usize, col: Option<usize> },
+}
+
+fn is_double_click(prev: Option<GridCellClick>, row: usize, col: usize, now: Instant) -> bool {
+    prev.is_some_and(|prev| {
+        prev.row == row
+            && prev.col == col
+            && now.duration_since(prev.at) <= GRID_DOUBLE_CLICK_THRESHOLD
+    })
+}
+
+fn grid_mouse_target(
+    x: u16,
+    y: u16,
+    grid_area: Rect,
+    show_row_numbers: bool,
+    row_count: usize,
+    row_offset: usize,
+    col_offset: usize,
+    col_widths: &[u16],
+) -> Option<GridMouseTarget> {
+    // Convert from block area (with borders) to inner grid content area.
+    if grid_area.width < 2 || grid_area.height < 2 {
+        return None;
+    }
+
+    let inner = Rect {
+        x: grid_area.x.saturating_add(1),
+        y: grid_area.y.saturating_add(1),
+        width: grid_area.width.saturating_sub(2),
+        height: grid_area.height.saturating_sub(2),
+    };
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    if x < inner.x
+        || x >= inner.x.saturating_add(inner.width)
+        || y < inner.y
+        || y >= inner.y.saturating_add(inner.height)
+    {
+        return None;
+    }
+
+    // Header is the first row of the inner area; body starts on the next row.
+    let is_header = y == inner.y;
+
+    let row_number_width = if show_row_numbers && row_count > 0 {
+        (row_count.to_string().len() as u16).saturating_add(1) // digits + space separator
+    } else {
+        0
+    };
+    let marker_w: u16 = 3 + row_number_width; // cursor + selected + space + row_numbers
+
+    let data_x = inner.x.saturating_add(marker_w);
+    let data_w = inner.width.saturating_sub(marker_w);
+    let col = hit_test_data_column(x, data_x, data_w, col_offset, col_widths);
+
+    if is_header {
+        return Some(GridMouseTarget::Header { col });
+    }
+
+    // Body row index, accounting for header row.
+    let body_y = y.saturating_sub(inner.y.saturating_add(1));
+    let row = row_offset + body_y as usize;
+    Some(GridMouseTarget::Cell { row, col })
+}
+
+fn hit_test_data_column(
+    x: u16,
+    data_x: u16,
+    data_w: u16,
+    col_offset: usize,
+    col_widths: &[u16],
+) -> Option<usize> {
+    if data_w == 0 || x < data_x || x >= data_x.saturating_add(data_w) {
+        return None;
+    }
+
+    let mut current_x = data_x;
+    let max_x = data_x.saturating_add(data_w);
+    let mut col = col_offset;
+
+    while col < col_widths.len() && current_x < max_x {
+        let w = col_widths[col];
+        if w == 0 {
+            col += 1;
+            continue;
+        }
+
+        let remaining = max_x - current_x;
+        if remaining == 0 {
+            break;
+        }
+
+        // Mirror rendering behavior: last column can be partially visible.
+        let draw_w = w.min(remaining);
+        let col_end = current_x.saturating_add(draw_w);
+
+        if x < col_end {
+            return Some(col);
+        }
+
+        // Separator space between columns counts as part of the left column.
+        if col_end < max_x && x == col_end {
+            return Some(col);
+        }
+
+        // Advance past the separator.
+        if col_end < max_x {
+            current_x = col_end.saturating_add(1).min(max_x);
+        } else {
+            break;
+        }
+
+        col += 1;
+    }
+
+    None
+}
+
 /// Calculate the scroll offset needed to keep cursor visible in the editor viewport.
 fn calculate_editor_scroll(
     cursor_row: usize,
@@ -5491,6 +5717,83 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var("TSQL_CONFIG_DIR");
         }
+    }
+
+    // ========== Grid Mouse Tests ==========
+
+    #[test]
+    fn test_grid_mouse_target_selects_column_from_header_and_body() {
+        let grid_area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+
+        let col_widths = vec![5, 5, 5];
+
+        // Header row is at y=1 (inner.y = 1).
+        // With no row numbers, marker_w = 3 and data_x = 1 + 3 = 4.
+        let header = grid_mouse_target(11, 1, grid_area, false, 10, 0, 0, &col_widths);
+        assert_eq!(header, Some(GridMouseTarget::Header { col: Some(1) }));
+
+        // Body starts at y=2. Click first row, second column.
+        let cell = grid_mouse_target(11, 2, grid_area, false, 10, 0, 0, &col_widths);
+        assert_eq!(
+            cell,
+            Some(GridMouseTarget::Cell {
+                row: 0,
+                col: Some(1)
+            })
+        );
+
+        // Click in marker area (before data_x) returns no column, but still returns the row.
+        let marker = grid_mouse_target(2, 2, grid_area, false, 10, 0, 0, &col_widths);
+        assert_eq!(marker, Some(GridMouseTarget::Cell { row: 0, col: None }));
+    }
+
+    #[test]
+    fn test_grid_mouse_target_accounts_for_row_numbers_width() {
+        let grid_area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+
+        let col_widths = vec![5, 5, 5];
+        // row_count=120 => digits=3, row_number_width=4, marker_w=7, data_x=1+7=8.
+        let cell = grid_mouse_target(9, 2, grid_area, true, 120, 0, 0, &col_widths);
+        assert_eq!(
+            cell,
+            Some(GridMouseTarget::Cell {
+                row: 0,
+                col: Some(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_is_double_click_requires_same_cell_and_threshold() {
+        let now = Instant::now();
+        let prev = GridCellClick {
+            at: now - Duration::from_millis(200),
+            row: 1,
+            col: 2,
+        };
+
+        assert!(is_double_click(Some(prev), 1, 2, now));
+        assert!(!is_double_click(Some(prev), 1, 3, now));
+        assert!(!is_double_click(
+            Some(GridCellClick {
+                at: now - Duration::from_millis(1000),
+                row: 1,
+                col: 2
+            }),
+            1,
+            2,
+            now
+        ));
     }
 
     // ========== CellEditor Tests ==========
@@ -6908,6 +7211,77 @@ mod tests {
             app.focus,
             Focus::Query,
             "Ctrl+H should be no-op when sidebar is hidden"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_b_opens_sidebar_and_focuses_schema() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        // Seed schema cache so focus_schema can select an item without requiring a render pass.
+        app.schema_cache.tables = vec![
+            TableInfo {
+                schema: "_sqlx_test".to_string(),
+                name: "t".to_string(),
+                columns: vec![ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int4".to_string(),
+                }],
+            },
+            TableInfo {
+                schema: "public".to_string(),
+                name: "u".to_string(),
+                columns: vec![ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "int4".to_string(),
+                }],
+            },
+        ];
+        app.schema_cache.loaded = true;
+
+        app.focus = Focus::Query;
+        app.sidebar_visible = false;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert!(
+            app.sidebar_visible,
+            "Ctrl+B should show the sidebar when it was hidden"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "Ctrl+B should focus Schema when opening the sidebar"
+        );
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarSection::Schema,
+            "Ctrl+B should set sidebar_focus to Schema"
+        );
+        assert_eq!(
+            app.sidebar.schema_state.selected(),
+            &["schema:_sqlx_test".to_string()],
+            "Ctrl+B should select the first schema item"
         );
     }
 

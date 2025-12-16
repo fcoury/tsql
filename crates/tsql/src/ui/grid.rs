@@ -22,7 +22,7 @@ pub enum ResizeAction {
     Widen,
     /// Narrow the column.
     Narrow,
-    /// Auto-fit the column to its content.
+    /// Toggle between fit-to-content and collapsed width.
     AutoFit,
 }
 
@@ -906,13 +906,55 @@ impl GridModel {
         }
     }
 
-    /// Auto-fit a column to its content.
+    /// Toggle a column between fit-to-content and collapsed width.
     pub fn autofit_column(&mut self, col: usize) {
         if col >= self.headers.len() {
             return;
         }
 
-        // Calculate optimal width based on header and all row values
+        // Toggle between:
+        // - expanded: fit raw content (up to 100)
+        // - collapsed: fit default display content (up to 40; UUIDs collapsed to 9 chars)
+        let collapsed = self.collapsed_column_width(col);
+        let expanded = self.expanded_column_width(col);
+        let current = self.col_widths.get(col).copied().unwrap_or(collapsed);
+
+        let next = if current >= expanded {
+            collapsed
+        } else {
+            expanded
+        };
+        if let Some(width) = self.col_widths.get_mut(col) {
+            *width = next;
+        }
+    }
+
+    fn collapsed_column_width(&self, col: usize) -> u16 {
+        let min_w: u16 = 3;
+        let max_w: u16 = 40;
+
+        let header_width = display_width(&self.headers[col]) as u16;
+        let max_data_width = self
+            .rows
+            .iter()
+            .filter_map(|row| row.get(col))
+            .map(|cell| {
+                if is_uuid(cell) {
+                    9 // 8 hex chars + "…" (unicode ellipsis)
+                } else {
+                    display_width(cell) as u16
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        clamp_u16(header_width.max(max_data_width), min_w, max_w)
+    }
+
+    fn expanded_column_width(&self, col: usize) -> u16 {
+        let min_w: u16 = 3;
+        let max_w: u16 = 100;
+
         let header_width = display_width(&self.headers[col]) as u16;
         let max_data_width = self
             .rows
@@ -922,11 +964,7 @@ impl GridModel {
             .max()
             .unwrap_or(0);
 
-        let optimal_width = header_width.max(max_data_width).clamp(3, 100); // Between 3 and 100
-
-        if let Some(width) = self.col_widths.get_mut(col) {
-            *width = optimal_width;
-        }
+        clamp_u16(header_width.max(max_data_width), min_w, max_w)
     }
 
     /// Generate UPDATE SQL statements for specified rows.
@@ -1200,7 +1238,7 @@ pub struct DataGrid<'a> {
 impl<'a> Widget for DataGrid<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Build title with search info if active
-        let base_title = "Results (j/k rows, h/l cols, +/- resize, = autofit, / search)";
+        let base_title = "Results (j/k rows, h/l cols, +/- resize, = fit/collapse, / search)";
         let title = if let Some(search_info) = self.state.search.match_info() {
             format!("{} {}", base_title, search_info)
         } else {
@@ -1630,6 +1668,11 @@ fn format_cell_for_display(s: &str, width: u16, uuid_expanded: bool) -> String {
     // For UUIDs, truncate to show first 8 chars + "…" unless expanded
     // This saves significant space in the grid (36 chars -> 9 chars)
     if is_uuid(s) {
+        // If the column is wide enough to show the full UUID, show it even when collapsed.
+        // This makes "auto-fit" behave as users expect (fit content -> show content).
+        if width as usize >= display_width(s) {
+            return fit_to_width(s, width);
+        }
         if uuid_expanded {
             // Show full UUID (may still be truncated by fit_to_width if column is narrow)
             return fit_to_width(s, width);
@@ -2506,6 +2549,13 @@ mod tests {
         let result = format_cell_for_display(uuid, 9, false);
         assert_eq!(result, "550e8400…", "UUID should fit exactly in 9 chars");
 
+        // If the column is wide enough to show the full UUID, collapsed mode should show it.
+        let result = format_cell_for_display(uuid, 40, false);
+        assert_eq!(
+            result, "550e8400-e29b-41d4-a716-446655440000    ",
+            "Collapsed UUID should show full value when it fits"
+        );
+
         // Non-UUID should not be truncated
         let normal = "hello world";
         let result = format_cell_for_display(normal, 20, false);
@@ -2551,6 +2601,23 @@ mod tests {
             expanded.starts_with("550e8400-e29b-41d4-a716-446655440000"),
             "Expanded UUID should show full value"
         );
+    }
+
+    #[test]
+    fn test_autofit_column_toggles_uuid_collapsed_and_expanded() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let mut model = GridModel::new(vec!["id".to_string()], vec![vec![uuid.to_string()]]);
+
+        // Initial widths use collapsed UUID width (9 chars)
+        assert_eq!(model.col_widths[0], 9);
+
+        // First toggle expands to fit raw UUID
+        model.autofit_column(0);
+        assert_eq!(model.col_widths[0], 36);
+
+        // Second toggle collapses back
+        model.autofit_column(0);
+        assert_eq!(model.col_widths[0], 9);
     }
 
     #[test]
