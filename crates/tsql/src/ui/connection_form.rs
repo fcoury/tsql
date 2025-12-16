@@ -67,26 +67,6 @@ impl FormField {
     }
 }
 
-fn ssl_mode_to_index(mode: SslMode) -> usize {
-    match mode {
-        SslMode::Disable => 0,
-        SslMode::Prefer => 1,
-        SslMode::Require => 2,
-        SslMode::VerifyCa => 3,
-        SslMode::VerifyFull => 4,
-    }
-}
-
-fn index_to_ssl_mode(index: usize) -> SslMode {
-    match index {
-        1 => SslMode::Prefer,
-        2 => SslMode::Require,
-        3 => SslMode::VerifyCa,
-        4 => SslMode::VerifyFull,
-        _ => SslMode::Disable,
-    }
-}
-
 /// Result of handling a key event in the connection form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionFormAction {
@@ -257,7 +237,7 @@ impl ConnectionFormModal {
         };
 
         let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
-        let ssl_mode_index = ssl_mode_to_index(ssl_mode);
+        let ssl_mode_index = ssl_mode.to_index();
 
         Self {
             name: entry.name.clone(),
@@ -574,9 +554,9 @@ impl ConnectionFormModal {
     }
 
     fn cycle_ssl_mode(&mut self, direction: i32) {
-        let len = 5i32; // disable, prefer, require, verify-ca, verify-full
+        let len = SslMode::COUNT as i32;
         self.ssl_mode_index = ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
-        self.ssl_mode = index_to_ssl_mode(self.ssl_mode_index);
+        self.ssl_mode = SslMode::from_index(self.ssl_mode_index);
     }
 
     fn process_url_paste(&mut self) -> ConnectionFormAction {
@@ -593,7 +573,7 @@ impl ConnectionFormModal {
                 self.database = entry.database;
                 self.user = entry.user;
                 self.ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
-                self.ssl_mode_index = ssl_mode_to_index(self.ssl_mode);
+                self.ssl_mode_index = self.ssl_mode.to_index();
 
                 if let Some(pwd) = password {
                     self.password = pwd;

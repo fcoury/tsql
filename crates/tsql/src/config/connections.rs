@@ -14,7 +14,7 @@ use url::Url;
 /// Service name for keyring storage
 const KEYRING_SERVICE: &str = "tsql";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SslMode {
     Disable,
@@ -25,6 +25,9 @@ pub enum SslMode {
 }
 
 impl SslMode {
+    /// Number of SSL mode variants (for UI cycling).
+    pub const COUNT: usize = 5;
+
     pub fn as_str(self) -> &'static str {
         match self {
             SslMode::Disable => "disable",
@@ -43,6 +46,28 @@ impl SslMode {
             "verify-ca" => Some(SslMode::VerifyCa),
             "verify-full" => Some(SslMode::VerifyFull),
             _ => None,
+        }
+    }
+
+    /// Convert to a numeric index for UI cycling.
+    pub fn to_index(self) -> usize {
+        match self {
+            SslMode::Disable => 0,
+            SslMode::Prefer => 1,
+            SslMode::Require => 2,
+            SslMode::VerifyCa => 3,
+            SslMode::VerifyFull => 4,
+        }
+    }
+
+    /// Convert from a numeric index, defaulting to Disable for invalid values.
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => SslMode::Prefer,
+            2 => SslMode::Require,
+            3 => SslMode::VerifyCa,
+            4 => SslMode::VerifyFull,
+            _ => SslMode::Disable,
         }
     }
 }
@@ -1410,5 +1435,144 @@ password_in_keychain = true
 
         // Clean up
         let _ = entry.delete_password_from_keychain();
+    }
+
+    // ========== SSL Mode Parsing Edge-Case Tests ==========
+
+    #[test]
+    fn test_ssl_mode_parse_case_insensitive() {
+        // Standard lowercase
+        assert_eq!(SslMode::parse("require"), Some(SslMode::Require));
+        assert_eq!(SslMode::parse("disable"), Some(SslMode::Disable));
+        assert_eq!(SslMode::parse("verify-ca"), Some(SslMode::VerifyCa));
+        assert_eq!(SslMode::parse("verify-full"), Some(SslMode::VerifyFull));
+
+        // Uppercase
+        assert_eq!(SslMode::parse("REQUIRE"), Some(SslMode::Require));
+        assert_eq!(SslMode::parse("DISABLE"), Some(SslMode::Disable));
+        assert_eq!(SslMode::parse("VERIFY-CA"), Some(SslMode::VerifyCa));
+        assert_eq!(SslMode::parse("VERIFY-FULL"), Some(SslMode::VerifyFull));
+
+        // Mixed case
+        assert_eq!(SslMode::parse("Require"), Some(SslMode::Require));
+        assert_eq!(SslMode::parse("Verify-Ca"), Some(SslMode::VerifyCa));
+        assert_eq!(SslMode::parse("vErIfY-fUlL"), Some(SslMode::VerifyFull));
+    }
+
+    #[test]
+    fn test_ssl_mode_parse_whitespace_trimming() {
+        assert_eq!(SslMode::parse("  require  "), Some(SslMode::Require));
+        assert_eq!(SslMode::parse("\trequire\n"), Some(SslMode::Require));
+        assert_eq!(SslMode::parse(" verify-ca "), Some(SslMode::VerifyCa));
+    }
+
+    #[test]
+    fn test_ssl_mode_parse_invalid_values() {
+        assert_eq!(SslMode::parse(""), None);
+        assert_eq!(SslMode::parse("   "), None);
+        assert_eq!(SslMode::parse("invalid"), None);
+        assert_eq!(SslMode::parse("ssl"), None);
+        assert_eq!(SslMode::parse("true"), None);
+        assert_eq!(SslMode::parse("false"), None);
+        assert_eq!(SslMode::parse("yes"), None);
+        assert_eq!(SslMode::parse("no"), None);
+        // Almost correct but not quite
+        assert_eq!(SslMode::parse("requires"), None);
+        assert_eq!(SslMode::parse("verifyca"), None);
+        assert_eq!(SslMode::parse("verify_ca"), None);
+        assert_eq!(SslMode::parse("verify ca"), None);
+    }
+
+    #[test]
+    fn test_ssl_mode_index_round_trip() {
+        // All modes should round-trip through index conversion
+        for mode in [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            let index = mode.to_index();
+            let recovered = SslMode::from_index(index);
+            assert_eq!(recovered, mode, "Round-trip failed for {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn test_ssl_mode_from_index_out_of_bounds() {
+        // Out-of-bounds indexes should default to Disable
+        assert_eq!(SslMode::from_index(5), SslMode::Disable);
+        assert_eq!(SslMode::from_index(100), SslMode::Disable);
+        assert_eq!(SslMode::from_index(usize::MAX), SslMode::Disable);
+    }
+
+    #[test]
+    fn test_ssl_mode_count_matches_variants() {
+        // Verify COUNT matches the actual number of variants
+        assert_eq!(SslMode::COUNT, 5);
+
+        // All indexes from 0 to COUNT-1 should produce distinct modes
+        let modes: Vec<SslMode> = (0..SslMode::COUNT).map(SslMode::from_index).collect();
+        assert_eq!(modes.len(), SslMode::COUNT);
+
+        // Check they're all distinct
+        let mut seen = std::collections::HashSet::new();
+        for mode in &modes {
+            assert!(seen.insert(mode), "Duplicate mode found: {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn test_ssl_mode_as_str_round_trip() {
+        // All modes should round-trip through string representation
+        for mode in [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            let s = mode.as_str();
+            let recovered = SslMode::parse(s);
+            assert_eq!(
+                recovered,
+                Some(mode),
+                "String round-trip failed for {:?}",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssl_mode_all_indexes_unique() {
+        // Ensure each mode has a unique index
+        let indexes = [
+            SslMode::Disable.to_index(),
+            SslMode::Prefer.to_index(),
+            SslMode::Require.to_index(),
+            SslMode::VerifyCa.to_index(),
+            SslMode::VerifyFull.to_index(),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for (i, &idx) in indexes.iter().enumerate() {
+            assert!(
+                seen.insert(idx),
+                "Duplicate index {} found at position {}",
+                idx,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssl_mode_indexes_are_contiguous() {
+        // Indexes should be 0, 1, 2, 3, 4 (contiguous from 0)
+        assert_eq!(SslMode::Disable.to_index(), 0);
+        assert_eq!(SslMode::Prefer.to_index(), 1);
+        assert_eq!(SslMode::Require.to_index(), 2);
+        assert_eq!(SslMode::VerifyCa.to_index(), 3);
+        assert_eq!(SslMode::VerifyFull.to_index(), 4);
     }
 }
