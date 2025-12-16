@@ -17,6 +17,8 @@ Find an alternative way to fix this:
 
 ## Done
 
+- Make the error into a popup instead of a new pane on the UI
+
 - Add mouse support to the help popup and all the pickers
 - The dw should only delete the next word (or from where we are to the end of the current word) but it's deleting the whole line. Deleting the whole line should be dd.
 

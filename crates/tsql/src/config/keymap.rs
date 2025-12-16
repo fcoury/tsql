@@ -625,7 +625,32 @@ impl Keymap {
 
         // Sidebar
         km.bind(
-            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyBinding::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(
+                KeyCode::Char('B'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('B'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        // Some terminals can't distinguish Ctrl+Shift+B from Ctrl+B.
+        // Provide a non-conflicting fallback by default.
+        km.bind(
+            KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        // Many terminals report Ctrl+\ as Ctrl+4 (both map to ASCII 0x1C).
+        km.bind(
+            KeyBinding::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
             Action::ToggleSidebar,
         );
 
@@ -762,7 +787,29 @@ impl Keymap {
 
         // Sidebar
         km.bind(
-            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyBinding::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(
+                KeyCode::Char('B'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('B'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
             Action::ToggleSidebar,
         );
 
@@ -819,7 +866,29 @@ impl Keymap {
 
         // Sidebar
         km.bind(
-            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyBinding::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(
+                KeyCode::Char('B'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('B'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
             Action::ToggleSidebar,
         );
 
