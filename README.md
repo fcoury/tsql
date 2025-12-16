@@ -8,6 +8,8 @@ A modern, keyboard-first PostgreSQL CLI with a TUI interface.
 
 ![tsql screenshot](assets/screenshot.png)
 
+[Join us on Discord](https://discord.gg/b928dKDcQq)
+
 ## Features
 
 - **Full-screen TUI** - Split-pane interface with query editor and results grid
