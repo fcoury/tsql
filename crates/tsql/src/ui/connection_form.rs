@@ -72,6 +72,8 @@ fn ssl_mode_to_index(mode: SslMode) -> usize {
         SslMode::Disable => 0,
         SslMode::Prefer => 1,
         SslMode::Require => 2,
+        SslMode::VerifyCa => 3,
+        SslMode::VerifyFull => 4,
     }
 }
 
@@ -79,6 +81,8 @@ fn index_to_ssl_mode(index: usize) -> SslMode {
     match index {
         1 => SslMode::Prefer,
         2 => SslMode::Require,
+        3 => SslMode::VerifyCa,
+        4 => SslMode::VerifyFull,
         _ => SslMode::Disable,
     }
 }
@@ -570,7 +574,7 @@ impl ConnectionFormModal {
     }
 
     fn cycle_ssl_mode(&mut self, direction: i32) {
-        let len = 3i32;
+        let len = 5i32; // disable, prefer, require, verify-ca, verify-full
         self.ssl_mode_index = ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
         self.ssl_mode = index_to_ssl_mode(self.ssl_mode_index);
     }
