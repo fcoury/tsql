@@ -4375,7 +4375,8 @@ impl App {
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
         // Try to get the password from keychain or env var
-        let password = match entry.get_password() {
+        // Use timeout to avoid blocking UI if keychain shows permission dialog
+        let password = match entry.get_password_with_timeout(500) {
             Ok(Some(pwd)) => Some(pwd),
             Ok(None) => None,
             Err(e) => {

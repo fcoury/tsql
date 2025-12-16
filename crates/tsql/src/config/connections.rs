@@ -301,6 +301,67 @@ impl ConnectionEntry {
         Ok(None)
     }
 
+    /// Get the password with a timeout to avoid blocking the UI.
+    ///
+    /// On macOS, keychain access can block indefinitely if the system
+    /// shows a permission dialog. This method spawns the keychain access
+    /// in a separate thread with a short timeout to prevent UI freezes.
+    ///
+    /// Returns:
+    /// - Ok(Some(password)) if password was retrieved
+    /// - Ok(None) if no password available or timeout occurred
+    /// - Err if there was an error (other than timeout/no entry)
+    pub fn get_password_with_timeout(&self, timeout_ms: u64) -> Result<Option<String>> {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        // Try environment variable first (no blocking risk)
+        if let Some(ref env_var) = self.password_env {
+            let var_name = env_var.strip_prefix('$').unwrap_or(env_var);
+            if let Ok(pwd) = std::env::var(var_name) {
+                return Ok(Some(pwd));
+            }
+        }
+
+        // If not configured for keychain, return None
+        if !self.password_in_keychain {
+            return Ok(None);
+        }
+
+        // Spawn keychain access in a separate thread with timeout
+        let name = self.name.clone();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<Option<String>> {
+                let entry = keyring::Entry::new(KEYRING_SERVICE, &name)
+                    .context("Failed to create keyring entry")?;
+
+                match entry.get_password() {
+                    Ok(password) => Ok(Some(password)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(e) => Err(anyhow!("Failed to get password from keychain: {}", e)),
+                }
+            })();
+            let _ = tx.send(result);
+        });
+
+        // Wait for result with timeout
+        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Keychain access is blocked (probably showing system dialog)
+                // Return None to trigger password prompt
+                Ok(None)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Thread panicked or was killed
+                Ok(None)
+            }
+        }
+    }
+
     /// Format connection for display (without password)
     pub fn display_string(&self) -> String {
         format!(
