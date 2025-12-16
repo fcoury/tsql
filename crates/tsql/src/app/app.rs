@@ -19,7 +19,10 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Terminal;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
@@ -50,7 +53,77 @@ use crate::util::{is_json_column_type, should_use_multiline_editor};
 use throbber_widgets_tui::{Throbber, ThrobberState, BRAILLE_SIX};
 use tui_syntax::Highlighter;
 
-fn make_rustls_connect() -> MakeRustlsConnect {
+/// Certificate verifier that skips all validation.
+/// Used for sslmode=require/prefer where we want encryption without cert validation.
+#[derive(Debug)]
+struct SkipServerVerification(Arc<CryptoProvider>);
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        ))
+    }
+}
+
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// TLS connector WITHOUT certificate validation (for sslmode=require/prefer).
+/// Provides encryption but accepts any server certificate including self-signed.
+fn make_rustls_connect_insecure() -> MakeRustlsConnect {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+    MakeRustlsConnect::new(config)
+}
+
+/// TLS connector WITH certificate validation (for sslmode=verify-ca/verify-full).
+/// Validates server certificate against Mozilla's root CA store.
+fn make_rustls_connect_verified() -> MakeRustlsConnect {
     let mut root_store = RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder()
@@ -68,7 +141,7 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
         for (k, v) in url.query_pairs() {
             if k.eq_ignore_ascii_case("sslmode") {
                 return SslMode::parse(&v).ok_or_else(|| {
-                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require.")
+                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require, verify-ca, verify-full.")
                 });
             }
         }
@@ -79,7 +152,7 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
         if let Some((k, v)) = part.split_once('=') {
             if k.eq_ignore_ascii_case("sslmode") {
                 return SslMode::parse(v).ok_or_else(|| {
-                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require.")
+                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require, verify-ca, verify-full.")
                 });
             }
         }
@@ -4835,7 +4908,8 @@ impl App {
                     }
                 }
                 SslMode::Require => {
-                    let tls = make_rustls_connect();
+                    // Require TLS but NO certificate validation (encryption only)
+                    let tls = make_rustls_connect_insecure();
                     match tokio_postgres::connect(&conn_str, tls).await {
                         Ok((client, connection)) => {
                             let tx2 = tx.clone();
@@ -4863,7 +4937,8 @@ impl App {
                     }
                 }
                 SslMode::Prefer => {
-                    let tls = make_rustls_connect();
+                    // Try TLS first (without cert validation), fallback to NoTls
+                    let tls = make_rustls_connect_insecure();
                     match tokio_postgres::connect(&conn_str, tls).await {
                         Ok((client, connection)) => {
                             let tx2 = tx.clone();
@@ -4913,6 +4988,35 @@ impl App {
                                     });
                                 }
                             }
+                        }
+                    }
+                }
+                SslMode::VerifyCa | SslMode::VerifyFull => {
+                    // Require TLS WITH certificate validation
+                    let tls = make_rustls_connect_verified();
+                    match tokio_postgres::connect(&conn_str, tls).await {
+                        Ok((client, connection)) => {
+                            let tx2 = tx.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = connection.await {
+                                    let _ = tx2.send(DbEvent::ConnectionLost {
+                                        error: format_pg_error(&e),
+                                    });
+                                }
+                            });
+
+                            let token = client.cancel_token();
+                            let shared = Arc::new(Mutex::new(client));
+                            let _ = tx.send(DbEvent::Connected {
+                                client: shared,
+                                cancel_token: token,
+                                connected_with_tls: true,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::ConnectError {
+                                error: format_pg_error(&e),
+                            });
                         }
                     }
                 }
@@ -5435,7 +5539,8 @@ impl App {
                             Err(e) => send_err(&tx, e),
                         },
                         SslMode::Require => {
-                            let tls = make_rustls_connect();
+                            // TLS without cert validation
+                            let tls = make_rustls_connect_insecure();
                             match tokio_postgres::connect(&url, tls).await {
                                 Ok((client, _)) => {
                                     drop(client);
@@ -5445,7 +5550,8 @@ impl App {
                             }
                         }
                         SslMode::Prefer => {
-                            let tls = make_rustls_connect();
+                            // Try TLS without cert validation, fallback to NoTls
+                            let tls = make_rustls_connect_insecure();
                             match tokio_postgres::connect(&url, tls).await {
                                 Ok((client, _)) => {
                                     drop(client);
@@ -5458,6 +5564,17 @@ impl App {
                                     }
                                     Err(e) => send_err(&tx, e),
                                 },
+                            }
+                        }
+                        SslMode::VerifyCa | SslMode::VerifyFull => {
+                            // TLS with cert validation
+                            let tls = make_rustls_connect_verified();
+                            match tokio_postgres::connect(&url, tls).await {
+                                Ok((client, _)) => {
+                                    drop(client);
+                                    send_ok(&tx);
+                                }
+                                Err(e) => send_err(&tx, e),
                             }
                         }
                     }
@@ -6035,8 +6152,10 @@ impl App {
 
         self.rt.spawn(async move {
             // Attempt to cancel. We ignore errors since cancellation is best-effort.
+            // For cancellation, we use the insecure TLS connector since we just need
+            // to send a cancel signal - the cert validation doesn't matter here.
             if connected_with_tls {
-                let tls = make_rustls_connect();
+                let tls = make_rustls_connect_insecure();
                 let _ = token.cancel_query(tls).await;
             } else {
                 let _ = token.cancel_query(NoTls).await;

@@ -15,11 +15,13 @@ use url::Url;
 const KEYRING_SERVICE: &str = "tsql";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SslMode {
     Disable,
     Prefer,
     Require,
+    VerifyCa,
+    VerifyFull,
 }
 
 impl SslMode {
@@ -28,6 +30,8 @@ impl SslMode {
             SslMode::Disable => "disable",
             SslMode::Prefer => "prefer",
             SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
         }
     }
 
@@ -36,6 +40,8 @@ impl SslMode {
             "disable" => Some(SslMode::Disable),
             "prefer" => Some(SslMode::Prefer),
             "require" => Some(SslMode::Require),
+            "verify-ca" => Some(SslMode::VerifyCa),
+            "verify-full" => Some(SslMode::VerifyFull),
             _ => None,
         }
     }
