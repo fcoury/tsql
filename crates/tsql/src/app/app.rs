@@ -26,7 +26,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
-use tokio_postgres_rustls::MakeRustlsConnect;
+use tokio_postgres_rustls_improved::MakeRustlsConnect;
 use tui_textarea::{CursorMove, Input};
 use webpki_roots::TLS_SERVER_ROOTS;
 

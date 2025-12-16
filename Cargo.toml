@@ -8,7 +8,7 @@ version = "0.3.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/fcoury/tsql"
-rust-version = "1.80"
+rust-version = "1.86"
 
 [workspace.dependencies]
 # Shared dependencies
@@ -18,8 +18,8 @@ crossterm = "0.28"
 ratatui = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tokio-postgres = "0.7"
-tokio-postgres-rustls = "0.13"
-rustls = "0.23"
+tokio-postgres-rustls-improved = "0.16"
+rustls = "0.23.35"
 webpki-roots = "0.26"
 tui-textarea = { version = "0.7", features = ["search"] }
 unicode-width = "0.2"

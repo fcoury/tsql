@@ -1249,7 +1249,7 @@ pub fn quote_identifier(s: &str) -> String {
     // If it contains special chars or is a reserved word, quote it
     if s.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && !s.chars().next().map_or(true, |c| c.is_ascii_digit())
+        && !s.chars().next().is_none_or(|c| c.is_ascii_digit())
     {
         s.to_string()
     } else {
