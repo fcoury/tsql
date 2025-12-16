@@ -5,7 +5,7 @@ A modern, keyboard-first PostgreSQL CLI with a TUI interface.
 [![CI](https://github.com/fcoury/tsql/actions/workflows/ci.yml/badge.svg)](https://github.com/fcoury/tsql/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/tsql.svg)](https://crates.io/crates/tsql)
 [![License](https://img.shields.io/crates/l/tsql.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/1204152891049512960)(https://discord.gg/b928dKDcQq)
+[![Discord](https://img.shields.io/discord/1204152891049512960)](https://discord.gg/b928dKDcQq)
 
 ![tsql screenshot](assets/screenshot.png)
 
