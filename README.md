@@ -69,6 +69,7 @@ Once connected:
 | ----- | -------------------------------------------------- |
 | `Tab` | Switch focus between query editor and results grid |
 | `?`   | Toggle help popup                                  |
+| `Ctrl+Shift+B` / `Ctrl+\` / `Ctrl+4` | Toggle sidebar                  |
 | `q`   | Quit application                                   |
 | `Esc` | Return to normal mode / close popups               |
 
@@ -101,7 +102,21 @@ Once connected:
 | `e`       | Edit cell            |
 | `/`       | Search in results    |
 | `+/-`     | Widen/narrow column  |
-| `=`       | Auto-fit column      |
+| `=`       | Fit/collapse column  |
+
+### Troubleshooting keybindings
+
+If a key combo isn't working in your terminal, you can inspect what `tsql` is actually receiving:
+
+```bash
+tsql --debug-keys
+```
+
+To also print mouse events:
+
+```bash
+tsql --debug-keys --mouse
+```
 
 ### Commands
 

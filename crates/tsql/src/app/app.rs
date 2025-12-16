@@ -344,42 +344,148 @@ pub struct QueryResult {
 ///
 /// Returns None for complex queries (JOINs, subqueries, etc.)
 fn extract_table_from_query(query: &str) -> Option<String> {
-    let query = query.trim().to_lowercase();
+    fn tokenize(query: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut buf = String::new();
+        let mut chars = query.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
 
-    // Must start with SELECT
-    if !query.starts_with("select") {
+        let flush = |buf: &mut String, tokens: &mut Vec<String>| {
+            if !buf.is_empty() {
+                tokens.push(std::mem::take(buf));
+            }
+        };
+
+        while let Some(ch) = chars.next() {
+            if in_single {
+                buf.push(ch);
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        buf.push(chars.next().unwrap());
+                    } else {
+                        in_single = false;
+                    }
+                }
+                continue;
+            }
+
+            if in_double {
+                buf.push(ch);
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        buf.push(chars.next().unwrap());
+                    } else {
+                        in_double = false;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' => {
+                    buf.push(ch);
+                    in_single = true;
+                }
+                '"' => {
+                    buf.push(ch);
+                    in_double = true;
+                }
+                ch if ch.is_whitespace() => flush(&mut buf, &mut tokens),
+                ';' | '(' | ')' | ',' => {
+                    flush(&mut buf, &mut tokens);
+                    tokens.push(ch.to_string());
+                }
+                _ => buf.push(ch),
+            }
+        }
+
+        flush(&mut buf, &mut tokens);
+        tokens
+    }
+
+    fn split_qualified_ident(s: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut buf = String::new();
+        let mut chars = s.chars().peekable();
+        let mut in_double = false;
+
+        while let Some(ch) = chars.next() {
+            if in_double {
+                buf.push(ch);
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        buf.push(chars.next().unwrap());
+                    } else {
+                        in_double = false;
+                    }
+                }
+                continue;
+            }
+
+            if ch == '"' {
+                in_double = true;
+                buf.push(ch);
+                continue;
+            }
+
+            if ch == '.' {
+                parts.push(std::mem::take(&mut buf));
+                continue;
+            }
+
+            buf.push(ch);
+        }
+
+        parts.push(buf);
+        parts
+    }
+
+    fn unquote_ident(s: &str) -> String {
+        let s = s.trim();
+        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+            let inner = &s[1..s.len() - 1];
+            inner.replace("\"\"", "\"")
+        } else {
+            s.trim_matches('\'').to_string()
+        }
+    }
+
+    let tokens = tokenize(query);
+    let first = tokens.iter().find(|t| !t.is_empty())?;
+    if !first.eq_ignore_ascii_case("select") {
         return None;
     }
 
-    // Find FROM keyword
-    let from_pos = query.find(" from ")?;
-    let after_from = &query[from_pos + 6..].trim_start();
+    let from_idx = tokens.iter().position(|t| t.eq_ignore_ascii_case("from"))?;
 
-    // Extract the table name (first word after FROM)
-    // Stop at whitespace, semicolon, or end of string
-    let table_end = after_from
-        .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
-        .unwrap_or(after_from.len());
+    let table_token = tokens
+        .get(from_idx + 1)
+        .map(|t| t.as_str())
+        .filter(|t| !t.is_empty())?;
 
-    let table = after_from[..table_end].trim();
-
-    if table.is_empty() {
+    if table_token == "(" || table_token.starts_with('(') {
         return None;
     }
 
-    // Check for complex queries (JOINs, subqueries)
-    let rest = &after_from[table_end..];
-    if rest.contains(" join ") || table.starts_with('(') {
+    // Reject joins (complex).
+    if tokens
+        .iter()
+        .skip(from_idx + 2)
+        .any(|t| t.eq_ignore_ascii_case("join"))
+    {
         return None;
     }
 
-    // Remove schema prefix if present (public.users -> users)
-    let table_name = table.rsplit('.').next().unwrap_or(table);
-
-    // Remove quotes if present
-    let table_name = table_name.trim_matches('"').trim_matches('\'');
-
-    Some(table_name.to_string())
+    let table_token = table_token.trim_end_matches(';').trim_end_matches(',');
+    let parts = split_qualified_ident(table_token);
+    let last = parts.last().map(|s| s.as_str()).unwrap_or(table_token);
+    let table_name = unquote_ident(last);
+    if table_name.is_empty() {
+        None
+    } else {
+        Some(table_name)
+    }
 }
 
 pub type SharedClient = Arc<Mutex<Client>>;
@@ -2047,8 +2153,11 @@ impl App {
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
                 // Ctrl+Shift+C: Open connection manager
-                (KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                | (KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                (code @ (KeyCode::Char('c') | KeyCode::Char('C')), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && (modifiers.contains(KeyModifiers::SHIFT)
+                            || matches!(code, KeyCode::Char('C'))) =>
+                {
                     self.open_connection_manager();
                     return false;
                 }
@@ -2121,8 +2230,28 @@ impl App {
                     };
                     return false;
                 }
-                // Ctrl+B: Toggle sidebar
-                (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                // Ctrl+\ (and terminals that report it as Ctrl+4): Toggle sidebar
+                (KeyCode::Char('\\') | KeyCode::Char('4'), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if self.sidebar_visible {
+                        self.sidebar_visible = false;
+                        // If hiding sidebar and focus was on it, move focus to query
+                        if matches!(self.focus, Focus::Sidebar(_)) {
+                            self.focus = Focus::Query;
+                        }
+                    } else {
+                        // When opening the sidebar, jump straight to Schema.
+                        self.focus_schema();
+                    }
+                    return false;
+                }
+                // Ctrl+Shift+B: Toggle sidebar
+                (code @ (KeyCode::Char('b') | KeyCode::Char('B')), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && (modifiers.contains(KeyModifiers::SHIFT)
+                            || matches!(code, KeyCode::Char('B'))) =>
+                {
                     if self.sidebar_visible {
                         self.sidebar_visible = false;
                         // If hiding sidebar and focus was on it, move focus to query
@@ -2180,8 +2309,14 @@ impl App {
                                 GridKeyResult::None
                             }
                             Action::ToggleSidebar => {
-                                self.sidebar_visible = !self.sidebar_visible;
-                                // Note: No need to change focus here - we're already in Focus::Grid
+                                if self.sidebar_visible {
+                                    self.sidebar_visible = false;
+                                    if matches!(self.focus, Focus::Sidebar(_)) {
+                                        self.focus = Focus::Query;
+                                    }
+                                } else {
+                                    self.focus_schema();
+                                }
                                 GridKeyResult::None
                             }
                             // Goto navigation (custom keybindings for navigation)
@@ -2778,20 +2913,17 @@ impl App {
     }
 
     fn start_cell_edit(&mut self, row: usize, col: usize) {
-        // Check if we have a valid PK for safe editing
-        if !self.grid.has_valid_pk() {
-            self.last_error = Some(
-                "Cannot edit: no primary key detected. Run a simple SELECT from a table with a PK."
-                    .to_string(),
-            );
-            return;
-        }
-
         // Check if we have a source table
         if self.grid.source_table.is_none() {
             self.last_error =
                 Some("Cannot edit: unknown source table. Run a simple SELECT query.".to_string());
             return;
+        }
+
+        if !self.grid.has_valid_pk() {
+            self.last_status = Some(
+                "No primary key detected; updates will match the first row by values.".to_string(),
+            );
         }
 
         // Get the current cell value
@@ -3069,32 +3201,20 @@ impl App {
         };
 
         // Build WHERE clause from primary key values
-        let pk_conditions: Vec<String> = self
-            .grid
-            .primary_keys
-            .iter()
-            .filter_map(|pk_name| {
-                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
-                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
-                Some(format!(
-                    "{} = {}",
-                    quote_identifier(pk_name),
-                    escape_sql_value(pk_value)
-                ))
-            })
-            .collect();
-
-        if pk_conditions.is_empty() {
-            self.last_error = Some("Cannot update: missing primary key values".to_string());
-            return;
-        }
+        let where_clause = match self.build_update_where_clause(row, col, None) {
+            Ok(w) => w,
+            Err(msg) => {
+                self.last_error = Some(msg);
+                return;
+            }
+        };
 
         let update_sql = format!(
             "UPDATE {} SET {} = {} WHERE {}",
-            table,
+            quote_identifier(&table),
             quote_identifier(&column_name),
             escape_sql_value(&new_value),
-            pk_conditions.join(" AND ")
+            where_clause
         );
 
         self.execute_cell_update(update_sql, row, col, new_value);
@@ -3132,34 +3252,22 @@ impl App {
             }
         };
 
-        // Build WHERE clause from primary key values
-        let pk_conditions: Vec<String> = self
-            .grid
-            .primary_keys
-            .iter()
-            .filter_map(|pk_name| {
-                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
-                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
-                Some(format!(
-                    "{} = {}",
-                    quote_identifier(pk_name),
-                    escape_sql_value(pk_value)
-                ))
-            })
-            .collect();
-
-        if pk_conditions.is_empty() {
-            self.cell_editor.close();
-            self.last_error = Some("Cannot update: missing primary key values".to_string());
-            return;
-        }
+        let where_clause =
+            match self.build_update_where_clause(row, col, Some((&original_value).as_str())) {
+                Ok(w) => w,
+                Err(msg) => {
+                    self.cell_editor.close();
+                    self.last_error = Some(msg);
+                    return;
+                }
+            };
 
         let update_sql = format!(
             "UPDATE {} SET {} = {} WHERE {}",
-            table,
+            quote_identifier(&table),
             quote_identifier(&column_name),
             escape_sql_value(&new_value),
-            pk_conditions.join(" AND ")
+            where_clause
         );
 
         // Close editor and execute update
@@ -3192,14 +3300,32 @@ impl App {
         self.rt.spawn(async move {
             let guard = client.lock().await;
             match guard.simple_query(&sql).await {
-                Ok(_) => {
+                Ok(messages) => {
                     drop(guard);
-                    // Send a custom event to update the cell
-                    let _ = tx.send(DbEvent::CellUpdated {
-                        row: update_row,
-                        col: update_col,
-                        value: update_value,
-                    });
+                    let affected = messages
+                        .iter()
+                        .filter_map(|m| match m {
+                            SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+                            _ => None,
+                        })
+                        .sum::<u64>();
+
+                    if affected == 1 {
+                        // Send a custom event to update the cell
+                        let _ = tx.send(DbEvent::CellUpdated {
+                            row: update_row,
+                            col: update_col,
+                            value: update_value,
+                        });
+                    } else if affected == 0 {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: "Update affected 0 rows (row may have changed)".to_string(),
+                        });
+                    } else {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Update affected {} rows (ambiguous match)", affected),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(DbEvent::QueryError {
@@ -3208,6 +3334,75 @@ impl App {
                 }
             }
         });
+    }
+
+    fn build_update_where_clause(
+        &self,
+        row: usize,
+        edited_col: usize,
+        edited_original_value: Option<&str>,
+    ) -> Result<String, String> {
+        let table = self
+            .grid
+            .source_table
+            .as_ref()
+            .ok_or_else(|| "Cannot update: unknown source table".to_string())?;
+
+        let pk_conditions: Vec<String> = self
+            .grid
+            .primary_keys
+            .iter()
+            .filter_map(|pk_name| {
+                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
+                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
+                Some(format!(
+                    "{} = {}",
+                    quote_identifier(pk_name),
+                    escape_sql_value(pk_value)
+                ))
+            })
+            .collect();
+
+        if !pk_conditions.is_empty() {
+            return Ok(pk_conditions.join(" AND "));
+        }
+
+        // Fallback for tables without a detected PK (or when PK columns are not present in the
+        // result set): match the first row by values and pin it using `ctid`.
+        //
+        // Notes:
+        // - This can be ambiguous if multiple rows share the same visible column values.
+        // - `ctid` is stable for the lifetime of the tuple; it's safe for immediate updates.
+        let row_values = self
+            .grid
+            .rows
+            .get(row)
+            .ok_or_else(|| "Cannot update: invalid row".to_string())?;
+
+        if self.grid.headers.is_empty() || row_values.is_empty() {
+            return Err("Cannot update: no row data".to_string());
+        }
+
+        let mut match_conditions = Vec::new();
+        for (idx, header) in self.grid.headers.iter().enumerate() {
+            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
+            if idx == edited_col {
+                if let Some(original) = edited_original_value {
+                    value = original;
+                }
+            }
+            match_conditions.push(format!(
+                "{} IS NOT DISTINCT FROM {}",
+                quote_identifier(header),
+                escape_sql_literal_for_where(value)
+            ));
+        }
+
+        Ok(format!(
+            "ctid = (SELECT ctid FROM {} WHERE {} ORDER BY ctid LIMIT 1)",
+            quote_identifier(table),
+            match_conditions.join(" AND ")
+        ))
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
@@ -3834,9 +4029,13 @@ impl App {
                 self.open_history_picker();
             }
             Action::ToggleSidebar => {
-                self.sidebar_visible = !self.sidebar_visible;
-                if !self.sidebar_visible && matches!(self.focus, Focus::Sidebar(_)) {
-                    self.focus = Focus::Query;
+                if self.sidebar_visible {
+                    self.sidebar_visible = false;
+                    if matches!(self.focus, Focus::Sidebar(_)) {
+                        self.focus = Focus::Query;
+                    }
+                } else {
+                    self.focus_schema();
                 }
             }
 
@@ -5737,6 +5936,22 @@ fn calculate_editor_scroll(
     (scroll_row as u16, scroll_col as u16)
 }
 
+fn escape_sql_literal_for_where(s: &str) -> String {
+    if s.eq_ignore_ascii_case("null") {
+        return "NULL".to_string();
+    }
+
+    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+        return s.to_string();
+    }
+
+    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
+        return s.to_uppercase();
+    }
+
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5842,6 +6057,62 @@ mod tests {
     }
 
     // ========== CellEditor Tests ==========
+
+    #[test]
+    fn test_start_cell_edit_allows_tables_without_primary_key() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut grid = GridModel::new(
+            vec!["a".to_string(), "b".to_string()],
+            vec![vec!["1".to_string(), "2".to_string()]],
+        );
+        grid.source_table = Some("t".to_string());
+        grid.primary_keys = Vec::new();
+
+        let mut app = App::new(grid, rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.start_cell_edit(0, 0);
+        assert!(
+            app.cell_editor.active || app.json_editor.is_some(),
+            "Editing should be allowed even without a detected PK"
+        );
+    }
+
+    #[test]
+    fn test_build_update_where_clause_falls_back_to_ctid_match() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut grid = GridModel::new(
+            vec!["a".to_string(), "b".to_string()],
+            vec![vec!["1".to_string(), "NULL".to_string()]],
+        );
+        grid.source_table = Some("t".to_string());
+        grid.primary_keys = Vec::new();
+
+        let app = App::new(grid, rt.handle().clone(), tx, rx, None);
+        let where_clause = app
+            .build_update_where_clause(0, 0, Some("1"))
+            .expect("where clause");
+
+        assert!(
+            where_clause.contains("ctid = (SELECT ctid"),
+            "Should use ctid subselect when no PK is available"
+        );
+        assert!(
+            where_clause.contains("b IS NOT DISTINCT FROM NULL"),
+            "Should use IS NOT DISTINCT FROM and preserve NULLs"
+        );
+    }
 
     #[test]
     fn test_cell_editor_open_sets_cursor_at_end() {
@@ -6245,6 +6516,10 @@ mod tests {
         assert_eq!(
             extract_table_from_query("SELECT * FROM users;"),
             Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT *\nFROM fax_numbers\nLIMIT 100;"),
+            Some("fax_numbers".to_string())
         );
     }
 
@@ -7263,7 +7538,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ctrl_b_opens_sidebar_and_focuses_schema() {
+    fn test_ctrl_shift_b_opens_sidebar_and_focuses_schema() {
         let _guard = ConfigDirGuard::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -7308,27 +7583,153 @@ mod tests {
         app.sidebar_visible = false;
         app.mode = Mode::Normal;
 
-        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         app.on_key(key);
 
         assert!(
             app.sidebar_visible,
-            "Ctrl+B should show the sidebar when it was hidden"
+            "Ctrl+Shift+B should show the sidebar when it was hidden"
         );
         assert_eq!(
             app.focus,
             Focus::Sidebar(SidebarSection::Schema),
-            "Ctrl+B should focus Schema when opening the sidebar"
+            "Ctrl+Shift+B should focus Schema when opening the sidebar"
         );
         assert_eq!(
             app.sidebar_focus,
             SidebarSection::Schema,
-            "Ctrl+B should set sidebar_focus to Schema"
+            "Ctrl+Shift+B should set sidebar_focus to Schema"
         );
         assert_eq!(
             app.sidebar.schema_state.selected(),
             &["schema:_sqlx_test".to_string()],
-            "Ctrl+B should select the first schema item"
+            "Ctrl+Shift+B should select the first schema item"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_backslash_toggles_sidebar_when_sidebar_schema_focused() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.sidebar_focus = SidebarSection::Schema;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert!(
+            !app.sidebar_visible,
+            "Ctrl+\\ should hide the sidebar when it is visible"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "When hiding the sidebar, focus should return to Query"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_backslash_toggles_sidebar_when_sidebar_connections_focused() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.sidebar_focus = SidebarSection::Connections;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert!(
+            !app.sidebar_visible,
+            "Ctrl+\\ should hide the sidebar when it is visible"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "When hiding the sidebar, focus should return to Query"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_4_toggles_sidebar_when_sidebar_schema_focused() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.sidebar_focus = SidebarSection::Schema;
+        app.mode = Mode::Normal;
+
+        let key = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        app.on_key(key);
+
+        assert!(
+            !app.sidebar_visible,
+            "Ctrl+4 should hide the sidebar when it is visible"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Query,
+            "When hiding the sidebar, focus should return to Query"
         );
     }
 

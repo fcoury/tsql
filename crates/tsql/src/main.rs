@@ -1,8 +1,8 @@
 use std::env;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 
 use anyhow::{Context, Result};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -33,6 +33,8 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  -h, --help        Print this help message");
     eprintln!("  -V, --version     Print version information");
+    eprintln!("      --debug-keys  Print detected key/mouse events (for troubleshooting)");
+    eprintln!("      --mouse       (with --debug-keys) Also print mouse events");
     eprintln!();
     eprintln!("Environment Variables:");
     eprintln!("  DATABASE_URL      Default connection URL if not provided as argument");
@@ -45,6 +47,8 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
+    eprintln!("  tsql --debug-keys");
+    eprintln!("  tsql --debug-keys --mouse");
 }
 
 fn main() -> Result<()> {
@@ -61,6 +65,18 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "-V" || a == "--version") {
         print_version();
         return Ok(());
+    }
+
+    // Key debug mode (helps identify what the terminal actually sends)
+    let debug_keys_mode = args
+        .iter()
+        .any(|a| a == "--debug-keys" || a == "--debug-keys-mouse")
+        || args.get(1).is_some_and(|a| a == "debug-keys");
+    if debug_keys_mode {
+        let debug_mouse = args
+            .iter()
+            .any(|a| a == "--debug-keys-mouse" || a == "--mouse");
+        return run_debug_keys(debug_mouse);
     }
 
     // Load configuration from ~/.config/tsql/config.toml
@@ -141,6 +157,126 @@ fn main() -> Result<()> {
     restore_terminal(terminal)?;
 
     res
+}
+
+fn run_debug_keys(with_mouse: bool) -> Result<()> {
+    struct DebugTerminalGuard {
+        stdout: Stdout,
+        with_mouse: bool,
+    }
+
+    impl DebugTerminalGuard {
+        fn new(with_mouse: bool) -> Result<Self> {
+            enable_raw_mode()?;
+            let mut stdout = io::stdout();
+            if with_mouse {
+                execute!(stdout, EnableMouseCapture)?;
+            }
+            Ok(Self { stdout, with_mouse })
+        }
+
+        fn println(&mut self, line: &str) -> Result<()> {
+            write!(self.stdout, "\r\n{line}")?;
+            self.stdout.flush()?;
+            Ok(())
+        }
+    }
+
+    impl Drop for DebugTerminalGuard {
+        fn drop(&mut self) {
+            if self.with_mouse {
+                let _ = execute!(self.stdout, DisableMouseCapture);
+            }
+            let _ = disable_raw_mode();
+            let _ = self.stdout.flush();
+        }
+    }
+
+    fn describe_key(key: KeyEvent) -> String {
+        let mut parts = Vec::new();
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            parts.push("Ctrl");
+        }
+        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            parts.push("Alt");
+        }
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+        {
+            parts.push("Shift");
+        }
+
+        let key_name = match key.code {
+            KeyCode::Char(c) => format!("{c:?}"),
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::Esc => "Esc".to_string(),
+            KeyCode::Tab => "Tab".to_string(),
+            KeyCode::BackTab => "BackTab".to_string(),
+            KeyCode::Backspace => "Backspace".to_string(),
+            KeyCode::Delete => "Delete".to_string(),
+            KeyCode::Insert => "Insert".to_string(),
+            KeyCode::Home => "Home".to_string(),
+            KeyCode::End => "End".to_string(),
+            KeyCode::PageUp => "PageUp".to_string(),
+            KeyCode::PageDown => "PageDown".to_string(),
+            KeyCode::Up => "Up".to_string(),
+            KeyCode::Down => "Down".to_string(),
+            KeyCode::Left => "Left".to_string(),
+            KeyCode::Right => "Right".to_string(),
+            KeyCode::F(n) => format!("F{n}"),
+            other => format!("{other:?}"),
+        };
+
+        if parts.is_empty() {
+            key_name
+        } else {
+            format!("{}+{key_name}", parts.join("+"))
+        }
+    }
+
+    let mut guard = DebugTerminalGuard::new(with_mouse)?;
+    let mouse_msg = if with_mouse { "on" } else { "off" };
+    guard.println(&format!(
+        "tsql --debug-keys (mouse: {mouse_msg}) (press Esc or Ctrl+C to exit)"
+    ))?;
+
+    loop {
+        let ev = event::read()?;
+        match ev {
+            Event::Key(key) => {
+                let desc = describe_key(key);
+                guard.println(&format!("Key: {desc}    raw={key:?}"))?;
+
+                let is_ctrl_c = key.code == KeyCode::Char('c')
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL);
+                if key.code == KeyCode::Esc || is_ctrl_c {
+                    break;
+                }
+            }
+            Event::Mouse(mouse) => {
+                if with_mouse {
+                    guard.println(&format!("Mouse: {mouse:?}"))?;
+                }
+            }
+            Event::Resize(w, h) => {
+                guard.println(&format!("Resize: {w}x{h}"))?;
+            }
+            Event::Paste(text) => {
+                guard.println(&format!("Paste: {:?} ({} bytes)", text, text.len()))?;
+            }
+            other => {
+                guard.println(&format!("Event: {other:?}"))?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {

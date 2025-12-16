@@ -77,7 +77,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("?", "Toggle this help"),
         KeyBinding::new("Ctrl+O", "Open connection picker"),
         KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
-        KeyBinding::new("Ctrl+B", "Toggle sidebar"),
+        KeyBinding::new("Ctrl+Shift+B / Ctrl+\\ / Ctrl+4", "Toggle sidebar"),
     ],
 );
 
