@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::config::{Action, ConnectionColor, ConnectionEntry, Keymap};
+use crate::config::{Action, ConnectionColor, ConnectionEntry, Keymap, SslMode};
 
 /// Which field is currently focused in the form
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,19 +27,21 @@ pub enum FormField {
     User,
     Password,
     SavePassword,
+    SslMode,
     Color,
     UrlPaste,
 }
 
 impl FormField {
     /// Get the next field in tab order
-    /// Order: Name → User → Password → SavePassword → Host → Port → Database → Color → UrlPaste
+    /// Order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
     pub fn next(self) -> Self {
         match self {
             FormField::Name => FormField::User,
             FormField::User => FormField::Password,
             FormField::Password => FormField::SavePassword,
-            FormField::SavePassword => FormField::Host,
+            FormField::SavePassword => FormField::SslMode,
+            FormField::SslMode => FormField::Host,
             FormField::Host => FormField::Port,
             FormField::Port => FormField::Database,
             FormField::Database => FormField::Color,
@@ -55,12 +57,29 @@ impl FormField {
             FormField::User => FormField::Name,
             FormField::Password => FormField::User,
             FormField::SavePassword => FormField::Password,
-            FormField::Host => FormField::SavePassword,
+            FormField::SslMode => FormField::SavePassword,
+            FormField::Host => FormField::SslMode,
             FormField::Port => FormField::Host,
             FormField::Database => FormField::Port,
             FormField::Color => FormField::Database,
             FormField::UrlPaste => FormField::Color,
         }
+    }
+}
+
+fn ssl_mode_to_index(mode: SslMode) -> usize {
+    match mode {
+        SslMode::Disable => 0,
+        SslMode::Prefer => 1,
+        SslMode::Require => 2,
+    }
+}
+
+fn index_to_ssl_mode(index: usize) -> SslMode {
+    match index {
+        1 => SslMode::Prefer,
+        2 => SslMode::Require,
+        _ => SslMode::Disable,
     }
 }
 
@@ -105,6 +124,7 @@ pub struct ConnectionFormModal {
     user: String,
     password: String,
     save_password: bool,
+    ssl_mode: SslMode,
     color: ConnectionColor,
     url_paste: String,
 
@@ -122,6 +142,8 @@ pub struct ConnectionFormModal {
 
     /// Color selection index (for cycling through colors)
     color_index: usize,
+    /// SSL mode selection index (for cycling through modes)
+    ssl_mode_index: usize,
 
     /// Whether we're editing an existing connection (used for UI hints)
     #[allow(dead_code)]
@@ -153,6 +175,7 @@ struct OriginalFormValues {
     user: String,
     password: String,
     save_password: bool,
+    ssl_mode: SslMode,
     color: ConnectionColor,
 }
 
@@ -172,6 +195,7 @@ impl ConnectionFormModal {
             user: String::new(),
             password: String::new(),
             save_password: false,
+            ssl_mode: SslMode::Disable,
             color: ConnectionColor::None,
             url_paste: String::new(),
 
@@ -185,6 +209,7 @@ impl ConnectionFormModal {
 
             focused: FormField::Name,
             color_index: 0,
+            ssl_mode_index: 0,
             editing: false,
             original_name: None,
             title: "New Connection".to_string(),
@@ -223,8 +248,12 @@ impl ConnectionFormModal {
             user: entry.user.clone(),
             password: password.clone(),
             save_password: entry.password_in_keychain,
+            ssl_mode: entry.ssl_mode.unwrap_or(SslMode::Disable),
             color: entry.color,
         };
+
+        let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
+        let ssl_mode_index = ssl_mode_to_index(ssl_mode);
 
         Self {
             name: entry.name.clone(),
@@ -234,6 +263,7 @@ impl ConnectionFormModal {
             user: entry.user.clone(),
             password: password.clone(),
             save_password: entry.password_in_keychain,
+            ssl_mode,
             color: entry.color,
             url_paste: String::new(),
 
@@ -247,6 +277,7 @@ impl ConnectionFormModal {
 
             focused: FormField::Name,
             color_index,
+            ssl_mode_index,
             editing: true,
             original_name: Some(entry.name.clone()),
             title: format!("Edit: {}", entry.name),
@@ -269,7 +300,8 @@ impl ConnectionFormModal {
                 || !self.password.is_empty()
                 || !self.database.is_empty()
                 || self.host != "localhost"
-                || self.port != "5432";
+                || self.port != "5432"
+                || self.ssl_mode != SslMode::Disable;
         }
 
         // For editing, compare with original values
@@ -281,6 +313,7 @@ impl ConnectionFormModal {
                 || self.user != orig.user
                 || self.password != orig.password
                 || self.save_password != orig.save_password
+                || self.ssl_mode != orig.ssl_mode
                 || self.color != orig.color;
         }
 
@@ -366,6 +399,12 @@ impl ConnectionFormModal {
                 ConnectionFormAction::Continue
             }
 
+            // Enter on ssl mode cycles
+            (KeyCode::Enter, KeyModifiers::NONE) if self.focused == FormField::SslMode => {
+                self.cycle_ssl_mode(1);
+                ConnectionFormAction::Continue
+            }
+
             // Space toggles checkboxes
             (KeyCode::Char(' '), KeyModifiers::NONE) if self.focused == FormField::SavePassword => {
                 self.save_password = !self.save_password;
@@ -378,6 +417,12 @@ impl ConnectionFormModal {
                 ConnectionFormAction::Continue
             }
 
+            // Space cycles ssl mode
+            (KeyCode::Char(' '), KeyModifiers::NONE) if self.focused == FormField::SslMode => {
+                self.cycle_ssl_mode(1);
+                ConnectionFormAction::Continue
+            }
+
             // Left/Right on color cycles
             (KeyCode::Left, KeyModifiers::NONE) if self.focused == FormField::Color => {
                 self.cycle_color(-1);
@@ -385,6 +430,16 @@ impl ConnectionFormModal {
             }
             (KeyCode::Right, KeyModifiers::NONE) if self.focused == FormField::Color => {
                 self.cycle_color(1);
+                ConnectionFormAction::Continue
+            }
+
+            // Left/Right on ssl mode cycles
+            (KeyCode::Left, KeyModifiers::NONE) if self.focused == FormField::SslMode => {
+                self.cycle_ssl_mode(-1);
+                ConnectionFormAction::Continue
+            }
+            (KeyCode::Right, KeyModifiers::NONE) if self.focused == FormField::SslMode => {
+                self.cycle_ssl_mode(1);
                 ConnectionFormAction::Continue
             }
 
@@ -437,7 +492,7 @@ impl ConnectionFormModal {
             FormField::User => Some((&mut self.user, &mut self.user_cursor)),
             FormField::Password => Some((&mut self.password, &mut self.password_cursor)),
             FormField::UrlPaste => Some((&mut self.url_paste, &mut self.url_paste_cursor)),
-            FormField::SavePassword | FormField::Color => None,
+            FormField::SavePassword | FormField::SslMode | FormField::Color => None,
         }
     }
 
@@ -514,6 +569,12 @@ impl ConnectionFormModal {
             .unwrap_or(ConnectionColor::None);
     }
 
+    fn cycle_ssl_mode(&mut self, direction: i32) {
+        let len = 3i32;
+        self.ssl_mode_index = ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
+        self.ssl_mode = index_to_ssl_mode(self.ssl_mode_index);
+    }
+
     fn process_url_paste(&mut self) -> ConnectionFormAction {
         if self.url_paste.is_empty() {
             return ConnectionFormAction::Continue;
@@ -527,6 +588,8 @@ impl ConnectionFormModal {
                 self.port = entry.port.to_string();
                 self.database = entry.database;
                 self.user = entry.user;
+                self.ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
+                self.ssl_mode_index = ssl_mode_to_index(self.ssl_mode);
 
                 if let Some(pwd) = password {
                     self.password = pwd;
@@ -605,7 +668,10 @@ impl ConnectionFormModal {
             no_password_required,
             color: self.color,
             favorite: None, // Preserve from original if editing
-            ssl_mode: None,
+            ssl_mode: match self.ssl_mode {
+                SslMode::Disable => None,
+                other => Some(other),
+            },
         };
 
         let password = if self.password.is_empty() {
@@ -654,7 +720,10 @@ impl ConnectionFormModal {
             no_password_required: false,
             color: ConnectionColor::None,
             favorite: None,
-            ssl_mode: None,
+            ssl_mode: match self.ssl_mode {
+                SslMode::Disable => None,
+                other => Some(other),
+            },
         };
 
         let password = if self.password.is_empty() {
@@ -670,7 +739,7 @@ impl ConnectionFormModal {
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         // Calculate modal size
         let modal_width = 60u16.min(area.width - 4);
-        let modal_height = 18u16.min(area.height - 2);
+        let modal_height = 19u16.min(area.height - 2);
         let modal_x = (area.width - modal_width) / 2;
         let modal_y = (area.height - modal_height) / 2;
 
@@ -698,13 +767,14 @@ impl ConnectionFormModal {
         frame.render_widget(block, modal_area);
 
         // Layout the form fields
-        // Order: Name → User → Password → SavePassword → Host → Port → Database → Color → UrlPaste
+        // Order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
         let chunks = Layout::vertical([
             Constraint::Length(1), // Name
             Constraint::Length(1), // Separator
             Constraint::Length(1), // User
             Constraint::Length(1), // Password
             Constraint::Length(1), // Save password checkbox
+            Constraint::Length(1), // SSL mode
             Constraint::Length(1), // Separator
             Constraint::Length(1), // Host
             Constraint::Length(1), // Port
@@ -743,10 +813,11 @@ impl ConnectionFormModal {
             self.save_password,
             FormField::SavePassword,
         );
-        self.render_separator(frame, chunks[5]);
+        self.render_ssl_mode_field(frame, chunks[5]);
+        self.render_separator(frame, chunks[6]);
         self.render_text_field(
             frame,
-            chunks[6],
+            chunks[7],
             "Host:",
             &self.host,
             self.host_cursor,
@@ -754,7 +825,7 @@ impl ConnectionFormModal {
         );
         self.render_text_field(
             frame,
-            chunks[7],
+            chunks[8],
             "Port:",
             &self.port,
             self.port_cursor,
@@ -762,17 +833,17 @@ impl ConnectionFormModal {
         );
         self.render_text_field(
             frame,
-            chunks[8],
+            chunks[9],
             "Database:",
             &self.database,
             self.database_cursor,
             FormField::Database,
         );
-        self.render_separator(frame, chunks[9]);
-        self.render_color_field(frame, chunks[10]);
-        self.render_url_paste_field(frame, chunks[11]);
-        self.render_separator(frame, chunks[12]);
-        self.render_help(frame, chunks[13]);
+        self.render_separator(frame, chunks[10]);
+        self.render_color_field(frame, chunks[11]);
+        self.render_url_paste_field(frame, chunks[12]);
+        self.render_separator(frame, chunks[13]);
+        self.render_help(frame, chunks[14]);
     }
 
     fn render_text_field(
@@ -915,6 +986,41 @@ impl ConnectionFormModal {
         frame.render_widget(widget, chunks[1]);
     }
 
+    fn render_ssl_mode_field(&self, frame: &mut Frame, area: Rect) {
+        let is_focused = self.focused == FormField::SslMode;
+        let label_width = 10;
+
+        let chunks =
+            Layout::horizontal([Constraint::Length(label_width), Constraint::Min(1)]).split(area);
+
+        // Label
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let label_widget = Paragraph::new("SSL:").style(label_style);
+        frame.render_widget(label_widget, chunks[0]);
+
+        let mode_name = self.ssl_mode.as_str();
+        let mut spans = vec![];
+        if is_focused {
+            spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!("{:<8}", mode_name),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if is_focused {
+            spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+        }
+
+        let widget = Paragraph::new(Line::from(spans));
+        frame.render_widget(widget, chunks[1]);
+    }
+
     fn render_url_paste_field(&self, frame: &mut Frame, area: Rect) {
         let is_focused = self.focused == FormField::UrlPaste;
         let label_width = 10;
@@ -1007,14 +1113,16 @@ mod tests {
 
     #[test]
     fn test_form_field_navigation() {
-        // New order: Name → User → Password → SavePassword → Host → Port → Database → Color → UrlPaste
+        // New order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
         assert_eq!(FormField::Name.next(), FormField::User);
         assert_eq!(FormField::User.next(), FormField::Password);
         assert_eq!(FormField::Password.next(), FormField::SavePassword);
-        assert_eq!(FormField::SavePassword.next(), FormField::Host);
+        assert_eq!(FormField::SavePassword.next(), FormField::SslMode);
+        assert_eq!(FormField::SslMode.next(), FormField::Host);
         assert_eq!(FormField::UrlPaste.next(), FormField::Name);
         assert_eq!(FormField::Name.prev(), FormField::UrlPaste);
         assert_eq!(FormField::User.prev(), FormField::Name);
+        assert_eq!(FormField::Host.prev(), FormField::SslMode);
     }
 
     #[test]

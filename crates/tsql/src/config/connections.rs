@@ -14,6 +14,33 @@ use url::Url;
 /// Service name for keyring storage
 const KEYRING_SERVICE: &str = "tsql";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SslMode {
+    Disable,
+    Prefer,
+    Require,
+}
+
+impl SslMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "disable" => Some(SslMode::Disable),
+            "prefer" => Some(SslMode::Prefer),
+            "require" => Some(SslMode::Require),
+            _ => None,
+        }
+    }
+}
+
 /// Named colors for connection visual identification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,7 +149,7 @@ pub struct ConnectionEntry {
     pub favorite: Option<u8>,
     /// SSL mode (for Phase 7)
     #[serde(default)]
-    pub ssl_mode: Option<String>,
+    pub ssl_mode: Option<SslMode>,
 }
 
 fn default_port() -> u16 {
@@ -184,6 +211,11 @@ impl ConnectionEntry {
         url.push('/');
         url.push_str(&self.database);
 
+        if let Some(mode) = self.ssl_mode {
+            url.push_str("?sslmode=");
+            url.push_str(mode.as_str());
+        }
+
         url
     }
 
@@ -227,6 +259,17 @@ impl ConnectionEntry {
         // If password is in URL, we have a password; if not, assume no password required
         let no_password_required = password.is_none();
 
+        let ssl_mode = url
+            .query_pairs()
+            .find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("sslmode") {
+                    SslMode::parse(&v)
+                } else {
+                    None
+                }
+            })
+            .filter(|m| *m != SslMode::Disable);
+
         let entry = ConnectionEntry {
             name: name.to_string(),
             host,
@@ -238,7 +281,7 @@ impl ConnectionEntry {
             no_password_required,
             color: ConnectionColor::None,
             favorite: None,
-            ssl_mode: None,
+            ssl_mode,
         };
 
         Ok((entry, password))
@@ -660,6 +703,7 @@ mod tests {
         assert_eq!(entry.port, 5432);
         assert_eq!(entry.color, ConnectionColor::None);
         assert!(entry.favorite.is_none());
+        assert!(entry.ssl_mode.is_none());
     }
 
     #[test]
@@ -690,6 +734,22 @@ mod tests {
 
         let url = entry.to_url(Some("secret"));
         assert_eq!(url, "postgres://postgres:secret@localhost/mydb");
+    }
+
+    #[test]
+    fn test_connection_to_url_includes_sslmode() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ssl_mode: Some(SslMode::Require),
+            ..Default::default()
+        };
+
+        let url = entry.to_url(None);
+        assert_eq!(url, "postgres://postgres@localhost/mydb?sslmode=require");
     }
 
     #[test]
@@ -733,6 +793,7 @@ mod tests {
         assert_eq!(entry.database, "mydb");
         assert_eq!(entry.user, "user");
         assert!(password.is_none());
+        assert!(entry.ssl_mode.is_none());
     }
 
     #[test]
@@ -758,6 +819,15 @@ mod tests {
             ConnectionEntry::from_url("test", "postgresql://user@localhost/mydb").unwrap();
 
         assert_eq!(entry.host, "localhost");
+    }
+
+    #[test]
+    fn test_connection_from_url_parses_sslmode() {
+        let (entry, _) =
+            ConnectionEntry::from_url("test", "postgres://user@localhost/mydb?sslmode=require")
+                .unwrap();
+
+        assert_eq!(entry.ssl_mode, Some(SslMode::Require));
     }
 
     #[test]
