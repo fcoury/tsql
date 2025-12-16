@@ -715,6 +715,45 @@ impl GridState {
             self.col_offset = self.col_offset.min(col_count.saturating_sub(1));
         }
     }
+
+    /// Clamp cursor and selection to valid bounds after model changes.
+    ///
+    /// This ensures state validity when rows are added or removed.
+    /// For row appending (streaming results), cursor positions remain valid
+    /// but this method can be called for consistency.
+    pub fn clamp_to_bounds(&mut self, model: &GridModel) {
+        let row_count = model.rows.len();
+        let col_count = model.headers.len();
+
+        if row_count == 0 {
+            self.cursor_row = 0;
+            self.row_offset = 0;
+            self.selected_rows.clear();
+        } else {
+            // Clamp cursor row
+            if self.cursor_row >= row_count {
+                self.cursor_row = row_count - 1;
+            }
+            // Clamp row offset
+            if self.row_offset >= row_count {
+                self.row_offset = row_count.saturating_sub(1);
+            }
+            // Remove any invalid selections
+            self.selected_rows.retain(|&r| r < row_count);
+        }
+
+        if col_count == 0 {
+            self.cursor_col = 0;
+            self.col_offset = 0;
+        } else {
+            if self.cursor_col >= col_count {
+                self.cursor_col = col_count - 1;
+            }
+            if self.col_offset >= col_count {
+                self.col_offset = col_count - 1;
+            }
+        }
+    }
 }
 
 pub struct GridModel {
@@ -767,6 +806,36 @@ impl GridModel {
             primary_keys: Vec::new(),
             col_types: Vec::new(),
         }
+    }
+
+    /// Append additional rows to the grid, updating column widths as needed.
+    ///
+    /// This method is used for streaming/paged query results where rows arrive
+    /// incrementally. The headers and column types remain unchanged.
+    pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
+        const MIN_W: u16 = 3;
+        const MAX_W: u16 = 40;
+
+        // Update column widths for any cells that are wider than current widths
+        for row in &new_rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i >= self.col_widths.len() {
+                    break;
+                }
+                // For UUIDs, use the truncated display width (8 hex chars + ellipsis = 9)
+                let effective_width = if is_uuid(cell) {
+                    9
+                } else {
+                    UnicodeWidthStr::width(cell.as_str()) as u16
+                };
+                let w = effective_width.clamp(MIN_W, MAX_W);
+                if w > self.col_widths[i] {
+                    self.col_widths[i] = w;
+                }
+            }
+        }
+
+        self.rows.extend(new_rows);
     }
 
     /// Get the column type for a given column index.
@@ -2663,5 +2732,191 @@ mod tests {
             Some(Color::DarkGray),
             "Non-cursor row should use DarkGray foreground"
         );
+    }
+
+    // =========================================================================
+    // Tests for append_rows (Phase B: streaming/paged results)
+    // =========================================================================
+
+    #[test]
+    fn test_append_rows_extends_rows() {
+        let mut model = create_test_model();
+        assert_eq!(model.rows.len(), 2);
+
+        model.append_rows(vec![
+            vec!["3".to_string(), "Charlie".to_string()],
+            vec!["4".to_string(), "Diana".to_string()],
+        ]);
+
+        assert_eq!(model.rows.len(), 4);
+        assert_eq!(model.rows[2], vec!["3", "Charlie"]);
+        assert_eq!(model.rows[3], vec!["4", "Diana"]);
+    }
+
+    #[test]
+    fn test_append_rows_updates_column_widths() {
+        let mut model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Al".to_string()]], // short names
+        );
+
+        // Initial widths: "id" = 3 (min), "name" = 4
+        assert_eq!(model.col_widths[0], 3); // "id" -> min 3
+        assert_eq!(model.col_widths[1], 4); // "name"
+
+        // Append a row with a longer name
+        model.append_rows(vec![vec![
+            "2".to_string(),
+            "Christopher".to_string(), // 11 chars
+        ]]);
+
+        // Width should increase for the name column
+        assert_eq!(model.col_widths[0], 3); // unchanged
+        assert_eq!(model.col_widths[1], 11); // "Christopher"
+    }
+
+    #[test]
+    fn test_append_rows_respects_max_width() {
+        let mut model = GridModel::new(vec!["data".to_string()], vec![vec!["short".to_string()]]);
+
+        // Append a very long string (> 40 chars)
+        let long_string = "a".repeat(100);
+        model.append_rows(vec![vec![long_string]]);
+
+        // Width should be clamped to max 40
+        assert_eq!(model.col_widths[0], 40);
+    }
+
+    #[test]
+    fn test_append_rows_empty_does_nothing() {
+        let mut model = create_test_model();
+        let original_len = model.rows.len();
+        let original_widths = model.col_widths.clone();
+
+        model.append_rows(vec![]);
+
+        assert_eq!(model.rows.len(), original_len);
+        assert_eq!(model.col_widths, original_widths);
+    }
+
+    #[test]
+    fn test_append_rows_preserves_headers_and_types() {
+        let mut model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        )
+        .with_col_types(vec!["int4".to_string(), "text".to_string()])
+        .with_source_table(Some("users".to_string()));
+
+        model.append_rows(vec![vec!["2".to_string(), "Bob".to_string()]]);
+
+        assert_eq!(model.headers, vec!["id", "name"]);
+        assert_eq!(model.col_types, vec!["int4", "text"]);
+        assert_eq!(model.source_table, Some("users".to_string()));
+    }
+
+    // =========================================================================
+    // Tests for clamp_to_bounds (cursor/selection validity)
+    // =========================================================================
+
+    #[test]
+    fn test_clamp_to_bounds_cursor_in_range() {
+        let model = create_test_model(); // 2 rows, 2 cols
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            row_offset: 0,
+            col_offset: 0,
+            ..Default::default()
+        };
+
+        state.clamp_to_bounds(&model);
+
+        // Should remain unchanged
+        assert_eq!(state.cursor_row, 1);
+        assert_eq!(state.cursor_col, 1);
+    }
+
+    #[test]
+    fn test_clamp_to_bounds_cursor_out_of_range() {
+        let model = create_test_model(); // 2 rows, 2 cols
+        let mut state = GridState {
+            cursor_row: 10, // out of range
+            cursor_col: 5,  // out of range
+            row_offset: 10,
+            col_offset: 5,
+            ..Default::default()
+        };
+
+        state.clamp_to_bounds(&model);
+
+        assert_eq!(state.cursor_row, 1); // clamped to max row (2-1)
+        assert_eq!(state.cursor_col, 1); // clamped to max col (2-1)
+        assert_eq!(state.row_offset, 1);
+        assert_eq!(state.col_offset, 1);
+    }
+
+    #[test]
+    fn test_clamp_to_bounds_clears_invalid_selections() {
+        let model = create_test_model(); // 2 rows
+        let mut state = GridState::default();
+        state.selected_rows.insert(0);
+        state.selected_rows.insert(1);
+        state.selected_rows.insert(5); // invalid
+        state.selected_rows.insert(10); // invalid
+
+        state.clamp_to_bounds(&model);
+
+        assert!(state.selected_rows.contains(&0));
+        assert!(state.selected_rows.contains(&1));
+        assert!(!state.selected_rows.contains(&5));
+        assert!(!state.selected_rows.contains(&10));
+        assert_eq!(state.selected_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_clamp_to_bounds_empty_model() {
+        let model = GridModel::empty();
+        let mut state = GridState {
+            cursor_row: 5,
+            cursor_col: 3,
+            row_offset: 2,
+            col_offset: 1,
+            ..Default::default()
+        };
+        state.selected_rows.insert(0);
+        state.selected_rows.insert(1);
+
+        state.clamp_to_bounds(&model);
+
+        assert_eq!(state.cursor_row, 0);
+        assert_eq!(state.cursor_col, 0);
+        assert_eq!(state.row_offset, 0);
+        assert_eq!(state.col_offset, 0);
+        assert!(state.selected_rows.is_empty());
+    }
+
+    #[test]
+    fn test_clamp_after_append_keeps_cursor_valid() {
+        // Simulates streaming: append rows, cursor stays valid
+        let mut model = create_test_model(); // 2 rows
+        let mut state = GridState {
+            cursor_row: 1, // at last row
+            cursor_col: 0,
+            ..Default::default()
+        };
+
+        // Append more rows
+        model.append_rows(vec![
+            vec!["3".to_string(), "Charlie".to_string()],
+            vec!["4".to_string(), "Diana".to_string()],
+        ]);
+
+        state.clamp_to_bounds(&model);
+
+        // Cursor should remain at row 1 (still valid)
+        assert_eq!(state.cursor_row, 1);
+        // Now we can navigate to the new rows
+        assert_eq!(model.rows.len(), 4);
     }
 }

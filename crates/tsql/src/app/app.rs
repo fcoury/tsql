@@ -19,15 +19,18 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Terminal;
+use rustls::{ClientConfig, RootCertStore};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tui_textarea::{CursorMove, Input};
+use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::config::{
     load_connections, save_connections, Action, Config, ConnectionEntry, ConnectionsFile,
-    KeyBinding, Keymap,
+    KeyBinding, Keymap, SslMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -46,6 +49,53 @@ use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
 use throbber_widgets_tui::{Throbber, ThrobberState, BRAILLE_SIX};
 use tui_syntax::Highlighter;
+
+fn make_rustls_connect() -> MakeRustlsConnect {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    MakeRustlsConnect::new(config)
+}
+
+fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
+    // Default: preserve existing behavior (no TLS unless explicitly requested).
+    let default = SslMode::Disable;
+
+    if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
+        let url = url::Url::parse(conn_str).map_err(|e| format!("Invalid URL: {e}"))?;
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("sslmode") {
+                return SslMode::parse(&v).ok_or_else(|| {
+                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require.")
+                });
+            }
+        }
+        return Ok(default);
+    }
+
+    for part in conn_str.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            if k.eq_ignore_ascii_case("sslmode") {
+                return SslMode::parse(v).ok_or_else(|| {
+                    format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require.")
+                });
+            }
+        }
+    }
+
+    Ok(default)
+}
+
+fn effective_max_rows(config_max_rows: usize) -> usize {
+    const DEFAULT_MAX_ROWS: usize = 2000;
+    if config_max_rows == 0 {
+        DEFAULT_MAX_ROWS
+    } else {
+        config_max_rows
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaTableContext {
@@ -336,6 +386,84 @@ pub struct QueryResult {
     pub col_types: Vec<String>,
 }
 
+/// State for a paged/streaming query using server-side cursors.
+#[derive(Debug, Clone)]
+pub struct PagedQueryState {
+    /// The original query being executed.
+    pub query: String,
+    /// Whether a cursor is currently open.
+    pub cursor_open: bool,
+    /// Whether we're currently fetching a page.
+    pub loading: bool,
+    /// Whether all rows have been fetched.
+    pub done: bool,
+    /// Number of rows fetched so far.
+    pub loaded_rows: usize,
+    /// Maximum rows to fetch (0 = unlimited, uses config default).
+    pub max_rows: usize,
+    /// Number of rows to fetch per page.
+    pub page_size: usize,
+    /// The source table name, if known.
+    pub source_table: Option<String>,
+    /// When the query started.
+    pub started: Instant,
+    /// Channel to request more rows from the background fetch task.
+    pub fetch_more_tx: Option<mpsc::UnboundedSender<()>>,
+}
+
+impl PagedQueryState {
+    pub fn new(
+        query: String,
+        max_rows: usize,
+        page_size: usize,
+        source_table: Option<String>,
+    ) -> Self {
+        Self {
+            query,
+            cursor_open: false,
+            loading: false,
+            done: false,
+            loaded_rows: 0,
+            max_rows,
+            page_size,
+            source_table,
+            started: Instant::now(),
+            fetch_more_tx: None,
+        }
+    }
+
+    /// Request more rows from the background fetch task.
+    pub fn request_more(&self) -> bool {
+        if let Some(ref tx) = self.fetch_more_tx {
+            tx.send(()).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+/// Default page size for cursor-based queries.
+const DEFAULT_PAGE_SIZE: usize = 500;
+
+/// Check if a query is suitable for cursor-based paging.
+///
+/// Returns true for simple SELECT queries without:
+/// - JOINs
+/// - Subqueries in FROM clause
+/// - Multiple statements
+///
+/// This allows us to use server-side cursors for efficient streaming.
+fn is_pageable_query(query: &str) -> bool {
+    // Reuse the logic from extract_table_from_query - if it can extract a table,
+    // the query is simple enough to page.
+    // Also check for multiple statements (semicolons not at the end).
+    let trimmed = query.trim().trim_end_matches(';');
+    if trimmed.contains(';') {
+        return false; // Multiple statements
+    }
+    extract_table_from_query(query).is_some()
+}
+
 /// Extract the table name from a simple SELECT query.
 /// Returns Some(table_name) for queries like:
 /// - SELECT * FROM users
@@ -392,7 +520,7 @@ fn extract_table_from_query(query: &str) -> Option<String> {
                     in_double = true;
                 }
                 ch if ch.is_whitespace() => flush(&mut buf, &mut tokens),
-                ';' | '(' | ')' | ',' => {
+                ';' | '(' | ')' | ',' | '*' => {
                     flush(&mut buf, &mut tokens);
                     tokens.push(ch.to_string());
                 }
@@ -494,6 +622,7 @@ pub enum DbEvent {
     Connected {
         client: SharedClient,
         cancel_token: CancelToken,
+        connected_with_tls: bool,
     },
     ConnectError {
         error: String,
@@ -522,6 +651,20 @@ pub enum DbEvent {
         success: bool,
         message: String,
     },
+    /// Additional rows have been fetched (for streaming/paged results).
+    RowsAppended {
+        /// The new rows to append.
+        rows: Vec<Vec<String>>,
+        /// Whether this is the final batch (no more rows available).
+        done: bool,
+        /// Whether fetching was truncated due to max_rows limit.
+        truncated: bool,
+    },
+    /// Metadata (primary keys, column types) loaded after initial results.
+    MetadataLoaded {
+        primary_keys: Vec<String>,
+        col_types: Vec<String>,
+    },
 }
 
 pub struct DbSession {
@@ -534,6 +677,8 @@ pub struct DbSession {
     pub running: bool,
     /// Whether we're currently in a transaction (after BEGIN, before COMMIT/ROLLBACK)
     pub in_transaction: bool,
+    /// Whether the current connection was established using TLS.
+    pub connected_with_tls: bool,
 }
 
 impl DbSession {
@@ -547,6 +692,7 @@ impl DbSession {
             last_elapsed: None,
             running: false,
             in_transaction: false,
+            connected_with_tls: false,
         }
     }
 }
@@ -770,6 +916,9 @@ pub struct App {
     pub db_events_rx: mpsc::UnboundedReceiver<DbEvent>,
     pub db: DbSession,
 
+    /// State for paged/streaming query using server-side cursor.
+    pub paged_query: Option<PagedQueryState>,
+
     pub grid: GridModel,
     pub grid_state: GridState,
 
@@ -950,6 +1099,7 @@ impl App {
             db_events_tx,
             db_events_rx,
             db: DbSession::new(),
+            paged_query: None,
 
             grid,
             grid_state: GridState::default(),
@@ -1837,9 +1987,11 @@ impl App {
                 self.key_sequence.mark_hint_shown();
             }
 
-            // Use faster polling when query is running to keep UI responsive
-            let poll_duration = if self.db.running {
-                Duration::from_millis(16) // ~60 FPS when query running
+            // Use faster polling when query is running or loading more rows
+            let is_loading =
+                self.db.running || self.paged_query.as_ref().is_some_and(|p| p.loading);
+            let poll_duration = if is_loading {
+                Duration::from_millis(16) // ~60 FPS when loading
             } else {
                 Duration::from_millis(100) // 10 FPS when idle (reduces CPU usage)
             };
@@ -2353,6 +2505,9 @@ impl App {
                         // Fall back to legacy key handling for unmapped keys
                         self.grid_state.handle_key(key, &self.grid)
                     };
+
+                    // Check if we should fetch more rows (Phase D: auto-fetch on navigation)
+                    self.maybe_fetch_more_rows();
 
                     match result {
                         GridKeyResult::OpenSearch => {
@@ -3253,7 +3408,7 @@ impl App {
         };
 
         let where_clause =
-            match self.build_update_where_clause(row, col, Some((&original_value).as_str())) {
+            match self.build_update_where_clause(row, col, Some(original_value.as_str())) {
                 Ok(w) => w,
                 Err(msg) => {
                     self.cell_editor.close();
@@ -4635,6 +4790,7 @@ impl App {
         self.db.client = None;
         self.db.running = false;
         self.query_ui.clear();
+        self.db.connected_with_tls = false;
 
         self.last_status = Some("Connecting...".to_string());
 
@@ -4642,29 +4798,123 @@ impl App {
         let rt = self.rt.clone();
 
         self.rt.spawn(async move {
-            match tokio_postgres::connect(&conn_str, NoTls).await {
-                Ok((client, connection)) => {
-                    // Drive the connection on the runtime and surface errors.
-                    let tx2 = tx.clone();
-                    rt.spawn(async move {
-                        if let Err(e) = connection.await {
-                            let _ = tx2.send(DbEvent::ConnectionLost {
+            let ssl_mode = match resolve_ssl_mode(&conn_str) {
+                Ok(m) => m,
+                Err(msg) => {
+                    let _ = tx.send(DbEvent::ConnectError { error: msg });
+                    return;
+                }
+            };
+
+            match ssl_mode {
+                SslMode::Disable => {
+                    match tokio_postgres::connect(&conn_str, NoTls).await {
+                        Ok((client, connection)) => {
+                            let tx2 = tx.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = connection.await {
+                                    let _ = tx2.send(DbEvent::ConnectionLost {
+                                        error: format_pg_error(&e),
+                                    });
+                                }
+                            });
+
+                            let token = client.cancel_token();
+                            let shared = Arc::new(Mutex::new(client));
+                            let _ = tx.send(DbEvent::Connected {
+                                client: shared,
+                                cancel_token: token,
+                                connected_with_tls: false,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
                             });
                         }
-                    });
-
-                    let token = client.cancel_token();
-                    let shared = Arc::new(Mutex::new(client));
-                    let _ = tx.send(DbEvent::Connected {
-                        client: shared,
-                        cancel_token: token,
-                    });
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(DbEvent::ConnectError {
-                        error: format_pg_error(&e),
-                    });
+                SslMode::Require => {
+                    let tls = make_rustls_connect();
+                    match tokio_postgres::connect(&conn_str, tls).await {
+                        Ok((client, connection)) => {
+                            let tx2 = tx.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = connection.await {
+                                    let _ = tx2.send(DbEvent::ConnectionLost {
+                                        error: format_pg_error(&e),
+                                    });
+                                }
+                            });
+
+                            let token = client.cancel_token();
+                            let shared = Arc::new(Mutex::new(client));
+                            let _ = tx.send(DbEvent::Connected {
+                                client: shared,
+                                cancel_token: token,
+                                connected_with_tls: true,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::ConnectError {
+                                error: format_pg_error(&e),
+                            });
+                        }
+                    }
+                }
+                SslMode::Prefer => {
+                    let tls = make_rustls_connect();
+                    match tokio_postgres::connect(&conn_str, tls).await {
+                        Ok((client, connection)) => {
+                            let tx2 = tx.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = connection.await {
+                                    let _ = tx2.send(DbEvent::ConnectionLost {
+                                        error: format_pg_error(&e),
+                                    });
+                                }
+                            });
+
+                            let token = client.cancel_token();
+                            let shared = Arc::new(Mutex::new(client));
+                            let _ = tx.send(DbEvent::Connected {
+                                client: shared,
+                                cancel_token: token,
+                                connected_with_tls: true,
+                            });
+                        }
+                        Err(e) => {
+                            let tls_error = format_pg_error(&e);
+                            match tokio_postgres::connect(&conn_str, NoTls).await {
+                                Ok((client, connection)) => {
+                                    let tx2 = tx.clone();
+                                    rt.spawn(async move {
+                                        if let Err(e) = connection.await {
+                                            let _ = tx2.send(DbEvent::ConnectionLost {
+                                                error: format_pg_error(&e),
+                                            });
+                                        }
+                                    });
+
+                                    let token = client.cancel_token();
+                                    let shared = Arc::new(Mutex::new(client));
+                                    let _ = tx.send(DbEvent::Connected {
+                                        client: shared,
+                                        cancel_token: token,
+                                        connected_with_tls: false,
+                                    });
+                                }
+                                Err(e) => {
+                                    let plain_error = format_pg_error(&e);
+                                    let _ = tx.send(DbEvent::ConnectError {
+                                        error: format!(
+                                            "{tls_error}\n\nTLS failed (sslmode=prefer), then plain connect failed:\n{plain_error}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -5151,19 +5401,64 @@ impl App {
 
                 let tx = self.db_events_tx.clone();
                 self.rt.spawn(async move {
-                    match tokio_postgres::connect(&url, NoTls).await {
-                        Ok((client, _)) => {
-                            drop(client);
-                            let _ = tx.send(DbEvent::TestConnectionResult {
-                                success: true,
-                                message: "Connection successful!".to_string(),
-                            });
-                        }
-                        Err(e) => {
+                    let ssl_mode = match resolve_ssl_mode(&url) {
+                        Ok(m) => m,
+                        Err(msg) => {
                             let _ = tx.send(DbEvent::TestConnectionResult {
                                 success: false,
-                                message: format!("Connection failed: {}", format_pg_error(&e)),
+                                message: format!("Connection failed: {msg}"),
                             });
+                            return;
+                        }
+                    };
+
+                    let send_ok = |tx: &mpsc::UnboundedSender<DbEvent>| {
+                        let _ = tx.send(DbEvent::TestConnectionResult {
+                            success: true,
+                            message: "Connection successful!".to_string(),
+                        });
+                    };
+                    let send_err = |tx: &mpsc::UnboundedSender<DbEvent>,
+                                    e: tokio_postgres::Error| {
+                        let _ = tx.send(DbEvent::TestConnectionResult {
+                            success: false,
+                            message: format!("Connection failed: {}", format_pg_error(&e)),
+                        });
+                    };
+
+                    match ssl_mode {
+                        SslMode::Disable => match tokio_postgres::connect(&url, NoTls).await {
+                            Ok((client, _)) => {
+                                drop(client);
+                                send_ok(&tx);
+                            }
+                            Err(e) => send_err(&tx, e),
+                        },
+                        SslMode::Require => {
+                            let tls = make_rustls_connect();
+                            match tokio_postgres::connect(&url, tls).await {
+                                Ok((client, _)) => {
+                                    drop(client);
+                                    send_ok(&tx);
+                                }
+                                Err(e) => send_err(&tx, e),
+                            }
+                        }
+                        SslMode::Prefer => {
+                            let tls = make_rustls_connect();
+                            match tokio_postgres::connect(&url, tls).await {
+                                Ok((client, _)) => {
+                                    drop(client);
+                                    send_ok(&tx);
+                                }
+                                Err(_) => match tokio_postgres::connect(&url, NoTls).await {
+                                    Ok((client, _)) => {
+                                        drop(client);
+                                        send_ok(&tx);
+                                    }
+                                    Err(e) => send_err(&tx, e),
+                                },
+                            }
                         }
                     }
                 });
@@ -5338,12 +5633,251 @@ impl App {
         self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
-        let started = Instant::now();
         let source_table = extract_table_from_query(&query);
+        let max_rows = effective_max_rows(self.config.connection.max_rows);
+        let page_size = DEFAULT_PAGE_SIZE;
+
+        // Use cursor-based paging for simple SELECT queries
+        if is_pageable_query(&query) {
+            // Create channel for fetch-more requests
+            let (fetch_more_tx, fetch_more_rx) = mpsc::unbounded_channel();
+
+            let mut paged_state =
+                PagedQueryState::new(query.clone(), max_rows, page_size, source_table.clone());
+            paged_state.fetch_more_tx = Some(fetch_more_tx);
+            self.paged_query = Some(paged_state);
+
+            self.execute_query_paged(
+                client,
+                query,
+                max_rows,
+                page_size,
+                source_table,
+                tx,
+                fetch_more_rx,
+            );
+        } else {
+            self.paged_query = None;
+            self.execute_query_simple(client, query, max_rows, source_table, tx);
+        }
+    }
+
+    /// Execute a query using cursor-based paging for streaming results.
+    /// Fetches the first page immediately, then waits for signals on `fetch_more_rx`
+    /// to fetch additional pages on demand.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_query_paged(
+        &self,
+        client: SharedClient,
+        query: String,
+        _max_rows: usize, // No longer used - fetch on demand instead
+        page_size: usize,
+        source_table: Option<String>,
+        tx: mpsc::UnboundedSender<DbEvent>,
+        mut fetch_more_rx: mpsc::UnboundedReceiver<()>,
+    ) {
+        let started = Instant::now();
 
         self.rt.spawn(async move {
-            const MAX_ROWS: usize = 2000;
+            let guard = client.lock().await;
 
+            // Start transaction and declare cursor
+            let begin_result = guard.simple_query("BEGIN").await;
+            if let Err(e) = begin_result {
+                let _ = tx.send(DbEvent::QueryError {
+                    error: format!("Failed to begin transaction: {}", format_pg_error(&e)),
+                });
+                return;
+            }
+
+            let cursor_query = format!(
+                "DECLARE tsql_cursor NO SCROLL CURSOR FOR {}",
+                query.trim().trim_end_matches(';')
+            );
+            let declare_result = guard.simple_query(&cursor_query).await;
+            if let Err(e) = declare_result {
+                // Rollback and report error
+                let _ = guard.simple_query("ROLLBACK").await;
+                let _ = tx.send(DbEvent::QueryError {
+                    error: format!("Failed to declare cursor: {}", format_pg_error(&e)),
+                });
+                return;
+            }
+
+            // Fetch first page to get headers and initial rows
+            let fetch_query = format!("FETCH FORWARD {} FROM tsql_cursor", page_size);
+            let mut headers: Vec<String> = Vec::new();
+            let mut first_page_rows: Vec<Vec<String>> = Vec::new();
+            let mut total_fetched: usize = 0;
+            let mut done = false;
+
+            // First fetch
+            match guard.simple_query(&fetch_query).await {
+                Ok(messages) => {
+                    for msg in messages {
+                        match msg {
+                            SimpleQueryMessage::Row(row) => {
+                                if headers.is_empty() {
+                                    headers = row
+                                        .columns()
+                                        .iter()
+                                        .map(|c| c.name().to_string())
+                                        .collect();
+                                }
+                                let mut out_row = Vec::with_capacity(row.len());
+                                for i in 0..row.len() {
+                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                }
+                                first_page_rows.push(out_row);
+                                total_fetched += 1;
+                            }
+                            SimpleQueryMessage::CommandComplete(_) => {}
+                            _ => {}
+                        }
+                    }
+
+                    // If we got fewer rows than page_size, we're done
+                    if first_page_rows.is_empty() || first_page_rows.len() < page_size {
+                        done = true;
+                    }
+                }
+                Err(e) => {
+                    let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
+                    });
+                    return;
+                }
+            }
+
+            // Release lock so we can fetch metadata in background
+            drop(guard);
+
+            let elapsed = started.elapsed();
+            let headers_for_metadata = headers.clone();
+
+            // Send initial result with first page IMMEDIATELY (no metadata yet)
+            // This gives instant feedback to the user
+            let result = QueryResult {
+                headers: if first_page_rows.is_empty() && headers.is_empty() {
+                    vec!["status".to_string()]
+                } else {
+                    headers
+                },
+                rows: if first_page_rows.is_empty() {
+                    vec![vec!["OK".to_string()]]
+                } else {
+                    first_page_rows
+                },
+                command_tag: Some(format!("{} rows", total_fetched)),
+                truncated: false, // Not truncated - more rows available on demand
+                elapsed,
+                source_table: source_table.clone(),
+                primary_keys: Vec::new(), // Will be loaded asynchronously
+                col_types: vec![String::new(); headers_for_metadata.len()], // Will be loaded asynchronously
+            };
+            let _ = tx.send(DbEvent::QueryFinished { result });
+
+            // Spawn metadata fetch in background (happens while user sees results)
+            if source_table.is_some() {
+                let client_for_meta = client.clone();
+                let source_table_for_meta = source_table.clone();
+                let tx_for_meta = tx.clone();
+                let headers_for_meta = headers_for_metadata;
+                tokio::spawn(async move {
+                    if let Some(ref table) = source_table_for_meta {
+                        let (type_map, primary_keys) = tokio::join!(
+                            fetch_column_types(&client_for_meta, table),
+                            fetch_primary_keys(&client_for_meta, table)
+                        );
+                        let col_types: Vec<String> = headers_for_meta
+                            .iter()
+                            .map(|h| type_map.get(h).cloned().unwrap_or_default())
+                            .collect();
+                        let _ = tx_for_meta.send(DbEvent::MetadataLoaded {
+                            primary_keys,
+                            col_types,
+                        });
+                    }
+                });
+            }
+
+            // If done with first page (got all rows), close cursor and commit
+            if done {
+                let guard = client.lock().await;
+                let _ = guard.simple_query("CLOSE tsql_cursor; COMMIT").await;
+                // Send final completion signal so paged_query state is cleared
+                let _ = tx.send(DbEvent::RowsAppended {
+                    rows: vec![],
+                    done: true,
+                    truncated: false,
+                });
+                return;
+            }
+
+            // Wait for fetch-more signals and fetch additional pages on demand
+            while let Some(()) = fetch_more_rx.recv().await {
+                // Drain any additional pending requests (user may have scrolled multiple times)
+                while fetch_more_rx.try_recv().is_ok() {}
+
+                let guard = client.lock().await;
+                match guard.simple_query(&fetch_query).await {
+                    Ok(messages) => {
+                        let mut page_rows: Vec<Vec<String>> = Vec::new();
+                        for msg in messages {
+                            if let SimpleQueryMessage::Row(row) = msg {
+                                let mut out_row = Vec::with_capacity(row.len());
+                                for i in 0..row.len() {
+                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                }
+                                page_rows.push(out_row);
+                                total_fetched += 1;
+                            }
+                        }
+
+                        let page_done = page_rows.is_empty() || page_rows.len() < page_size;
+
+                        // Send appended rows
+                        let _ = tx.send(DbEvent::RowsAppended {
+                            rows: page_rows,
+                            done: page_done,
+                            truncated: false,
+                        });
+
+                        if page_done {
+                            let _ = guard.simple_query("CLOSE tsql_cursor; COMMIT").await;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            // If we exit because the channel was closed (e.g., new query started),
+            // clean up the cursor
+            let guard = client.lock().await;
+            let _ = guard.simple_query("CLOSE tsql_cursor; ROLLBACK").await;
+        });
+    }
+
+    /// Execute a query using simple_query (for non-pageable queries).
+    fn execute_query_simple(
+        &self,
+        client: SharedClient,
+        query: String,
+        max_rows: usize,
+        source_table: Option<String>,
+        tx: mpsc::UnboundedSender<DbEvent>,
+    ) {
+        let started = Instant::now();
+
+        self.rt.spawn(async move {
             let guard = client.lock().await;
             match guard.simple_query(&query).await {
                 Ok(messages) => {
@@ -5369,7 +5903,7 @@ impl App {
                                     );
                                 }
 
-                                if current_rows.len() < MAX_ROWS {
+                                if current_rows.len() < max_rows {
                                     let mut out_row = Vec::with_capacity(row.len());
                                     for i in 0..row.len() {
                                         out_row.push(row.get(i).unwrap_or("NULL").to_string());
@@ -5450,6 +5984,40 @@ impl App {
         });
     }
 
+    /// Check if we should fetch more rows for a paged query.
+    /// Called after grid navigation to implement auto-fetch on scroll.
+    fn maybe_fetch_more_rows(&mut self) {
+        // Only trigger if we have an active paged query
+        let Some(ref paged) = self.paged_query else {
+            return;
+        };
+
+        // Don't fetch if already done or loading
+        if paged.done || paged.loading {
+            return;
+        }
+
+        // Check if cursor is near the end of loaded rows
+        let row_count = self.grid.rows.len();
+        if row_count == 0 {
+            return;
+        }
+
+        let cursor_row = self.grid_state.cursor_row;
+        let threshold = paged.page_size / 2; // Fetch when within half a page of the end
+
+        if cursor_row + threshold >= row_count {
+            // Request more rows
+            if paged.request_more() {
+                // Update loading state
+                if let Some(ref mut paged) = self.paged_query {
+                    paged.loading = true;
+                }
+                self.last_status = Some(format!("Loading more... ({} rows)", row_count));
+            }
+        }
+    }
+
     fn cancel_query(&mut self) {
         if !self.db.running {
             return;
@@ -5463,10 +6031,16 @@ impl App {
         self.last_status = Some("Cancelling...".to_string());
 
         let tx = self.db_events_tx.clone();
+        let connected_with_tls = self.db.connected_with_tls;
 
         self.rt.spawn(async move {
             // Attempt to cancel. We ignore errors since cancellation is best-effort.
-            let _ = token.cancel_query(NoTls).await;
+            if connected_with_tls {
+                let tls = make_rustls_connect();
+                let _ = token.cancel_query(tls).await;
+            } else {
+                let _ = token.cancel_query(NoTls).await;
+            }
             // The query task will return an error which we handle normally.
             // We also send a cancelled event in case the query finished before the cancel arrived.
             let _ = tx.send(DbEvent::QueryCancelled);
@@ -5484,11 +6058,13 @@ impl App {
             DbEvent::Connected {
                 client,
                 cancel_token,
+                connected_with_tls,
             } => {
                 self.db.status = DbStatus::Connected;
                 self.db.client = Some(client);
                 self.db.cancel_token = Some(cancel_token);
                 self.db.running = false;
+                self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
                 // Load schema for completion
@@ -5513,22 +6089,27 @@ impl App {
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
             DbEvent::QueryFinished { result } => {
+                // Always clear running state after first page loads - the "Executing..."
+                // dialog should only show during initial query, not while waiting for
+                // on-demand scroll fetches. Subsequent page fetches show status line only.
+                let is_paged = self.paged_query.is_some();
                 self.db.running = false;
                 self.query_ui.clear();
-                self.db.last_command_tag = result.command_tag.clone();
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
 
-                // Track transaction state based on command tag
-                if let Some(ref tag) = result.command_tag {
-                    let tag_upper = tag.to_uppercase();
-                    if tag_upper.starts_with("BEGIN") {
-                        self.db.in_transaction = true;
-                    } else if tag_upper.starts_with("COMMIT")
-                        || tag_upper.starts_with("ROLLBACK")
-                        || tag_upper.starts_with("END")
-                    {
-                        self.db.in_transaction = false;
+                // Track transaction state based on command tag (skip for paged queries)
+                if !is_paged {
+                    if let Some(ref tag) = result.command_tag {
+                        let tag_upper = tag.to_uppercase();
+                        if tag_upper.starts_with("BEGIN") {
+                            self.db.in_transaction = true;
+                        } else if tag_upper.starts_with("COMMIT")
+                            || tag_upper.starts_with("ROLLBACK")
+                            || tag_upper.starts_with("END")
+                        {
+                            self.db.in_transaction = false;
+                        }
                     }
                 }
 
@@ -5538,14 +6119,28 @@ impl App {
                     .with_col_types(result.col_types);
                 self.grid_state = GridState::default();
 
+                // Update command_tag to reflect actual row count
+                self.db.last_command_tag = Some(format!("{} rows", self.grid.rows.len()));
+
+                // Update paged query state with initial load
+                if let Some(ref mut paged) = self.paged_query {
+                    paged.cursor_open = true;
+                    paged.loaded_rows = self.grid.rows.len();
+                    paged.loading = false;
+                }
+
                 // Move focus to grid to show results
                 self.focus = Focus::Grid;
 
                 // Mark the query as "saved" since it was successfully executed
                 self.editor.mark_saved();
 
-                // Set status - timing info is already shown in the status bar via timing_info segment
-                if result.truncated {
+                // Set status
+                if is_paged {
+                    // More rows available on demand
+                    self.last_status =
+                        Some(format!("{} rows (scroll for more)", self.grid.rows.len()));
+                } else if result.truncated {
                     self.last_status = Some("[truncated]".to_string());
                 } else {
                     self.last_status = Some("Ready".to_string());
@@ -5554,10 +6149,12 @@ impl App {
             DbEvent::QueryError { error } => {
                 self.db.running = false;
                 self.query_ui.clear();
+                self.paged_query = None; // Clear paged query state on error
                 self.last_status = Some("Query error (see above)".to_string());
                 self.last_error = Some(error);
             }
             DbEvent::QueryCancelled => {
+                self.paged_query = None; // Clear paged query state on cancel
                 self.db.running = false;
                 self.query_ui.clear();
                 self.last_status = Some("Query cancelled".to_string());
@@ -5590,6 +6187,54 @@ impl App {
                 } else {
                     self.last_error = Some(message);
                 }
+            }
+            DbEvent::RowsAppended {
+                rows,
+                done,
+                truncated,
+            } => {
+                // Append rows to the grid (streaming/paged results)
+                let new_rows_count = rows.len();
+                if !rows.is_empty() {
+                    self.grid.append_rows(rows);
+                    // Clamp state for safety (though append should keep cursor valid)
+                    self.grid_state.clamp_to_bounds(&self.grid);
+                }
+
+                // Update command_tag to reflect current total
+                self.db.last_command_tag = Some(format!("{} rows", self.grid.rows.len()));
+
+                // Update paged query state
+                if let Some(ref mut paged) = self.paged_query {
+                    paged.loading = false;
+                    paged.loaded_rows = self.grid.rows.len();
+                    paged.done = done;
+                }
+
+                if done {
+                    self.db.running = false;
+                    self.query_ui.clear();
+                    self.paged_query = None; // Clear paged query state when all rows fetched
+                    if truncated {
+                        self.last_status = Some("[truncated]".to_string());
+                    } else {
+                        self.last_status = Some("Ready".to_string());
+                    }
+                } else {
+                    // More rows available on demand
+                    if new_rows_count > 0 {
+                        self.last_status =
+                            Some(format!("{} rows (scroll for more)", self.grid.rows.len()));
+                    }
+                }
+            }
+            DbEvent::MetadataLoaded {
+                primary_keys,
+                col_types,
+            } => {
+                // Update grid with loaded metadata (for editing support)
+                self.grid.primary_keys = primary_keys;
+                self.grid.col_types = col_types;
             }
         }
     }
@@ -5656,9 +6301,12 @@ impl App {
             None
         };
 
-        // Running indicator
+        // Running/loading indicator
+        let paged_loading = self.paged_query.as_ref().is_some_and(|p| p.loading);
         let running_indicator = if self.db.running {
             Some("⏳ running")
+        } else if paged_loading {
+            Some("⏳ loading")
         } else {
             None
         };
@@ -5783,6 +6431,7 @@ fn is_double_click(prev: Option<GridCellClick>, row: usize, col: usize, now: Ins
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grid_mouse_target(
     x: u16,
     y: u16,
@@ -6054,6 +6703,13 @@ mod tests {
             2,
             now
         ));
+    }
+
+    #[test]
+    fn test_effective_max_rows_defaults_and_overrides() {
+        assert_eq!(effective_max_rows(0), 2000);
+        assert_eq!(effective_max_rows(1), 1);
+        assert_eq!(effective_max_rows(10_000), 10_000);
     }
 
     // ========== CellEditor Tests ==========
@@ -6850,9 +7506,10 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_string(&mut app, "postgres");
 
-        // Tab to Password, then SavePassword, then Host
+        // Tab to Password, then SavePassword, then SSL mode, then Host
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Password
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SavePassword
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SslMode
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host (already localhost)
 
         // Tab to Port (already 5432), then Database
@@ -8062,5 +8719,71 @@ mod tests {
             Focus::Grid,
             "Ctrl+J from Grid should be no-op (at boundary)"
         );
+    }
+
+    // =========================================================================
+    // Tests for is_pageable_query (Phase C: cursor-based paging)
+    // =========================================================================
+
+    #[test]
+    fn test_is_pageable_query_simple_select() {
+        assert!(is_pageable_query("SELECT * FROM users"));
+        assert!(is_pageable_query("select * from users"));
+        assert!(is_pageable_query("SELECT id, name FROM users"));
+        assert!(is_pageable_query("SELECT * FROM users;"));
+        assert!(is_pageable_query("  SELECT * FROM users  "));
+    }
+
+    #[test]
+    fn test_is_pageable_query_with_schema() {
+        assert!(is_pageable_query("SELECT * FROM public.users"));
+        assert!(is_pageable_query("SELECT * FROM \"my schema\".users"));
+    }
+
+    #[test]
+    fn test_is_pageable_query_with_where() {
+        assert!(is_pageable_query("SELECT * FROM users WHERE id > 10"));
+        assert!(is_pageable_query("SELECT * FROM users WHERE name = 'test'"));
+    }
+
+    #[test]
+    fn test_is_pageable_query_rejects_joins() {
+        assert!(!is_pageable_query(
+            "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
+        ));
+        assert!(!is_pageable_query(
+            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id"
+        ));
+    }
+
+    #[test]
+    fn test_is_pageable_query_rejects_subqueries() {
+        assert!(!is_pageable_query(
+            "SELECT * FROM (SELECT * FROM users) AS sub"
+        ));
+    }
+
+    #[test]
+    fn test_is_pageable_query_rejects_non_select() {
+        assert!(!is_pageable_query(
+            "INSERT INTO users (name) VALUES ('test')"
+        ));
+        assert!(!is_pageable_query("UPDATE users SET name = 'test'"));
+        assert!(!is_pageable_query("DELETE FROM users"));
+        assert!(!is_pageable_query("CREATE TABLE test (id INT)"));
+    }
+
+    #[test]
+    fn test_is_pageable_query_rejects_multiple_statements() {
+        assert!(!is_pageable_query(
+            "SELECT * FROM users; SELECT * FROM orders"
+        ));
+        assert!(!is_pageable_query("BEGIN; SELECT * FROM users; COMMIT"));
+    }
+
+    #[test]
+    fn test_is_pageable_query_empty() {
+        assert!(!is_pageable_query(""));
+        assert!(!is_pageable_query("   "));
     }
 }
