@@ -4,12 +4,21 @@
 
 ### Big tasks
 
+Find an alternative way to fix this:
+
+```
+┌Error (Enter to dismiss)──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Cannot edit: no primary key detected. Run a simple SELECT from a table with a PK.                                                                     │
+│                                                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Minor tasks / fixes
 
-- The dw should only delete the next word (or from where we are to the end of the current word) but it's deleting the whole line. Deleting the whole line should be dd.
-- Add mouse support to the help popup and all the pickers
-
 ## Done
+
+- Add mouse support to the help popup and all the pickers
+- The dw should only delete the next word (or from where we are to the end of the current word) but it's deleting the whole line. Deleting the whole line should be dd.
 
 - The uuid fields look great but they should take less space when condensed by default (8 chars + the unicode ... instead of the literal one).
 

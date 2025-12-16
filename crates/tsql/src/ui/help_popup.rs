@@ -201,7 +201,7 @@ const GRID_COLUMNS: HelpSection = HelpSection::new(
     &[
         KeyBinding::new("+ / >", "Widen column"),
         KeyBinding::new("- / <", "Narrow column"),
-        KeyBinding::new("=", "Auto-fit column width"),
+        KeyBinding::new("=", "Toggle fit/collapse column"),
     ],
 );
 
