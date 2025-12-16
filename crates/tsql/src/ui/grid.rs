@@ -15,6 +15,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::Action;
 use crate::util::{is_uuid, looks_like_json};
 
+/// Minimum column width for display.
+const MIN_COLUMN_WIDTH: u16 = 3;
+/// Maximum column width before truncation.
+const MAX_COLUMN_WIDTH: u16 = 40;
+/// Display width for UUIDs (8 hex chars + ellipsis).
+const UUID_DISPLAY_WIDTH: u16 = 9;
+
 /// Action for column resize operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeAction {
@@ -813,22 +820,19 @@ impl GridModel {
     /// This method is used for streaming/paged query results where rows arrive
     /// incrementally. The headers and column types remain unchanged.
     pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
-        const MIN_W: u16 = 3;
-        const MAX_W: u16 = 40;
-
         // Update column widths for any cells that are wider than current widths
         for row in &new_rows {
             for (i, cell) in row.iter().enumerate() {
                 if i >= self.col_widths.len() {
                     break;
                 }
-                // For UUIDs, use the truncated display width (8 hex chars + ellipsis = 9)
+                // For UUIDs, use the truncated display width
                 let effective_width = if is_uuid(cell) {
-                    9
+                    UUID_DISPLAY_WIDTH
                 } else {
                     UnicodeWidthStr::width(cell.as_str()) as u16
                 };
-                let w = effective_width.clamp(MIN_W, MAX_W);
+                let w = effective_width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
                 if w > self.col_widths[i] {
                     self.col_widths[i] = w;
                 }
@@ -1690,13 +1694,9 @@ fn render_row_cells_with_search(
 }
 
 fn compute_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<u16> {
-    // Keep columns readable but rely on horizontal scroll for the rest.
-    let min_w: u16 = 3;
-    let max_w: u16 = 40;
-
     let mut widths: Vec<u16> = headers
         .iter()
-        .map(|h| clamp_u16(display_width(h) as u16, min_w, max_w))
+        .map(|h| clamp_u16(display_width(h) as u16, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH))
         .collect();
 
     for row in rows {
@@ -1704,14 +1704,13 @@ fn compute_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<u16> {
             if i >= widths.len() {
                 break;
             }
-            // For UUIDs, use the truncated display width (8 hex chars + ellipsis = 9)
-            // since UUIDs are displayed truncated by default
+            // For UUIDs, use the truncated display width since UUIDs are displayed truncated
             let effective_width = if is_uuid(cell) {
-                9 // 8 hex chars + "…" (unicode ellipsis)
+                UUID_DISPLAY_WIDTH
             } else {
                 display_width(cell) as u16
             };
-            let w = clamp_u16(effective_width, min_w, max_w);
+            let w = clamp_u16(effective_width, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
             widths[i] = widths[i].max(w);
         }
     }
