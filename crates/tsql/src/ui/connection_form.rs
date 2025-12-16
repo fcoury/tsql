@@ -589,6 +589,11 @@ impl ConnectionFormModal {
             }
         };
 
+        // Auto-detect if no password is required:
+        // If password is empty and user didn't choose to save to keychain,
+        // assume the connection doesn't require a password
+        let no_password_required = self.password.is_empty() && !self.save_password;
+
         let entry = ConnectionEntry {
             name: self.name.clone(),
             host: self.host.clone(),
@@ -597,6 +602,7 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: self.save_password && !self.password.is_empty(),
             password_env: None,
+            no_password_required,
             color: self.color,
             favorite: None, // Preserve from original if editing
             ssl_mode: None,
@@ -645,6 +651,7 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: false,
             password_env: None,
+            no_password_required: false,
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: None,

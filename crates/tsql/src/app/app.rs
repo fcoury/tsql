@@ -38,9 +38,9 @@ use crate::ui::{
     ConnectionManagerAction, ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker,
     GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
     JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
-    KeySequenceHandlerWithContext, KeySequenceResult, PendingKey, PickerAction, Priority,
-    QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
-    SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
+    KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
+    PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
+    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -708,6 +708,8 @@ pub struct App {
     pub connection_manager: Option<ConnectionManagerModal>,
     /// Connection form modal (when open, for add/edit).
     pub connection_form: Option<ConnectionFormModal>,
+    /// Password prompt modal (when connecting to entry that needs password).
+    pub password_prompt: Option<PasswordPrompt>,
 
     /// Sidebar component state.
     pub sidebar: Sidebar,
@@ -858,6 +860,7 @@ impl App {
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
+            password_prompt: None,
 
             sidebar: Sidebar::new(),
             sidebar_visible: false,
@@ -1668,6 +1671,11 @@ impl App {
                     }
                 }
 
+                // Render password prompt if active
+                if let Some(ref prompt) = self.password_prompt {
+                    prompt.render(frame, size);
+                }
+
                 // Render confirmation prompt if active (topmost layer)
                 if let Some(ref mut prompt) = self.confirm_prompt {
                     prompt.render(frame, size);
@@ -1731,6 +1739,26 @@ impl App {
                 ConfirmResult::Pending => {
                     // Put it back, wait for valid input
                     self.confirm_prompt = Some(prompt);
+                    return false;
+                }
+            }
+        }
+
+        // Handle password prompt when active
+        if let Some(mut prompt) = self.password_prompt.take() {
+            match prompt.handle_key(key) {
+                PasswordPromptResult::Submitted(password) => {
+                    let entry = prompt.entry().clone();
+                    self.connect_to_entry_with_password(entry, password);
+                    return false;
+                }
+                PasswordPromptResult::Cancelled => {
+                    self.last_status = Some("Connection cancelled".to_string());
+                    return false;
+                }
+                PasswordPromptResult::Pending => {
+                    // Put it back, wait for more input
+                    self.password_prompt = Some(prompt);
                     return false;
                 }
             }
@@ -4346,7 +4374,7 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
-        // Try to get the password
+        // Try to get the password from keychain or env var
         let password = match entry.get_password() {
             Ok(Some(pwd)) => Some(pwd),
             Ok(None) => None,
@@ -4356,8 +4384,24 @@ impl App {
             }
         };
 
-        // Build the connection URL
-        let url = entry.to_url(password.as_deref());
+        // Determine if we need to prompt for password:
+        // - If we have a password from keychain/env, use it
+        // - If no_password_required is true, connect without password
+        // - Otherwise, prompt for password
+        if password.is_some() || entry.no_password_required {
+            // We have a password or don't need one - connect directly
+            let url = entry.to_url(password.as_deref());
+            self.current_connection_name = Some(entry.name.clone());
+            self.start_connect(url);
+        } else {
+            // Need to prompt for password
+            self.password_prompt = Some(PasswordPrompt::new(entry));
+        }
+    }
+
+    /// Connect to an entry with the provided password (called after password prompt).
+    fn connect_to_entry_with_password(&mut self, entry: ConnectionEntry, password: String) {
+        let url = entry.to_url(Some(&password));
         self.current_connection_name = Some(entry.name.clone());
         self.start_connect(url);
     }
@@ -6432,13 +6476,14 @@ mod tests {
         app.connection_manager = None;
         app.last_error = None;
 
-        // Add a test connection
+        // Add a test connection (no password required for this test)
         let entry = ConnectionEntry {
             name: "testconn".to_string(),
             host: "localhost".to_string(),
             port: 5432,
             database: "testdb".to_string(),
             user: "postgres".to_string(),
+            no_password_required: true, // No password for test connection
             ..Default::default()
         };
         app.connections = ConnectionsFile::new();
@@ -6496,13 +6541,14 @@ mod tests {
         app.connection_picker = None;
         app.connection_manager = None;
 
-        // Add a test connection
+        // Add a test connection (no password required for this test)
         let entry = ConnectionEntry {
             name: "testconn".to_string(),
             host: "localhost".to_string(),
             port: 5432,
             database: "testdb".to_string(),
             user: "postgres".to_string(),
+            no_password_required: true, // No password for test connection
             ..Default::default()
         };
         app.connections = ConnectionsFile::new();

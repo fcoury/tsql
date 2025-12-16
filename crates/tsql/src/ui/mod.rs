@@ -12,6 +12,7 @@ mod key_hint_popup;
 mod key_sequence;
 mod mouse_util;
 pub use mouse_util::{is_inside, MOUSE_SCROLL_LINES};
+mod password_prompt;
 mod row_detail;
 pub mod sidebar;
 mod status_line;
@@ -37,6 +38,7 @@ pub use key_sequence::{
     KeySequenceAction, KeySequenceCompletion, KeySequenceHandler, KeySequenceHandlerWithContext,
     KeySequenceResult, PendingKey,
 };
+pub use password_prompt::{PasswordPrompt, PasswordPromptResult};
 pub use row_detail::{RowDetailAction, RowDetailModal};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};

@@ -111,6 +111,9 @@ pub struct ConnectionEntry {
     /// Environment variable name containing password (fallback)
     #[serde(default)]
     pub password_env: Option<String>,
+    /// Whether this connection requires no password (auto-detected when saved with empty password)
+    #[serde(default)]
+    pub no_password_required: bool,
     /// Visual color indicator
     #[serde(default)]
     pub color: ConnectionColor,
@@ -136,6 +139,7 @@ impl Default for ConnectionEntry {
             user: String::new(),
             password_in_keychain: false,
             password_env: None,
+            no_password_required: false,
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: None,
@@ -220,6 +224,9 @@ impl ConnectionEntry {
                 .unwrap_or_else(|_| p.to_string())
         });
 
+        // If password is in URL, we have a password; if not, assume no password required
+        let no_password_required = password.is_none();
+
         let entry = ConnectionEntry {
             name: name.to_string(),
             host,
@@ -228,6 +235,7 @@ impl ConnectionEntry {
             user,
             password_in_keychain: false,
             password_env: None,
+            no_password_required,
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: None,
@@ -1001,5 +1009,269 @@ password_in_keychain = true
             entry_default_port.short_display(),
             "admin@db.example.com/mydb"
         );
+    }
+
+    // ========== Issue #16 Reproduction Tests ==========
+    // https://github.com/fcoury/tsql/issues/16
+    // "Password missing even though the test connection worked"
+
+    /// This test reproduces issue #16: when a user creates a new connection,
+    /// enters a password, tests it successfully, saves WITHOUT checking
+    /// "Save to keychain", and then tries to connect - the password is missing.
+    ///
+    /// The bug: password is only saved to keychain if save_password=true.
+    /// If user doesn't check the checkbox, password is lost after save.
+    #[test]
+    fn test_issue_16_password_missing_after_save_without_keychain() {
+        use tempfile::TempDir;
+
+        // Create a temp directory for the test
+        let temp_dir = TempDir::new().unwrap();
+        let connections_file = temp_dir.path().join("connections.toml");
+
+        // Step 1: User creates a new connection with password
+        let entry = ConnectionEntry {
+            name: "test-pg".to_string(),
+            host: "localhost".to_string(),
+            port: 5433,
+            database: "testdb".to_string(),
+            user: "testuser".to_string(),
+            // User did NOT check "Save to keychain"
+            password_in_keychain: false,
+            ..Default::default()
+        };
+
+        // The password that user entered (this works during test connection)
+        let password = "testpass123";
+
+        // Step 2: User tests the connection - this works because password is in memory
+        // (Simulated - in real app, entry.to_url(Some(password)) is used)
+        let test_url = entry.to_url(Some(password));
+        assert!(
+            test_url.contains("testpass123"),
+            "Test URL should contain password"
+        );
+
+        // Step 3: User saves the connection
+        let mut connections = ConnectionsFile::new();
+        connections.add(entry.clone()).unwrap();
+
+        // Save to file
+        let content = toml::to_string_pretty(&connections).unwrap();
+        std::fs::write(&connections_file, &content).unwrap();
+
+        // Note: In the real app, if save_password=false, the password is NOT
+        // saved to keychain here. The password is simply discarded.
+
+        // Step 4: User closes form, connection is saved
+        // Step 5: User tries to connect to the saved connection
+
+        // Load connections from file (simulating app restart or re-reading)
+        let loaded_content = std::fs::read_to_string(&connections_file).unwrap();
+        let loaded_connections: ConnectionsFile = toml::from_str(&loaded_content).unwrap();
+
+        let loaded_entry = loaded_connections.find_by_name("test-pg").unwrap();
+
+        // Step 6: Try to get password for connection
+        // BUG: This returns None because password was never saved!
+        let retrieved_password = loaded_entry.get_password().unwrap();
+
+        // This assertion demonstrates the bug - password is None
+        // When this test fails, it means the bug is fixed
+        assert!(
+            retrieved_password.is_none(),
+            "BUG REPRODUCED: Password is missing after save without keychain. \
+             User entered password '{}', tested successfully, saved connection, \
+             but password is now None. This is issue #16.",
+            password
+        );
+
+        // What SHOULD happen (after fix):
+        // The password should be retrievable somehow, either:
+        // 1. Force save to keychain (change default behavior), or
+        // 2. Prompt user that password won't be saved, or
+        // 3. Store password in config file (less secure), or
+        // 4. Always prompt for password on connect if not in keychain
+
+        // For now, this test documents the bug by asserting the current
+        // (broken) behavior. When we fix it, we'll update this test.
+    }
+
+    /// Test that demonstrates the expected workflow when password IS saved to keychain
+    #[test]
+    fn test_password_saved_to_keychain_workflow() {
+        // This test shows the WORKING case - when user checks "Save to keychain"
+
+        let entry = ConnectionEntry {
+            name: "keychain-test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "testuser".to_string(),
+            // User DID check "Save to keychain"
+            password_in_keychain: true,
+            ..Default::default()
+        };
+
+        // In the real app, when save_password=true:
+        // entry.set_password_in_keychain("password") is called
+        // Then entry.get_password() would return Some("password")
+
+        // We can't actually test keychain in unit tests without mocking,
+        // but this documents the expected behavior.
+        assert!(
+            entry.password_in_keychain,
+            "Entry should have password_in_keychain=true"
+        );
+    }
+
+    /// Test to verify that ConnectionEntry without keychain has no way to retrieve password
+    #[test]
+    fn test_connection_entry_get_password_returns_none_without_keychain() {
+        let entry = ConnectionEntry {
+            name: "no-password".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "testuser".to_string(),
+            password_in_keychain: false,
+            ..Default::default()
+        };
+
+        // This entry has no way to retrieve password
+        let password = entry.get_password().unwrap();
+        assert!(
+            password.is_none(),
+            "Entry without keychain or env var should return None for password"
+        );
+    }
+
+    /// Test keychain save and retrieve - run with --ignored flag
+    /// This test actually writes to the system keychain
+    #[test]
+    #[ignore] // Ignored by default because it modifies system keychain
+    fn test_keychain_save_and_retrieve() {
+        let entry = ConnectionEntry {
+            name: "tsql-keychain-test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "testuser".to_string(),
+            password_in_keychain: true,
+            ..Default::default()
+        };
+
+        let test_password = "test-secret-password-123";
+
+        // Save password to keychain
+        let save_result = entry.set_password_in_keychain(test_password);
+        assert!(
+            save_result.is_ok(),
+            "Failed to save password to keychain: {:?}",
+            save_result.err()
+        );
+
+        // Retrieve password from keychain
+        let retrieved = entry.get_password_from_keychain();
+        assert!(
+            retrieved.is_ok(),
+            "Failed to retrieve password from keychain: {:?}",
+            retrieved.err()
+        );
+
+        let password = retrieved.unwrap();
+        assert_eq!(
+            password,
+            Some(test_password.to_string()),
+            "Retrieved password doesn't match saved password"
+        );
+
+        // Clean up - delete the test password
+        let _ = entry.delete_password_from_keychain();
+    }
+
+    /// Test keyring crate directly to verify it's working
+    #[test]
+    #[ignore]
+    fn test_keyring_direct() {
+        let service = "tsql-test-direct";
+        let user = "test-user";
+        let password = "test-password-123";
+
+        println!(
+            "Creating keyring entry with service='{}' user='{}'",
+            service, user
+        );
+
+        let entry = keyring::Entry::new(service, user);
+        println!("Entry creation result: {:?}", entry);
+
+        match entry {
+            Ok(e) => {
+                println!("Setting password...");
+                let set_result = e.set_password(password);
+                println!("Set password result: {:?}", set_result);
+
+                println!("Getting password...");
+                let get_result = e.get_password();
+                println!("Get password result: {:?}", get_result);
+
+                // Cleanup
+                let _ = e.delete_credential();
+            }
+            Err(e) => {
+                println!("Failed to create entry: {:?}", e);
+            }
+        }
+    }
+
+    /// Test the full issue #16 flow WITH keychain enabled
+    /// This reproduces the bug where even with "Save to keychain" checked,
+    /// the password is still missing when connecting
+    #[test]
+    #[ignore] // Ignored by default because it modifies system keychain
+    fn test_issue_16_with_keychain_enabled() {
+        let entry = ConnectionEntry {
+            name: "tsql-issue16-keychain-test".to_string(),
+            host: "localhost".to_string(),
+            port: 5433,
+            database: "testdb".to_string(),
+            user: "testuser".to_string(),
+            password_in_keychain: true,
+            ..Default::default()
+        };
+
+        let test_password = "testpass123";
+
+        // Step 1: Save password to keychain (simulating what app.rs should do)
+        println!("Saving password to keychain...");
+        let save_result = entry.set_password_in_keychain(test_password);
+        println!("Save result: {:?}", save_result);
+
+        if let Err(ref e) = save_result {
+            println!("ERROR: Failed to save to keychain: {}", e);
+        }
+
+        // Step 2: Retrieve password (simulating connect flow)
+        println!("Retrieving password from entry.get_password()...");
+        let password = entry.get_password();
+        println!("Get password result: {:?}", password);
+
+        match password {
+            Ok(Some(pwd)) => {
+                println!("SUCCESS: Password retrieved: {}", pwd);
+                assert_eq!(pwd, test_password);
+            }
+            Ok(None) => {
+                println!("BUG: Password is None even though password_in_keychain=true");
+                println!("This is issue #16!");
+            }
+            Err(e) => {
+                println!("ERROR: Failed to get password: {}", e);
+            }
+        }
+
+        // Clean up
+        let _ = entry.delete_password_from_keychain();
     }
 }
