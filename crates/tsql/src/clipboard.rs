@@ -92,6 +92,7 @@ pub fn copy_with_wl_copy(text: &str, cfg: &ClipboardConfig, cmd: &Path) -> Resul
             }
             None => {
                 if Instant::now() >= deadline {
+                    // Already returning success; spawn thread just to reap and prevent zombie.
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
@@ -116,7 +117,14 @@ fn is_wayland_session() -> bool {
 
 fn find_in_path(cmd: &str) -> Option<PathBuf> {
     let cmd_path = Path::new(cmd);
-    if cmd.contains('/') || cmd.contains('\\') {
+    // Check if cmd looks like a path (contains separator). On Unix, backslash is a
+    // valid filename character, so only check forward slash there.
+    #[cfg(windows)]
+    let has_separator = cmd.contains('/') || cmd.contains('\\');
+    #[cfg(not(windows))]
+    let has_separator = cmd.contains('/');
+
+    if has_separator {
         return is_executable_file(cmd_path).then(|| cmd_path.to_path_buf());
     }
 

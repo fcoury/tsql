@@ -3187,6 +3187,8 @@ impl App {
         };
 
         match choice {
+            // Defensive: early return above handles Disabled config, but choose_backend
+            // could still return Disabled in edge cases.
             crate::clipboard::ClipboardBackendChoice::Disabled => {
                 self.last_status = Some("Clipboard disabled".to_string());
             }
@@ -3247,7 +3249,7 @@ impl App {
     fn set_copied_status(&mut self, text: &str) {
         self.last_error = None; // Clear any stale clipboard error
         let lines = text.lines().count();
-        let chars = text.len();
+        let chars = text.chars().count();
         self.last_status = Some(format!(
             "Copied {} line{}, {} char{}",
             lines,
