@@ -5840,12 +5840,15 @@ impl App {
                 return;
             }
 
-            // Fetch first page to get headers and initial rows
-            let fetch_query = format!("FETCH FORWARD {} FROM tsql_cursor", page_size);
+            // Fetch first page to get headers and initial rows.
+            // Bound the first fetch to max_rows if it's smaller than page_size.
+            let first_page_size = page_size.min(max_rows);
+            let fetch_query = format!("FETCH FORWARD {} FROM tsql_cursor", first_page_size);
             let mut headers: Vec<String> = Vec::new();
             let mut first_page_rows: Vec<Vec<String>> = Vec::new();
             let mut total_fetched: usize = 0;
             let mut done = false;
+            let mut truncated = false;
 
             // First fetch
             match guard.simple_query(&fetch_query).await {
@@ -5860,20 +5863,28 @@ impl App {
                                         .map(|c| c.name().to_string())
                                         .collect();
                                 }
-                                let mut out_row = Vec::with_capacity(row.len());
-                                for i in 0..row.len() {
-                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                // Enforce max_rows on the initial page too
+                                if total_fetched < max_rows {
+                                    let mut out_row = Vec::with_capacity(row.len());
+                                    for i in 0..row.len() {
+                                        out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                    }
+                                    first_page_rows.push(out_row);
+                                    total_fetched += 1;
+                                } else {
+                                    truncated = true;
                                 }
-                                first_page_rows.push(out_row);
-                                total_fetched += 1;
                             }
                             SimpleQueryMessage::CommandComplete(_) => {}
                             _ => {}
                         }
                     }
 
-                    // If we got fewer rows than page_size, we're done
-                    if first_page_rows.is_empty() || first_page_rows.len() < page_size {
+                    // If we got fewer rows than requested, or hit the cap, we're done
+                    if first_page_rows.is_empty()
+                        || first_page_rows.len() < first_page_size
+                        || total_fetched >= max_rows
+                    {
                         done = true;
                     }
                 }
@@ -5886,10 +5897,8 @@ impl App {
                 }
             }
 
-            // Check if we've hit max_rows limit on first page
-            let mut truncated = false;
-            if max_rows > 0 && total_fetched >= max_rows {
-                done = true;
+            // If we hit max_rows, mark truncated so the UI can show it
+            if total_fetched >= max_rows {
                 truncated = true;
             }
 
@@ -5958,13 +5967,15 @@ impl App {
                 return;
             }
 
-            // Wait for fetch-more signals and fetch additional pages on demand
+            // Wait for fetch-more signals and fetch additional pages on demand.
+            // Continuation fetches use page_size (not first_page_size which was bounded by max_rows).
+            let continuation_fetch_query = format!("FETCH FORWARD {} FROM tsql_cursor", page_size);
             while let Some(()) = fetch_more_rx.recv().await {
                 // Drain any additional pending requests (user may have scrolled multiple times)
                 while fetch_more_rx.try_recv().is_ok() {}
 
                 // Check if we've already hit max_rows - don't fetch more
-                if max_rows > 0 && total_fetched >= max_rows {
+                if total_fetched >= max_rows {
                     let guard = client.lock().await;
                     let _ = guard.simple_query("CLOSE tsql_cursor").await;
                     let _ = tx.send(DbEvent::RowsAppended {
@@ -5976,7 +5987,7 @@ impl App {
                 }
 
                 let guard = client.lock().await;
-                match guard.simple_query(&fetch_query).await {
+                match guard.simple_query(&continuation_fetch_query).await {
                     Ok(messages) => {
                         let mut page_rows: Vec<Vec<String>> = Vec::new();
                         for msg in messages {
@@ -5989,14 +6000,14 @@ impl App {
                                 total_fetched += 1;
 
                                 // Stop collecting if we hit max_rows mid-page
-                                if max_rows > 0 && total_fetched >= max_rows {
+                                if total_fetched >= max_rows {
                                     break;
                                 }
                             }
                         }
 
                         // Check if done: no more rows, incomplete page, or hit max_rows
-                        let hit_max = max_rows > 0 && total_fetched >= max_rows;
+                        let hit_max = total_fetched >= max_rows;
                         let page_done =
                             page_rows.is_empty() || page_rows.len() < page_size || hit_max;
 
