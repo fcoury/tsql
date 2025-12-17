@@ -70,14 +70,17 @@ pub fn copy_with_wl_copy(text: &str, cfg: &ClipboardConfig, cmd: &Path) -> Resul
             .map_err(|e| anyhow!("Failed to check wl-copy status: {}", e))?
         {
             Some(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+
+                // Only attempt to read stderr when failing. If `wl-copy` forks,
+                // the background process may inherit the stderr pipe and keep it
+                // open, so reading on success can block indefinitely.
                 let mut stderr_bytes = Vec::new();
                 if let Some(mut stderr) = child.stderr.take() {
                     use std::io::Read;
                     let _ = stderr.read_to_end(&mut stderr_bytes);
-                }
-
-                if status.success() {
-                    return Ok(());
                 }
 
                 let stderr = String::from_utf8_lossy(&stderr_bytes);
