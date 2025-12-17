@@ -7,6 +7,8 @@ A modern, keyboard-first PostgreSQL CLI with a TUI interface.
 [![License](https://img.shields.io/crates/l/tsql.svg)](LICENSE)
 [![Discord](https://img.shields.io/discord/1204152891049512960)](https://discord.gg/b928dKDcQq)
 
+If you like this crate show some support by [following fcoury (me) on X](https://x.com/fcoury)
+
 ![tsql screenshot](assets/screenshot.png)
 
 [Join us on Discord](https://discord.gg/b928dKDcQq)
