@@ -1065,6 +1065,9 @@ pub struct App {
     pub last_status: Option<String>,
     pub last_error: Option<String>,
 
+    /// Long-lived clipboard handle to avoid losing selection ownership on Linux.
+    clipboard: Option<arboard::Clipboard>,
+
     /// Query history with persistence.
     pub history: History,
     /// Fuzzy picker for history search (when open).
@@ -1237,6 +1240,7 @@ impl App {
             confirm_prompt: None,
             last_status: None,
             last_error: None,
+            clipboard: None,
 
             history,
             history_picker: None,
@@ -3169,25 +3173,39 @@ impl App {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => match clipboard.set_text(text) {
-                Ok(()) => {
-                    let lines = text.lines().count();
-                    let chars = text.len();
-                    self.last_status = Some(format!(
-                        "Copied {} line{}, {} char{}",
-                        lines,
-                        if lines == 1 { "" } else { "s" },
-                        chars,
-                        if chars == 1 { "" } else { "s" }
-                    ));
-                }
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
                 Err(e) => {
-                    self.last_error = Some(format!("Failed to copy: {}", e));
+                    self.last_error = Some(format!("Clipboard unavailable: {}", e));
+                    return;
                 }
-            },
+            }
+        }
+
+        let clipboard = match self.clipboard.as_mut() {
+            Some(clipboard) => clipboard,
+            None => {
+                self.last_error = Some("Clipboard unavailable".to_string());
+                return;
+            }
+        };
+
+        match clipboard.set_text(text) {
+            Ok(()) => {
+                let lines = text.lines().count();
+                let chars = text.len();
+                self.last_status = Some(format!(
+                    "Copied {} line{}, {} char{}",
+                    lines,
+                    if lines == 1 { "" } else { "s" },
+                    chars,
+                    if chars == 1 { "" } else { "s" }
+                ));
+            }
             Err(e) => {
-                self.last_error = Some(format!("Clipboard unavailable: {}", e));
+                self.last_error = Some(format!("Failed to copy: {}", e));
+                self.clipboard = None;
             }
         }
     }
