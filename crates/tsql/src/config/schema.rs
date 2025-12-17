@@ -15,6 +15,8 @@ pub struct Config {
     pub connection: ConnectionConfig,
     /// SQL generation / templating settings
     pub sql: SqlConfig,
+    /// Clipboard settings
+    pub clipboard: ClipboardConfig,
     /// Keymap customizations
     pub keymap: KeymapConfig,
 }
@@ -127,6 +129,45 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Clipboard settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Clipboard backend selection.
+    pub backend: ClipboardBackend,
+    /// Command name/path for `wl-copy` when backend is `wl-copy` or `auto`.
+    pub wl_copy_cmd: String,
+    /// Use the "primary" selection for `wl-copy` (passes `-p`).
+    pub wl_copy_primary: bool,
+    /// Trim trailing newline for `wl-copy` (passes `-n`).
+    pub wl_copy_trim_newline: bool,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            backend: ClipboardBackend::Auto,
+            wl_copy_cmd: "wl-copy".to_string(),
+            wl_copy_primary: false,
+            wl_copy_trim_newline: false,
+        }
+    }
+}
+
+/// Clipboard backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipboardBackend {
+    /// Auto-detect: prefer `wl-copy` on Wayland when available, otherwise use arboard.
+    Auto,
+    /// Always use arboard.
+    Arboard,
+    /// Always use `wl-copy`.
+    WlCopy,
+    /// Disable clipboard support.
+    Disabled,
+}
+
 /// Keymap customization settings
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -229,6 +270,11 @@ default_url = "postgres://localhost/mydb"
 connect_timeout_secs = 5
 max_rows = 10000
 
+[clipboard]
+backend = "wl-copy"
+wl_copy_primary = true
+wl_copy_trim_newline = true
+
 [keymap]
 vim_mode = true
 
@@ -263,6 +309,11 @@ description = "Export results as CSV"
         );
         assert_eq!(config.connection.connect_timeout_secs, 5);
         assert_eq!(config.connection.max_rows, 10000);
+
+        // Clipboard
+        assert_eq!(config.clipboard.backend, ClipboardBackend::WlCopy);
+        assert!(config.clipboard.wl_copy_primary);
+        assert!(config.clipboard.wl_copy_trim_newline);
 
         // Keymap
         assert!(config.keymap.vim_mode);

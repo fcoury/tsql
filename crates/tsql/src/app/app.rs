@@ -32,8 +32,8 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::config::{
-    load_connections, save_connections, Action, Config, ConnectionEntry, ConnectionsFile,
-    KeyBinding, Keymap, SslMode,
+    load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
+    ConnectionsFile, KeyBinding, Keymap, SslMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -3173,41 +3173,84 @@ impl App {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
-        if self.clipboard.is_none() {
-            match arboard::Clipboard::new() {
-                Ok(clipboard) => self.clipboard = Some(clipboard),
-                Err(e) => {
-                    self.last_error = Some(format!("Clipboard unavailable: {}", e));
-                    return;
-                }
-            }
+        if self.config.clipboard.backend == ClipboardBackend::Disabled {
+            self.last_status = Some("Clipboard disabled".to_string());
+            return;
         }
 
-        let clipboard = match self.clipboard.as_mut() {
-            Some(clipboard) => clipboard,
-            None => {
-                self.last_error = Some("Clipboard unavailable".to_string());
+        let choice = match crate::clipboard::choose_backend(&self.config.clipboard) {
+            Ok(choice) => choice,
+            Err(e) => {
+                self.last_error = Some(e.to_string());
                 return;
             }
         };
 
-        match clipboard.set_text(text) {
-            Ok(()) => {
-                let lines = text.lines().count();
-                let chars = text.len();
-                self.last_status = Some(format!(
-                    "Copied {} line{}, {} char{}",
-                    lines,
-                    if lines == 1 { "" } else { "s" },
-                    chars,
-                    if chars == 1 { "" } else { "s" }
-                ));
+        match choice {
+            crate::clipboard::ClipboardBackendChoice::Disabled => {
+                self.last_status = Some("Clipboard disabled".to_string());
             }
-            Err(e) => {
-                self.last_error = Some(format!("Failed to copy: {}", e));
-                self.clipboard = None;
+            crate::clipboard::ClipboardBackendChoice::Arboard => {
+                if let Err(e) = self.copy_to_clipboard_with_arboard(text) {
+                    self.last_error = Some(format!("Failed to copy: {}", e));
+                } else {
+                    self.set_copied_status(text);
+                }
+            }
+            crate::clipboard::ClipboardBackendChoice::WlCopy { cmd } => {
+                match crate::clipboard::copy_with_wl_copy(text, &self.config.clipboard, &cmd) {
+                    Ok(()) => {
+                        self.set_copied_status(text);
+                    }
+                    Err(e) => {
+                        if self.config.clipboard.backend == ClipboardBackend::Auto {
+                            // Best-effort fallback for auto mode.
+                            if let Err(arboard_err) = self.copy_to_clipboard_with_arboard(text) {
+                                self.last_error = Some(format!(
+                                    "wl-copy failed: {}; arboard failed: {}",
+                                    e, arboard_err
+                                ));
+                            } else {
+                                self.set_copied_status(text);
+                            }
+                        } else {
+                            self.last_error = Some(format!("Failed to copy: {}", e));
+                        }
+                    }
+                }
             }
         }
+    }
+
+    fn copy_to_clipboard_with_arboard(&mut self, text: &str) -> Result<()> {
+        if self.clipboard.is_none() {
+            let clipboard = arboard::Clipboard::new()
+                .map_err(|e| anyhow::anyhow!("Clipboard unavailable: {}", e))?;
+            self.clipboard = Some(clipboard);
+        }
+
+        let clipboard = self
+            .clipboard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Clipboard unavailable"))?;
+
+        clipboard
+            .set_text(text)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    fn set_copied_status(&mut self, text: &str) {
+        let lines = text.lines().count();
+        let chars = text.len();
+        self.last_status = Some(format!(
+            "Copied {} line{}, {} char{}",
+            lines,
+            if lines == 1 { "" } else { "s" },
+            chars,
+            if chars == 1 { "" } else { "s" }
+        ));
     }
 
     fn start_cell_edit(&mut self, row: usize, col: usize) {
