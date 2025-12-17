@@ -6226,7 +6226,12 @@ impl App {
     }
 
     fn cancel_query(&mut self) {
-        if !self.db.running {
+        // Check if there's anything to cancel:
+        // 1. A query is actively running (db.running)
+        // 2. A paged fetch is in progress (paged_query.loading)
+        let paged_loading = self.paged_query.as_ref().is_some_and(|p| p.loading);
+
+        if !self.db.running && !paged_loading {
             return;
         }
 
@@ -6236,6 +6241,13 @@ impl App {
         };
 
         self.last_status = Some("Cancelling...".to_string());
+
+        // If cancelling a paged fetch, clear the paged_query state.
+        // This closes the fetch-more channel, causing the cursor task to exit
+        // and close the cursor.
+        if paged_loading {
+            self.paged_query = None;
+        }
 
         let tx = self.db_events_tx.clone();
         let connected_with_tls = self.db.connected_with_tls;
