@@ -290,16 +290,13 @@ impl ConnectionEntry {
         // If password is in URL, we have a password; if not, assume no password required
         let no_password_required = password.is_none();
 
-        let ssl_mode = url
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k.eq_ignore_ascii_case("sslmode") {
-                    SslMode::parse(&v)
-                } else {
-                    None
-                }
-            })
-            .filter(|m| *m != SslMode::Disable);
+        let ssl_mode = url.query_pairs().find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("sslmode") {
+                SslMode::parse(&v)
+            } else {
+                None
+            }
+        });
 
         let entry = ConnectionEntry {
             name: name.to_string(),
@@ -859,6 +856,62 @@ mod tests {
                 .unwrap();
 
         assert_eq!(entry.ssl_mode, Some(SslMode::Require));
+    }
+
+    #[test]
+    fn test_connection_from_url_preserves_sslmode_disable() {
+        // Verify that explicit sslmode=disable is preserved (not converted to None)
+        let (entry, _) =
+            ConnectionEntry::from_url("test", "postgres://user@localhost/mydb?sslmode=disable")
+                .unwrap();
+
+        assert_eq!(
+            entry.ssl_mode,
+            Some(SslMode::Disable),
+            "Explicit sslmode=disable should be preserved as Some(Disable), not None"
+        );
+    }
+
+    #[test]
+    fn test_connection_url_round_trip_all_ssl_modes() {
+        // Verify from_url/to_url round-trip consistency for all SSL modes
+        let test_cases = [
+            (
+                "postgres://user@localhost/mydb?sslmode=disable",
+                Some(SslMode::Disable),
+            ),
+            (
+                "postgres://user@localhost/mydb?sslmode=prefer",
+                Some(SslMode::Prefer),
+            ),
+            (
+                "postgres://user@localhost/mydb?sslmode=require",
+                Some(SslMode::Require),
+            ),
+            (
+                "postgres://user@localhost/mydb?sslmode=verify-ca",
+                Some(SslMode::VerifyCa),
+            ),
+            (
+                "postgres://user@localhost/mydb?sslmode=verify-full",
+                Some(SslMode::VerifyFull),
+            ),
+            ("postgres://user@localhost/mydb", None), // No sslmode
+        ];
+
+        for (url, expected_mode) in test_cases {
+            let (entry, _) = ConnectionEntry::from_url("test", url).unwrap();
+            assert_eq!(entry.ssl_mode, expected_mode, "Failed for URL: {}", url);
+
+            // Verify round-trip: to_url should produce URL with same sslmode
+            let regenerated_url = entry.to_url(None);
+            let (re_entry, _) = ConnectionEntry::from_url("test", &regenerated_url).unwrap();
+            assert_eq!(
+                re_entry.ssl_mode, expected_mode,
+                "Round-trip failed for URL: {} -> {}",
+                url, regenerated_url
+            );
+        }
     }
 
     #[test]
