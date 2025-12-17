@@ -123,6 +123,12 @@ fn make_rustls_connect_insecure() -> MakeRustlsConnect {
 
 /// TLS connector WITH certificate validation (for sslmode=verify-ca/verify-full).
 /// Validates server certificate against Mozilla's root CA store.
+///
+/// Note: rustls performs hostname verification by default, so both verify-ca and
+/// verify-full currently have identical behavior (full verification). In libpq,
+/// verify-ca only validates the CA chain without hostname checking, while verify-full
+/// adds hostname verification. A future enhancement could implement a custom verifier
+/// to disable hostname checking for verify-ca mode.
 fn make_rustls_connect_verified() -> MakeRustlsConnect {
     let mut root_store = RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
@@ -132,8 +138,20 @@ fn make_rustls_connect_verified() -> MakeRustlsConnect {
     MakeRustlsConnect::new(config)
 }
 
+/// Parse sslmode from a connection string (URL or keyword format).
+///
+/// # Default Behavior
+/// Returns `SslMode::Disable` when no sslmode is specified. This differs from
+/// libpq's default of `prefer` but matches tsql's historical behavior of requiring
+/// explicit opt-in for TLS. Users who want TLS should specify sslmode explicitly.
+///
+/// # Supported Modes
+/// - `disable`: No TLS (default)
+/// - `prefer`: Try TLS, fall back to plaintext
+/// - `require`: Require TLS, no certificate validation
+/// - `verify-ca`: Require TLS with CA validation (currently same as verify-full)
+/// - `verify-full`: Require TLS with CA + hostname validation
 fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
-    // Default: preserve existing behavior (no TLS unless explicitly requested).
     let default = SslMode::Disable;
 
     if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
@@ -8925,5 +8943,173 @@ mod tests {
     fn test_is_pageable_query_empty() {
         assert!(!is_pageable_query(""));
         assert!(!is_pageable_query("   "));
+    }
+
+    // ========== resolve_ssl_mode tests ==========
+
+    #[test]
+    fn test_resolve_ssl_mode_url_all_modes() {
+        use crate::config::SslMode;
+
+        // Test all valid sslmode values in URL format
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=disable"),
+            Ok(SslMode::Disable)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=prefer"),
+            Ok(SslMode::Prefer)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=verify-ca"),
+            Ok(SslMode::VerifyCa)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=verify-full"),
+            Ok(SslMode::VerifyFull)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_keyword_all_modes() {
+        use crate::config::SslMode;
+
+        // Test all valid sslmode values in keyword format
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test sslmode=disable"),
+            Ok(SslMode::Disable)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test sslmode=prefer"),
+            Ok(SslMode::Prefer)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test sslmode=require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test sslmode=verify-ca"),
+            Ok(SslMode::VerifyCa)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test sslmode=verify-full"),
+            Ok(SslMode::VerifyFull)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_case_insensitive() {
+        use crate::config::SslMode;
+
+        // URL format - case insensitive sslmode value
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=REQUIRE"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=Require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=VERIFY-CA"),
+            Ok(SslMode::VerifyCa)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?sslmode=Verify-Full"),
+            Ok(SslMode::VerifyFull)
+        );
+
+        // URL format - case insensitive parameter name
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?SSLMODE=require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db?SslMode=require"),
+            Ok(SslMode::Require)
+        );
+
+        // Keyword format - case insensitive
+        assert_eq!(
+            resolve_ssl_mode("host=localhost SSLMODE=require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost sslmode=REQUIRE"),
+            Ok(SslMode::Require)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_default_disable() {
+        use crate::config::SslMode;
+
+        // No sslmode specified - should default to Disable (differs from libpq's prefer)
+        assert_eq!(
+            resolve_ssl_mode("postgres://user@host/db"),
+            Ok(SslMode::Disable)
+        );
+        assert_eq!(
+            resolve_ssl_mode("postgresql://user@host/db"),
+            Ok(SslMode::Disable)
+        );
+        assert_eq!(
+            resolve_ssl_mode("host=localhost dbname=test"),
+            Ok(SslMode::Disable)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_invalid_values() {
+        // Invalid sslmode values should return an error
+        let result = resolve_ssl_mode("postgres://user@host/db?sslmode=invalid");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported sslmode"));
+
+        let result = resolve_ssl_mode("postgres://user@host/db?sslmode=true");
+        assert!(result.is_err());
+
+        let result = resolve_ssl_mode("host=localhost sslmode=yes");
+        assert!(result.is_err());
+
+        // Almost correct but misspelled
+        let result = resolve_ssl_mode("postgres://user@host/db?sslmode=requires");
+        assert!(result.is_err());
+
+        let result = resolve_ssl_mode("postgres://user@host/db?sslmode=verify_ca");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_postgresql_scheme() {
+        use crate::config::SslMode;
+
+        // Both postgres:// and postgresql:// should work
+        assert_eq!(
+            resolve_ssl_mode("postgresql://user@host/db?sslmode=require"),
+            Ok(SslMode::Require)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_with_other_params() {
+        use crate::config::SslMode;
+
+        // sslmode should be extracted even with other parameters
+        assert_eq!(
+            resolve_ssl_mode(
+                "postgres://user@host/db?connect_timeout=10&sslmode=require&application_name=test"
+            ),
+            Ok(SslMode::Require)
+        );
+
+        assert_eq!(
+            resolve_ssl_mode("host=localhost port=5432 sslmode=verify-full user=postgres"),
+            Ok(SslMode::VerifyFull)
+        );
     }
 }
