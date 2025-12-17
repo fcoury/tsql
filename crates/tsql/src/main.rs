@@ -7,7 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::runtime::Runtime;
@@ -17,6 +17,54 @@ use tsql::app::App;
 use tsql::config::{self, load_connections};
 use tsql::session::load_session;
 use tsql::ui::GridModel;
+
+/// Percent-encoding set for URL userinfo (username/password) per RFC 3986.
+/// Encodes reserved and unsafe characters while preserving unreserved chars (-, ., _, ~).
+const USERINFO_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
+
+/// Percent-encoding set for URL path segments (database name) per RFC 3986.
+/// Similar to userinfo but also encodes '?' to prevent query string injection.
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
 
 fn print_version() {
     println!("tsql {}", env!("CARGO_PKG_VERSION"));
@@ -49,11 +97,11 @@ fn build_url_from_libpq_env() -> Option<String> {
     // Add user and password if present
     if let Some(ref u) = user {
         // URL-encode special characters in username
-        url.push_str(&utf8_percent_encode(u, NON_ALPHANUMERIC).to_string());
+        url.push_str(&utf8_percent_encode(u, USERINFO_ENCODE_SET).to_string());
         if let Some(ref p) = password {
             url.push(':');
             // URL-encode special characters in password
-            url.push_str(&utf8_percent_encode(p, NON_ALPHANUMERIC).to_string());
+            url.push_str(&utf8_percent_encode(p, USERINFO_ENCODE_SET).to_string());
         }
         url.push('@');
     }
@@ -63,10 +111,10 @@ fn build_url_from_libpq_env() -> Option<String> {
     url.push(':');
     url.push_str(&port);
 
-    // Add database if present
+    // Add database if present (percent-encode to handle special characters)
     if let Some(ref db) = database {
         url.push('/');
-        url.push_str(db);
+        url.push_str(&utf8_percent_encode(db, PATH_SEGMENT_ENCODE_SET).to_string());
     }
 
     // Add sslmode if present
@@ -488,5 +536,31 @@ mod tests {
 
         let url = build_url_from_libpq_env().unwrap();
         assert_eq!(url, "postgres://localhost:5432?sslmode=verify-full");
+    }
+
+    #[test]
+    #[serial]
+    fn test_special_characters_in_database() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGDATABASE", "my db/test?foo");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // Space, slash, and question mark should be percent-encoded
+        assert!(url.contains("/my%20db%2Ftest%3Ffoo"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_unreserved_chars_not_encoded() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGUSER", "user-name_test.org~");
+        env::set_var("PGDATABASE", "my-db_name.test~");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // Unreserved characters (-, _, ., ~) should NOT be percent-encoded
+        assert!(url.contains("user-name_test.org~@"));
+        assert!(url.contains("/my-db_name.test~"));
     }
 }
