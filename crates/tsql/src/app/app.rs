@@ -179,6 +179,11 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
     Ok(default)
 }
 
+/// Normalize the max_rows config value.
+///
+/// If the user sets max_rows to 0 in config (or leaves it unset), this returns
+/// the default limit of 2000 rows. Otherwise, the configured value is used.
+/// Note: 0 does NOT mean "unlimited" - it's normalized to the default.
 fn effective_max_rows(config_max_rows: usize) -> usize {
     const DEFAULT_MAX_ROWS: usize = 2000;
     if config_max_rows == 0 {
@@ -490,7 +495,9 @@ pub struct PagedQueryState {
     pub done: bool,
     /// Number of rows fetched so far.
     pub loaded_rows: usize,
-    /// Maximum rows to fetch (0 = unlimited, uses config default).
+    /// Maximum rows to fetch. This value is pre-normalized via `effective_max_rows()`
+    /// so 0 from config becomes the default limit (2000). A non-zero value here
+    /// represents the actual row limit to enforce.
     pub max_rows: usize,
     /// Number of rows to fetch per page.
     pub page_size: usize,
@@ -5807,7 +5814,7 @@ impl App {
         &self,
         client: SharedClient,
         query: String,
-        max_rows: usize, // Maximum rows to fetch (0 = unlimited)
+        max_rows: usize, // Maximum rows to fetch (pre-normalized, 0 not used)
         page_size: usize,
         source_table: Option<String>,
         tx: mpsc::UnboundedSender<DbEvent>,
