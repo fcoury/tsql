@@ -18,37 +18,16 @@ use tsql::config::{self, load_connections};
 use tsql::session::load_session;
 use tsql::ui::GridModel;
 
-/// Percent-encoding set for URL userinfo (username/password) per RFC 3986.
+/// Percent-encoding set for URL components (userinfo, path segments, query values) per RFC 3986.
 /// Encodes reserved and unsafe characters while preserving unreserved chars (-, ., _, ~).
-const USERINFO_ENCODE_SET: &AsciiSet = &CONTROLS
+const URL_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
     .add(b'#')
     .add(b'%')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/')
-    .add(b':')
-    .add(b';')
-    .add(b'=')
-    .add(b'@')
-    .add(b'[')
-    .add(b'\\')
-    .add(b']')
-    .add(b'^')
-    .add(b'|');
-
-/// Percent-encoding set for URL path segments (database name) per RFC 3986.
-/// Similar to userinfo but also encodes '?' to prevent query string injection.
-const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'+')
     .add(b'<')
     .add(b'>')
     .add(b'?')
@@ -97,30 +76,36 @@ fn build_url_from_libpq_env() -> Option<String> {
     // Add user and password if present
     if let Some(ref u) = user {
         // URL-encode special characters in username
-        url.push_str(&utf8_percent_encode(u, USERINFO_ENCODE_SET).to_string());
+        url.push_str(&utf8_percent_encode(u, URL_COMPONENT_ENCODE_SET).to_string());
         if let Some(ref p) = password {
             url.push(':');
             // URL-encode special characters in password
-            url.push_str(&utf8_percent_encode(p, USERINFO_ENCODE_SET).to_string());
+            url.push_str(&utf8_percent_encode(p, URL_COMPONENT_ENCODE_SET).to_string());
         }
         url.push('@');
     }
 
-    // Add host and port
-    url.push_str(&host);
+    // Add host and port (wrap IPv6 addresses in brackets)
+    if host.contains(':') {
+        url.push('[');
+        url.push_str(&host);
+        url.push(']');
+    } else {
+        url.push_str(&host);
+    }
     url.push(':');
     url.push_str(&port);
 
     // Add database if present (percent-encode to handle special characters)
     if let Some(ref db) = database {
         url.push('/');
-        url.push_str(&utf8_percent_encode(db, PATH_SEGMENT_ENCODE_SET).to_string());
+        url.push_str(&utf8_percent_encode(db, URL_COMPONENT_ENCODE_SET).to_string());
     }
 
-    // Add sslmode if present
+    // Add sslmode if present (percent-encode to handle non-standard values)
     if let Some(ref ssl) = sslmode {
         url.push_str("?sslmode=");
-        url.push_str(ssl);
+        url.push_str(&utf8_percent_encode(ssl, URL_COMPONENT_ENCODE_SET).to_string());
     }
 
     Some(url)
@@ -562,5 +547,41 @@ mod tests {
         // Unreserved characters (-, _, ., ~) should NOT be percent-encoded
         assert!(url.contains("user-name_test.org~@"));
         assert!(url.contains("/my-db_name.test~"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_ipv6_localhost() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "::1");
+        env::set_var("PGDATABASE", "testdb");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // IPv6 addresses should be wrapped in brackets
+        assert_eq!(url, "postgres://[::1]:5432/testdb");
+    }
+
+    #[test]
+    #[serial]
+    fn test_ipv6_full_address() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "2001:db8::1");
+        env::set_var("PGPORT", "5433");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // IPv6 addresses should be wrapped in brackets
+        assert_eq!(url, "postgres://[2001:db8::1]:5433");
+    }
+
+    #[test]
+    #[serial]
+    fn test_sslmode_with_special_chars() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGSSLMODE", "require&foo=bar");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // Special characters in sslmode should be percent-encoded
+        assert!(url.contains("?sslmode=require%26foo%3Dbar"));
     }
 }
