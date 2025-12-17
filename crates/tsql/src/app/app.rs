@@ -3174,6 +3174,7 @@ impl App {
 
     fn copy_to_clipboard(&mut self, text: &str) {
         if self.config.clipboard.backend == ClipboardBackend::Disabled {
+            self.last_error = None;
             self.last_status = Some("Clipboard disabled".to_string());
             return;
         }
@@ -3190,6 +3191,7 @@ impl App {
             // Defensive: early return above handles Disabled config, but choose_backend
             // could still return Disabled in edge cases.
             crate::clipboard::ClipboardBackendChoice::Disabled => {
+                self.last_error = None;
                 self.last_status = Some("Clipboard disabled".to_string());
             }
             crate::clipboard::ClipboardBackendChoice::Arboard => {
