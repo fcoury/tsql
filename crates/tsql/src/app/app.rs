@@ -5792,9 +5792,15 @@ impl App {
             return;
         };
 
-        // Check if query is already running OR if we have an active paged cursor
-        // (paged queries keep cursor open even after db.running is cleared)
-        if self.db.running || self.paged_query.is_some() {
+        // If a previous paged query is still active, abandon it so we can run a new one.
+        // Dropping `paged_query` closes the fetch-more channel; the background cursor task
+        // will see `recv().await` return None, issue `CLOSE tsql_cursor`, and exit.
+        if self.paged_query.is_some() {
+            self.paged_query = None;
+        }
+
+        // Only block if a query is actively running (not just an idle paged cursor)
+        if self.db.running {
             self.last_status = Some("Query already running".to_string());
             return;
         }
