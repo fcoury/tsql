@@ -25,8 +25,20 @@ pub enum SslMode {
 }
 
 impl SslMode {
+    /// All SSL mode variants in order.
+    const fn all() -> [Self; 5] {
+        [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ]
+    }
+
     /// Number of SSL mode variants (for UI cycling).
-    pub const COUNT: usize = 5;
+    /// Derived from all() to avoid manual maintenance.
+    pub const COUNT: usize = Self::all().len();
 
     pub fn as_str(self) -> &'static str {
         match self {
