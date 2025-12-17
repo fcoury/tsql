@@ -819,6 +819,9 @@ impl GridModel {
     ///
     /// This method is used for streaming/paged query results where rows arrive
     /// incrementally. The headers and column types remain unchanged.
+    ///
+    /// Note: If new rows have more columns than the existing model, extra columns
+    /// are ignored. If new rows have fewer columns, missing columns are not processed.
     pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
         // Update column widths for any cells that are wider than current widths
         for row in &new_rows {

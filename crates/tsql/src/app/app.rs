@@ -166,14 +166,38 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
         return Ok(default);
     }
 
-    for part in conn_str.split_whitespace() {
+    // Parse keyword-style connection strings, handling spaces around '=' (e.g., "sslmode = require")
+    // by joining tokens with '=' that were split by whitespace.
+    let parts: Vec<&str> = conn_str.split_whitespace().collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        // Check for "key=value" format (value is non-empty)
         if let Some((k, v)) = part.split_once('=') {
             if k.eq_ignore_ascii_case("sslmode") {
+                // If value is empty, check next part (handles "sslmode= value")
+                let actual_value = if v.is_empty() && i + 1 < parts.len() {
+                    i += 1;
+                    parts[i]
+                } else {
+                    v
+                };
+                return SslMode::parse(actual_value).ok_or_else(|| {
+                    format!("Unsupported sslmode '{actual_value}'. Supported: disable, prefer, require, verify-ca, verify-full.")
+                });
+            }
+        }
+        // Check for "key" "=" "value" format (spaces around =)
+        else if i + 2 < parts.len() && parts[i + 1] == "=" {
+            if part.eq_ignore_ascii_case("sslmode") {
+                let v = parts[i + 2];
                 return SslMode::parse(v).ok_or_else(|| {
                     format!("Unsupported sslmode '{v}'. Supported: disable, prefer, require, verify-ca, verify-full.")
                 });
             }
+            i += 2; // Skip "=" and value
         }
+        i += 1;
     }
 
     Ok(default)
@@ -3096,6 +3120,9 @@ impl App {
                     self.grid_state.cursor_row =
                         (self.grid_state.cursor_row + amount).min(row_count - 1);
                 }
+
+                // Trigger auto-fetch when scrolling near the end of loaded rows
+                self.maybe_fetch_more_rows();
             }
             Focus::Sidebar(section) => {
                 // Scroll sidebar sections
@@ -9016,6 +9043,26 @@ mod tests {
         assert_eq!(
             resolve_ssl_mode("host=localhost dbname=test sslmode=verify-full"),
             Ok(SslMode::VerifyFull)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ssl_mode_keyword_with_spaces() {
+        use crate::config::SslMode;
+
+        // Test keyword format with spaces around '=' (libpq allows this)
+        assert_eq!(
+            resolve_ssl_mode("host=localhost sslmode = require"),
+            Ok(SslMode::Require)
+        );
+        assert_eq!(
+            resolve_ssl_mode("sslmode = verify-full host=localhost"),
+            Ok(SslMode::VerifyFull)
+        );
+        // Space after = only
+        assert_eq!(
+            resolve_ssl_mode("host=localhost sslmode= require"),
+            Ok(SslMode::Require)
         );
     }
 

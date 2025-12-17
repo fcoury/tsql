@@ -992,7 +992,7 @@ impl ConnectionFormModal {
             spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
         }
         spans.push(Span::styled(
-            format!("{:<8}", mode_name),
+            format!("{:<11}", mode_name), // 11 chars to fit "verify-full"
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
