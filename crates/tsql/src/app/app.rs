@@ -3229,19 +3229,23 @@ impl App {
             self.clipboard = Some(clipboard);
         }
 
-        let clipboard = self
+        let result = self
             .clipboard
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Clipboard unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("Clipboard unavailable"))?
+            .set_text(text);
 
-        clipboard
-            .set_text(text)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if let Err(e) = result {
+            // Drop cached handle so the next copy can reinitialize a fresh clipboard.
+            self.clipboard = None;
+            return Err(anyhow::anyhow!("{}", e));
+        }
 
         Ok(())
     }
 
     fn set_copied_status(&mut self, text: &str) {
+        self.last_error = None; // Clear any stale clipboard error
         let lines = text.lines().count();
         let chars = text.len();
         self.last_status = Some(format!(

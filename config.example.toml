@@ -91,16 +91,18 @@ auto_reconnect = true
 # Clipboard settings
 [clipboard]
 # Clipboard backend:
-# - "auto": On Linux Wayland, use wl-copy if available; otherwise use arboard
+# - "auto": On Linux Wayland, use wl-copy if available; on X11 or other platforms, use arboard
 # - "arboard": Always use arboard (built-in clipboard integration)
 # - "wl-copy": Always use wl-copy (requires wl-clipboard installed)
 # - "disabled": Disable clipboard support
 backend = "auto"
 
 # Command name/path for wl-copy when backend is "wl-copy" or "auto"
+# If wl-copy is not found, operations will fail with an error message
 wl_copy_cmd = "wl-copy"
 
-# Use the "primary" selection for wl-copy (passes -p)
+# Use the "primary" selection for wl-copy (passes -p; primary selection is typically
+# used for middle-click paste, while the standard clipboard is used for Ctrl+V)
 wl_copy_primary = false
 
 # Trim the trailing newline for wl-copy (passes -n)

@@ -220,12 +220,31 @@ mod tests {
     #[serial]
     #[cfg(target_os = "linux")]
     fn auto_selects_wl_copy_when_wayland_and_present() {
+        struct EnvGuard {
+            path: Option<std::ffi::OsString>,
+            wayland: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.path.take() {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+                match self.wayland.take() {
+                    Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                    None => std::env::remove_var("WAYLAND_DISPLAY"),
+                }
+            }
+        }
+
         let dir = TempDir::new().unwrap();
         let fake = dir.path().join("wl-copy");
         write_executable(&fake, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
 
-        let old_path = std::env::var_os("PATH");
-        let old_wayland = std::env::var_os("WAYLAND_DISPLAY");
+        let _guard = EnvGuard {
+            path: std::env::var_os("PATH"),
+            wayland: std::env::var_os("WAYLAND_DISPLAY"),
+        };
 
         std::env::set_var("PATH", dir.path().as_os_str());
         std::env::set_var("WAYLAND_DISPLAY", "wayland-1");
@@ -233,14 +252,5 @@ mod tests {
         let cfg = base_cfg();
         let choice = choose_backend(&cfg).unwrap();
         assert!(matches!(choice, ClipboardBackendChoice::WlCopy { .. }));
-
-        match old_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match old_wayland {
-            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-            None => std::env::remove_var("WAYLAND_DISPLAY"),
-        }
     }
 }
