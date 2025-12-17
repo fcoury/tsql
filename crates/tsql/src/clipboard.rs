@@ -1,5 +1,6 @@
 use crate::config::{ClipboardBackend, ClipboardConfig};
 use anyhow::{anyhow, Result};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,7 +54,6 @@ pub fn copy_with_wl_copy(text: &str, cfg: &ClipboardConfig, cmd: &Path) -> Resul
         .map_err(|e| anyhow!("Failed to start wl-copy: {}", e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
         stdin
             .write_all(text.as_bytes())
             .map_err(|e| anyhow!("Failed to write to wl-copy stdin: {}", e))?;
@@ -79,7 +79,6 @@ pub fn copy_with_wl_copy(text: &str, cfg: &ClipboardConfig, cmd: &Path) -> Resul
                 // open, so reading on success can block indefinitely.
                 let mut stderr_bytes = Vec::new();
                 if let Some(mut stderr) = child.stderr.take() {
-                    use std::io::Read;
                     let _ = stderr.read_to_end(&mut stderr_bytes);
                 }
 
@@ -189,7 +188,6 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
-        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let mut file = std::fs::File::create(path).unwrap();
