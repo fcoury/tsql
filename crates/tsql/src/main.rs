@@ -7,6 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::runtime::Runtime;
@@ -19,6 +20,62 @@ use tsql::ui::GridModel;
 
 fn print_version() {
     println!("tsql {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Build a PostgreSQL connection URL from libpq-compatible environment variables.
+///
+/// Supports: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE
+///
+/// Returns None if no relevant environment variables are set.
+fn build_url_from_libpq_env() -> Option<String> {
+    let host = env::var("PGHOST").ok();
+    let port = env::var("PGPORT").ok();
+    let database = env::var("PGDATABASE").ok();
+    let user = env::var("PGUSER").ok();
+    let password = env::var("PGPASSWORD").ok();
+    let sslmode = env::var("PGSSLMODE").ok();
+
+    // Need at least one of host or database to build a connection URL
+    if host.is_none() && database.is_none() {
+        return None;
+    }
+
+    let host = host.unwrap_or_else(|| "localhost".to_string());
+    let port = port.unwrap_or_else(|| "5432".to_string());
+
+    // Build the URL
+    let mut url = String::from("postgres://");
+
+    // Add user and password if present
+    if let Some(ref u) = user {
+        // URL-encode special characters in username
+        url.push_str(&utf8_percent_encode(u, NON_ALPHANUMERIC).to_string());
+        if let Some(ref p) = password {
+            url.push(':');
+            // URL-encode special characters in password
+            url.push_str(&utf8_percent_encode(p, NON_ALPHANUMERIC).to_string());
+        }
+        url.push('@');
+    }
+
+    // Add host and port
+    url.push_str(&host);
+    url.push(':');
+    url.push_str(&port);
+
+    // Add database if present
+    if let Some(ref db) = database {
+        url.push('/');
+        url.push_str(db);
+    }
+
+    // Add sslmode if present
+    if let Some(ref ssl) = sslmode {
+        url.push_str("?sslmode=");
+        url.push_str(ssl);
+    }
+
+    Some(url)
 }
 
 fn print_usage() {
@@ -38,6 +95,14 @@ fn print_usage() {
     eprintln!();
     eprintln!("Environment Variables:");
     eprintln!("  DATABASE_URL      Default connection URL if not provided as argument");
+    eprintln!();
+    eprintln!("  libpq-compatible variables (used if DATABASE_URL is not set):");
+    eprintln!("    PGHOST          PostgreSQL server hostname (default: localhost)");
+    eprintln!("    PGPORT          PostgreSQL server port (default: 5432)");
+    eprintln!("    PGDATABASE      Database name");
+    eprintln!("    PGUSER          Username for authentication");
+    eprintln!("    PGPASSWORD      Password for authentication");
+    eprintln!("    PGSSLMODE       SSL mode (disable, prefer, require, verify-ca, verify-full)");
     eprintln!();
     eprintln!("Configuration:");
     if let Some(path) = config::config_path() {
@@ -95,13 +160,16 @@ fn main() -> Result<()> {
         Default::default()
     };
 
-    // Connection string priority: CLI arg > DATABASE_URL env var > config file
+    // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
     let conn_str = if args.len() > 1 && !args[1].starts_with('-') {
         // First argument is the connection string
         Some(args[1].clone())
     } else {
         // Fall back to DATABASE_URL environment variable
-        env::var("DATABASE_URL").ok()
+        env::var("DATABASE_URL")
+            .ok()
+            // Then try libpq-compatible env vars (PGHOST, PGPORT, PGDATABASE, etc.)
+            .or_else(build_url_from_libpq_env)
     };
 
     let rt = Runtime::new().context("failed to initialize tokio runtime")?;
@@ -298,4 +366,127 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Helper to clear all libpq env vars before each test
+    fn clear_libpq_env_vars() {
+        for var in [
+            "PGHOST",
+            "PGPORT",
+            "PGDATABASE",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGSSLMODE",
+        ] {
+            env::remove_var(var);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_env_vars_returns_none() {
+        clear_libpq_env_vars();
+        assert!(build_url_from_libpq_env().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_pghost_only() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "db.example.com");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(url, "postgres://db.example.com:5432");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pgdatabase_only() {
+        clear_libpq_env_vars();
+        env::set_var("PGDATABASE", "mydb");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(url, "postgres://localhost:5432/mydb");
+    }
+
+    #[test]
+    #[serial]
+    fn test_all_vars() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "db.example.com");
+        env::set_var("PGPORT", "5433");
+        env::set_var("PGDATABASE", "testdb");
+        env::set_var("PGUSER", "testuser");
+        env::set_var("PGPASSWORD", "secret");
+        env::set_var("PGSSLMODE", "require");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(
+            url,
+            "postgres://testuser:secret@db.example.com:5433/testdb?sslmode=require"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_user_without_password() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGUSER", "admin");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(url, "postgres://admin@localhost:5432");
+    }
+
+    #[test]
+    #[serial]
+    fn test_special_characters_in_password() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGUSER", "user");
+        env::set_var("PGPASSWORD", "p@ss:word/test");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // Special characters should be percent-encoded
+        assert!(url.contains("p%40ss%3Aword%2Ftest"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_special_characters_in_username() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGUSER", "user@domain");
+
+        let url = build_url_from_libpq_env().unwrap();
+        // @ in username should be percent-encoded
+        assert!(url.contains("user%40domain@"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_custom_port() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGPORT", "15432");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(url, "postgres://localhost:15432");
+    }
+
+    #[test]
+    #[serial]
+    fn test_sslmode_only_with_host() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGSSLMODE", "verify-full");
+
+        let url = build_url_from_libpq_env().unwrap();
+        assert_eq!(url, "postgres://localhost:5432?sslmode=verify-full");
+    }
 }
