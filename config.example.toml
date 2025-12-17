@@ -88,6 +88,24 @@ max_rows = 0
 # Auto-reconnect on connection loss
 auto_reconnect = true
 
+# Clipboard settings
+[clipboard]
+# Clipboard backend:
+# - "auto": On Linux Wayland, use wl-copy if available; otherwise use arboard
+# - "arboard": Always use arboard (built-in clipboard integration)
+# - "wl-copy": Always use wl-copy (requires wl-clipboard installed)
+# - "disabled": Disable clipboard support
+backend = "auto"
+
+# Command name/path for wl-copy when backend is "wl-copy" or "auto"
+wl_copy_cmd = "wl-copy"
+
+# Use the "primary" selection for wl-copy (passes -p)
+wl_copy_primary = false
+
+# Trim the trailing newline for wl-copy (passes -n)
+wl_copy_trim_newline = false
+
 # Keymap settings
 [keymap]
 # Use vim-style keybindings
