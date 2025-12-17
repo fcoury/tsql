@@ -49,12 +49,20 @@ fn print_version() {
     println!("tsql {}", env!("CARGO_PKG_VERSION"));
 }
 
+/// Result of building a connection URL from libpq environment variables.
+struct LibpqEnvResult {
+    /// The connection URL, if successfully built.
+    url: Option<String>,
+    /// Warning message to display to the user, if any.
+    warning: Option<String>,
+}
+
 /// Build a PostgreSQL connection URL from libpq-compatible environment variables.
 ///
 /// Supports: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE
 ///
-/// Returns None if no relevant environment variables are set.
-fn build_url_from_libpq_env() -> Option<String> {
+/// Returns a result containing the URL (if buildable) and any warning message.
+fn build_url_from_libpq_env() -> LibpqEnvResult {
     let host = env::var("PGHOST").ok();
     let port = env::var("PGPORT").ok();
     let database = env::var("PGDATABASE").ok();
@@ -64,7 +72,23 @@ fn build_url_from_libpq_env() -> Option<String> {
 
     // Need at least one of host or database to build a connection URL
     if host.is_none() && database.is_none() {
-        return None;
+        return LibpqEnvResult {
+            url: None,
+            warning: None,
+        };
+    }
+
+    // Validate port is numeric if provided
+    if let Some(ref p) = port {
+        if p.parse::<u16>().is_err() {
+            return LibpqEnvResult {
+                url: None,
+                warning: Some(format!(
+                    "PGPORT '{}' is not a valid port number, ignoring libpq env vars",
+                    p
+                )),
+            };
+        }
     }
 
     let host = host.unwrap_or_else(|| "localhost".to_string());
@@ -108,7 +132,10 @@ fn build_url_from_libpq_env() -> Option<String> {
         url.push_str(&utf8_percent_encode(ssl, URL_COMPONENT_ENCODE_SET).to_string());
     }
 
-    Some(url)
+    LibpqEnvResult {
+        url: Some(url),
+        warning: None,
+    }
 }
 
 fn print_usage() {
@@ -194,15 +221,16 @@ fn main() -> Result<()> {
     };
 
     // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
-    let conn_str = if args.len() > 1 && !args[1].starts_with('-') {
+    let (conn_str, libpq_warning) = if args.len() > 1 && !args[1].starts_with('-') {
         // First argument is the connection string
-        Some(args[1].clone())
-    } else {
+        (Some(args[1].clone()), None)
+    } else if let Ok(url) = env::var("DATABASE_URL") {
         // Fall back to DATABASE_URL environment variable
-        env::var("DATABASE_URL")
-            .ok()
-            // Then try libpq-compatible env vars (PGHOST, PGPORT, PGDATABASE, etc.)
-            .or_else(build_url_from_libpq_env)
+        (Some(url), None)
+    } else {
+        // Then try libpq-compatible env vars (PGHOST, PGPORT, PGDATABASE, etc.)
+        let result = build_url_from_libpq_env();
+        (result.url, result.warning)
     };
 
     let rt = Runtime::new().context("failed to initialize tokio runtime")?;
@@ -219,6 +247,11 @@ fn main() -> Result<()> {
         conn_str.clone(),
         cfg,
     );
+
+    // Display any warning from libpq env var parsing
+    if libpq_warning.is_some() {
+        app.last_status = libpq_warning;
+    }
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
     let session_connection = app.apply_session_state(session);
@@ -424,7 +457,9 @@ mod tests {
     #[serial]
     fn test_no_env_vars_returns_none() {
         clear_libpq_env_vars();
-        assert!(build_url_from_libpq_env().is_none());
+        let result = build_url_from_libpq_env();
+        assert!(result.url.is_none());
+        assert!(result.warning.is_none());
     }
 
     #[test]
@@ -433,7 +468,7 @@ mod tests {
         clear_libpq_env_vars();
         env::set_var("PGHOST", "db.example.com");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(url, "postgres://db.example.com:5432");
     }
 
@@ -443,7 +478,7 @@ mod tests {
         clear_libpq_env_vars();
         env::set_var("PGDATABASE", "mydb");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(url, "postgres://localhost:5432/mydb");
     }
 
@@ -458,7 +493,7 @@ mod tests {
         env::set_var("PGPASSWORD", "secret");
         env::set_var("PGSSLMODE", "require");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(
             url,
             "postgres://testuser:secret@db.example.com:5433/testdb?sslmode=require"
@@ -472,7 +507,7 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGUSER", "admin");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(url, "postgres://admin@localhost:5432");
     }
 
@@ -484,7 +519,7 @@ mod tests {
         env::set_var("PGUSER", "user");
         env::set_var("PGPASSWORD", "p@ss:word/test");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // Special characters should be percent-encoded
         assert!(url.contains("p%40ss%3Aword%2Ftest"));
     }
@@ -496,7 +531,7 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGUSER", "user@domain");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // @ in username should be percent-encoded
         assert!(url.contains("user%40domain@"));
     }
@@ -508,7 +543,7 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGPORT", "15432");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(url, "postgres://localhost:15432");
     }
 
@@ -519,7 +554,7 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGSSLMODE", "verify-full");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         assert_eq!(url, "postgres://localhost:5432?sslmode=verify-full");
     }
 
@@ -530,7 +565,7 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGDATABASE", "my db/test?foo");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // Space, slash, and question mark should be percent-encoded
         assert!(url.contains("/my%20db%2Ftest%3Ffoo"));
     }
@@ -543,7 +578,7 @@ mod tests {
         env::set_var("PGUSER", "user-name_test.org~");
         env::set_var("PGDATABASE", "my-db_name.test~");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // Unreserved characters (-, _, ., ~) should NOT be percent-encoded
         assert!(url.contains("user-name_test.org~@"));
         assert!(url.contains("/my-db_name.test~"));
@@ -556,7 +591,7 @@ mod tests {
         env::set_var("PGHOST", "::1");
         env::set_var("PGDATABASE", "testdb");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // IPv6 addresses should be wrapped in brackets
         assert_eq!(url, "postgres://[::1]:5432/testdb");
     }
@@ -568,7 +603,7 @@ mod tests {
         env::set_var("PGHOST", "2001:db8::1");
         env::set_var("PGPORT", "5433");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // IPv6 addresses should be wrapped in brackets
         assert_eq!(url, "postgres://[2001:db8::1]:5433");
     }
@@ -580,8 +615,36 @@ mod tests {
         env::set_var("PGHOST", "localhost");
         env::set_var("PGSSLMODE", "require&foo=bar");
 
-        let url = build_url_from_libpq_env().unwrap();
+        let url = build_url_from_libpq_env().url.unwrap();
         // Special characters in sslmode should be percent-encoded
         assert!(url.contains("?sslmode=require%26foo%3Dbar"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_pgport_returns_warning() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGPORT", "not_a_number");
+
+        let result = build_url_from_libpq_env();
+        // Invalid port should return no URL but a warning
+        assert!(result.url.is_none());
+        assert!(result.warning.is_some());
+        assert!(result.warning.unwrap().contains("not_a_number"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_pgport_out_of_range_returns_warning() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "localhost");
+        env::set_var("PGPORT", "99999"); // u16 max is 65535
+
+        let result = build_url_from_libpq_env();
+        // Out of range port should return no URL but a warning
+        assert!(result.url.is_none());
+        assert!(result.warning.is_some());
+        assert!(result.warning.unwrap().contains("99999"));
     }
 }
