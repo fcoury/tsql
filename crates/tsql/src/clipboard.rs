@@ -2,6 +2,7 @@ use crate::config::{ClipboardBackend, ClipboardConfig};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardBackendChoice {
@@ -58,20 +59,45 @@ pub fn copy_with_wl_copy(text: &str, cfg: &ClipboardConfig, cmd: &Path) -> Resul
             .map_err(|e| anyhow!("Failed to write to wl-copy stdin: {}", e))?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| anyhow!("Failed to wait for wl-copy: {}", e))?;
+    // `wl-copy` may keep running to serve clipboard requests (selection ownership).
+    // It typically forks into the background, but we should never block the TUI waiting for it.
+    // We only wait briefly to catch immediate failures; otherwise we detach and reap in a thread
+    // to avoid zombie processes once it exits.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| anyhow!("Failed to check wl-copy status: {}", e))?
+        {
+            Some(status) => {
+                let mut stderr_bytes = Vec::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_end(&mut stderr_bytes);
+                }
 
-    if output.status.success() {
-        return Ok(());
-    }
+                if status.success() {
+                    return Ok(());
+                }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        return Err(anyhow!("wl-copy failed with exit status {}", output.status));
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    return Err(anyhow!("wl-copy failed with exit status {}", status));
+                }
+                return Err(anyhow!("wl-copy failed: {}", stderr));
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
-    Err(anyhow!("wl-copy failed: {}", stderr))
 }
 
 fn is_wayland_session() -> bool {
