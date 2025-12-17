@@ -5856,22 +5856,52 @@ impl App {
         let started = Instant::now();
 
         self.rt.spawn(async move {
+            // Helper to close the cursor - consolidates all cleanup into one place.
+            // Safe to call multiple times (CLOSE on non-existent cursor is a no-op warning).
+            async fn close_cursor(client: &SharedClient) {
+                let guard = client.lock().await;
+                let _ = guard.simple_query("CLOSE tsql_cursor").await;
+            }
+
             let guard = client.lock().await;
 
-            // Declare cursor WITH HOLD so we can commit immediately and avoid
-            // keeping a transaction open while the user scrolls through results.
+            // Declare cursor WITH HOLD inside an explicit transaction.
+            // WITH HOLD allows the cursor to persist after COMMIT, so we can
+            // release the transaction while keeping the cursor open for paging.
             // This prevents holding locks and snapshots for idle paged queries.
+            if let Err(e) = guard.simple_query("BEGIN").await {
+                let _ = tx.send(DbEvent::QueryError {
+                    error: format!("Failed to begin transaction: {}", format_pg_error(&e)),
+                });
+                return;
+            }
+
             let cursor_query = format!(
                 "DECLARE tsql_cursor NO SCROLL CURSOR WITH HOLD FOR {}",
                 query.trim().trim_end_matches(';')
             );
-            let declare_result = guard.simple_query(&cursor_query).await;
-            if let Err(e) = declare_result {
+            if let Err(e) = guard.simple_query(&cursor_query).await {
+                // Rollback on failure - cursor wasn't created
+                let _ = guard.simple_query("ROLLBACK").await;
                 let _ = tx.send(DbEvent::QueryError {
                     error: format!("Failed to declare cursor: {}", format_pg_error(&e)),
                 });
                 return;
             }
+
+            // Commit the transaction - WITH HOLD cursor persists after commit
+            if let Err(e) = guard.simple_query("COMMIT").await {
+                let _ = tx.send(DbEvent::QueryError {
+                    error: format!(
+                        "Failed to commit cursor transaction: {}",
+                        format_pg_error(&e)
+                    ),
+                });
+                return;
+            }
+
+            // Track whether cursor is open for cleanup
+            let cursor_open = true;
 
             // Fetch first page to get headers and initial rows.
             // Bound the first fetch to max_rows if it's smaller than page_size.
@@ -5922,7 +5952,8 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    let _ = guard.simple_query("CLOSE tsql_cursor").await;
+                    drop(guard);
+                    close_cursor(&client).await;
                     let _ = tx.send(DbEvent::QueryError {
                         error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
                     });
@@ -5987,10 +6018,9 @@ impl App {
                 });
             }
 
-            // If done with first page (got all rows or hit max_rows), close cursor
+            // If done with first page (got all rows or hit max_rows), close cursor and return
             if done {
-                let guard = client.lock().await;
-                let _ = guard.simple_query("CLOSE tsql_cursor").await;
+                close_cursor(&client).await;
                 // Send final completion signal so paged_query state is cleared
                 let _ = tx.send(DbEvent::RowsAppended {
                     rows: vec![],
@@ -6009,8 +6039,6 @@ impl App {
 
                 // Check if we've already hit max_rows - don't fetch more
                 if total_fetched >= max_rows {
-                    let guard = client.lock().await;
-                    let _ = guard.simple_query("CLOSE tsql_cursor").await;
                     let _ = tx.send(DbEvent::RowsAppended {
                         rows: vec![],
                         done: true,
@@ -6052,12 +6080,10 @@ impl App {
                         });
 
                         if page_done {
-                            let _ = guard.simple_query("CLOSE tsql_cursor").await;
                             break;
                         }
                     }
                     Err(e) => {
-                        let _ = guard.simple_query("CLOSE tsql_cursor").await;
                         let _ = tx.send(DbEvent::QueryError {
                             error: format!("Failed to fetch rows: {}", format_pg_error(&e)),
                         });
@@ -6066,10 +6092,13 @@ impl App {
                 }
             }
 
-            // If we exit because the channel was closed (e.g., new query started),
-            // clean up the cursor (WITH HOLD cursors persist until explicitly closed)
-            let guard = client.lock().await;
-            let _ = guard.simple_query("CLOSE tsql_cursor").await;
+            // Final cleanup: close cursor if still open.
+            // This handles all exit paths: normal completion, max_rows hit, errors,
+            // and channel closure (e.g., new query started).
+            // WITH HOLD cursors persist until explicitly closed or session ends.
+            if cursor_open {
+                close_cursor(&client).await;
+            }
         });
     }
 
