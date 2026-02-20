@@ -58,6 +58,8 @@ pub enum KeySequenceAction {
     GotoTables,
     /// Go to the results grid
     GotoResults,
+    /// Open the history picker
+    GotoHistory,
 
     // ─────────────────────────────────────────────────────────────────────
     // Schema panel table templates (Enter + key)
@@ -205,6 +207,7 @@ impl<C> KeySequenceHandlerWithContext<C> {
                 'c' => Some(KeySequenceAction::GotoConnections),
                 's' => Some(KeySequenceAction::GotoTables),
                 'r' => Some(KeySequenceAction::GotoResults),
+                'h' => Some(KeySequenceAction::GotoHistory),
                 _ => None,
             },
             PendingKey::SchemaTable => match c {

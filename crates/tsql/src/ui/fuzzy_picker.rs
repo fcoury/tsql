@@ -21,6 +21,9 @@ use ratatui::{
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
 
+/// A function that returns an optional styled prefix `(text, style)` for a picker item.
+type PrefixFn<T> = fn(&T) -> Option<(&'static str, Style)>;
+
 /// Result of handling a key event in the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerAction<T> {
@@ -70,6 +73,12 @@ pub struct FuzzyPicker<T> {
     matcher: Matcher,
     /// Function to get display text from item.
     display_fn: fn(&T) -> String,
+    /// Optional pre-filter: items where this returns false are hidden entirely.
+    /// Crucially, `original_index` still refers to the full `items` slice so that
+    /// callers can use it as a stable index into the underlying data source.
+    filter_fn: Option<fn(&T) -> bool>,
+    /// Optional function returning a styled prefix string for an item (not fuzzy-matched).
+    prefix_fn: Option<PrefixFn<T>>,
     /// Popup area (set during render, used for mouse hit testing).
     popup_area: Option<Rect>,
     /// List area (set during render, used for mouse item selection).
@@ -100,11 +109,56 @@ impl<T: Clone> FuzzyPicker<T> {
             title: title.into(),
             matcher: Matcher::new(Config::DEFAULT),
             display_fn,
+            filter_fn: None,
+            prefix_fn: None,
             popup_area: None,
             list_area: None,
         };
         picker.update_filtered();
         picker
+    }
+
+    /// Set a pre-filter that hides items unconditionally (before fuzzy matching).
+    ///
+    /// Items that return `false` are excluded from the visible list, but they
+    /// remain in `items` so `original_index` continues to reflect stable positions
+    /// into the source collection.
+    pub fn with_filter(mut self, f: fn(&T) -> bool) -> Self {
+        self.filter_fn = Some(f);
+        self.update_filtered();
+        self
+    }
+
+    /// Set an optional per-item prefix rendered in a distinct style (not fuzzy-matched).
+    pub fn with_prefix(mut self, f: PrefixFn<T>) -> Self {
+        self.prefix_fn = Some(f);
+        self
+    }
+
+    /// Return the original-source index of the currently selected filtered item.
+    pub fn selected_original_index(&self) -> Option<usize> {
+        self.filtered.get(self.selected).map(|fi| fi.original_index)
+    }
+
+    /// Return the current selection index within the filtered list.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Set the selection index, clamping to the filtered list bounds.
+    pub fn set_selected(&mut self, index: usize) {
+        self.selected = if self.filtered.is_empty() {
+            0
+        } else {
+            index.min(self.filtered.len() - 1)
+        };
+    }
+
+    /// Replace the current query and re-filter (used to restore state after a picker rebuild).
+    pub fn set_query(&mut self, query: String) {
+        self.cursor = query.len();
+        self.query = query;
+        self.update_filtered();
     }
 
     /// Get the current query string.
@@ -417,13 +471,20 @@ impl<T: Clone> FuzzyPicker<T> {
                 let text = (self.display_fn)(&filtered_item.item);
                 let is_selected = i == self.selected;
 
-                let line = if filtered_item.indices.is_empty() {
-                    // No highlighting needed.
+                let mut body_line = if filtered_item.indices.is_empty() {
                     Line::from(text)
                 } else {
-                    // Highlight matched characters.
                     highlight_matches(&text, &filtered_item.indices)
                 };
+
+                // Prepend the styled prefix if provided.
+                if let Some(prefix_fn) = self.prefix_fn {
+                    if let Some((prefix_text, prefix_style)) = prefix_fn(&filtered_item.item) {
+                        let mut spans = vec![Span::styled(prefix_text, prefix_style)];
+                        spans.extend(body_line.spans);
+                        body_line = Line::from(spans);
+                    }
+                }
 
                 let style = if is_selected {
                     Style::default().bg(Color::DarkGray)
@@ -431,7 +492,7 @@ impl<T: Clone> FuzzyPicker<T> {
                     Style::default()
                 };
 
-                ListItem::new(line).style(style)
+                ListItem::new(body_line).style(style)
             })
             .collect();
 
@@ -495,11 +556,13 @@ impl<T: Clone> FuzzyPicker<T> {
         self.filtered.clear();
 
         if self.query.is_empty() {
-            // Show all items in reverse order (most recent first for history).
+            // Show items in reverse order (most recent first for history),
+            // applying any pre-filter.
             self.filtered = self
                 .items
                 .iter()
                 .enumerate()
+                .filter(|(_, item)| self.filter_fn.is_none_or(|f| f(item)))
                 .rev()
                 .map(|(i, item)| FilteredItem {
                     item: item.clone(),
@@ -515,6 +578,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 .items
                 .iter()
                 .enumerate()
+                .filter(|(_, item)| self.filter_fn.is_none_or(|f| f(item)))
                 .filter_map(|(i, item)| {
                     let text = (self.display_fn)(item);
                     let mut indices = Vec::new();

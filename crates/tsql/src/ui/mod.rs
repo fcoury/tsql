@@ -39,6 +39,6 @@ pub use key_sequence::{
     KeySequenceResult, PendingKey,
 };
 pub use password_prompt::{PasswordPrompt, PasswordPromptResult};
-pub use row_detail::{RowDetailAction, RowDetailModal};
+pub use row_detail::{RowDetailAction, RowDetailModal, YankFormat};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};

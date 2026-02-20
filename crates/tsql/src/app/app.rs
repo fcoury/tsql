@@ -47,6 +47,7 @@ use crate::ui::{
     KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
     PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
     SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
+    YankFormat,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -1028,6 +1029,8 @@ pub struct App {
     pub completion: CompletionPopup,
     pub schema_cache: SchemaCache,
     pub pending_key: Option<char>,
+    /// When true, run() will open the external editor after the current event.
+    pending_external_edit: bool,
     /// Key sequence handler for multi-key commands like `gg`, `gc`, etc.
     key_sequence: KeySequenceHandlerWithContext<SchemaTableContext>,
     /// Editor scroll offset (row, col) for horizontal scrolling support.
@@ -1072,6 +1075,8 @@ pub struct App {
     pub history: History,
     /// Fuzzy picker for history search (when open).
     pub history_picker: Option<FuzzyPicker<HistoryEntry>>,
+    /// When true, the history picker shows only pinned entries.
+    history_picker_pinned_only: bool,
 
     /// Last rendered area for query editor (for mouse click handling).
     render_query_area: Option<Rect>,
@@ -1217,6 +1222,7 @@ impl App {
             completion: CompletionPopup::new(),
             schema_cache: SchemaCache::new(),
             pending_key: None,
+            pending_external_edit: false,
             key_sequence: KeySequenceHandlerWithContext::new(key_sequence_timeout_ms),
             editor_scroll: (0, 0),
 
@@ -1244,6 +1250,7 @@ impl App {
 
             history,
             history_picker: None,
+            history_picker_pinned_only: false,
 
             render_query_area: None,
             render_grid_area: None,
@@ -2141,6 +2148,11 @@ impl App {
                     _ => {}
                 }
             }
+
+            if self.pending_external_edit {
+                self.pending_external_edit = false;
+                self.open_in_external_editor(terminal)?;
+            }
         }
 
         // Save session state before exiting (if enabled)
@@ -2255,10 +2267,15 @@ impl App {
                 self.completion.close();
                 self.cell_editor.close();
                 self.history_picker = None;
+                self.history_picker_pinned_only = false;
                 self.connection_picker = None;
                 self.pending_key = None;
                 self.last_error = None;
                 self.mode = Mode::Normal;
+            } else if matches!(self.focus, Focus::Grid) && !self.grid_state.selected_rows.is_empty()
+            {
+                // Clear grid selection before considering quit
+                self.grid_state.selected_rows.clear();
             } else {
                 // Nothing open - behave like 'q' and show quit confirmation
                 if self.editor.is_modified() {
@@ -2430,12 +2447,8 @@ impl App {
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
-                // Ctrl+Shift+C: Open connection manager
-                (code @ (KeyCode::Char('c') | KeyCode::Char('C')), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL)
-                        && (modifiers.contains(KeyModifiers::SHIFT)
-                            || matches!(code, KeyCode::Char('C'))) =>
-                {
+                // Ctrl+M: Open connection manager
+                (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
                     self.open_connection_manager();
                     return false;
                 }
@@ -2566,6 +2579,19 @@ impl App {
         match self.focus {
             Focus::Grid => {
                 if self.mode == Mode::Normal {
+                    // When a yank chord is in progress, the second key must be handled
+                    // directly regardless of keymap bindings (e.g. `j` in `yj` must not
+                    // trigger MoveDown).
+                    if self.grid_state.pending_yank {
+                        let result = self.grid_state.handle_key(key, &self.grid);
+                        self.maybe_fetch_more_rows();
+                        if let GridKeyResult::Yank { text, status } = result {
+                            self.copy_to_clipboard(&text);
+                            self.last_status = Some(status);
+                        }
+                        return false;
+                    }
+
                     // First, try to look up action in keymap
                     let result = if let Some(action) = self.grid_keymap.get_action(&key) {
                         // Handle special actions at the App level
@@ -2645,6 +2671,10 @@ impl App {
                         }
                         GridKeyResult::CopyToClipboard(text) => {
                             self.copy_to_clipboard(&text);
+                        }
+                        GridKeyResult::Yank { text, status } => {
+                            self.copy_to_clipboard(&text);
+                            self.last_status = Some(status);
                         }
                         GridKeyResult::ResizeColumn { col, action } => match action {
                             ResizeAction::Widen => self.grid.widen_column(col, 2),
@@ -2860,6 +2890,11 @@ impl App {
                 self.load_schema();
             }
 
+            // ':' opens the command prompt from any sidebar section
+            (KeyCode::Char(':'), KeyModifiers::NONE, _) => {
+                self.command.open();
+            }
+
             // Tab or Escape to leave sidebar
             (KeyCode::Tab, KeyModifiers::NONE, _) | (KeyCode::Esc, KeyModifiers::NONE, _) => {
                 self.focus = Focus::Query;
@@ -2920,10 +2955,12 @@ impl App {
                     self.editor.set_text(entry.query);
                     self.editor.mark_saved(); // Mark as unmodified since it's loaded content
                     self.history_picker = None;
+                    self.history_picker_pinned_only = false;
                     self.last_status = Some("Loaded from history".to_string());
                 }
                 PickerAction::Cancelled => {
                     self.history_picker = None;
+                    self.history_picker_pinned_only = false;
                 }
                 PickerAction::Continue => {}
             }
@@ -3319,18 +3356,33 @@ impl App {
 
         match modal.handle_key(key) {
             RowDetailAction::Continue => {
-                // Put the modal back
                 self.row_detail = Some(modal);
             }
             RowDetailAction::Close => {
                 // Modal is already taken, just don't put it back
             }
             RowDetailAction::Edit { col } => {
-                // Get the row from the modal before closing
                 let row = self.grid_state.cursor_row;
-                // Close the detail modal first
-                // Then start editing the selected field
                 self.start_cell_edit(row, col);
+            }
+            RowDetailAction::Yank(fmt) => {
+                let row = self.grid_state.cursor_row;
+                let indices = &[row];
+                let (text, label) = match fmt {
+                    YankFormat::Tsv => (self.grid.rows_as_tsv(indices, false), "TSV"),
+                    YankFormat::TsvHeaders => {
+                        (self.grid.rows_as_tsv(indices, true), "TSV (with headers)")
+                    }
+                    YankFormat::Json => (self.grid.row_as_json(row).unwrap_or_default(), "JSON"),
+                    YankFormat::Csv => (self.grid.rows_as_csv(indices, false), "CSV"),
+                    YankFormat::CsvHeaders => {
+                        (self.grid.rows_as_csv(indices, true), "CSV (with headers)")
+                    }
+                    YankFormat::Markdown => (self.grid.rows_as_markdown(indices), "Markdown"),
+                };
+                self.copy_to_clipboard(&text);
+                self.last_status = Some(format!("Row copied as {label}"));
+                self.row_detail = Some(modal);
             }
         }
         false
@@ -3932,6 +3984,16 @@ impl App {
             }
             "connections" | "conn" => {
                 self.open_connection_manager();
+            }
+            "sbt" | "sidebar-toggle" => {
+                if self.sidebar_visible {
+                    self.sidebar_visible = false;
+                    if matches!(self.focus, Focus::Sidebar(_)) {
+                        self.focus = Focus::Query;
+                    }
+                } else {
+                    self.focus_schema();
+                }
             }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
@@ -4578,6 +4640,17 @@ impl App {
                             }
                             return;
                         }
+                        // vv - open query in external editor
+                        ('v', KeyCode::Char('v'), KeyModifiers::NONE) => {
+                            self.pending_external_edit = true;
+                            return;
+                        }
+                        // v<anything> - start visual mode (second key discarded)
+                        ('v', _, _) => {
+                            self.editor.textarea.start_selection();
+                            self.mode = Mode::Visual;
+                            return;
+                        }
                         _ => {
                             // Unknown combo, ignore pending
                             return;
@@ -4747,11 +4820,9 @@ impl App {
                         self.editor.textarea.redo();
                     }
 
-                    // Visual mode.
+                    // Visual mode / external editor (vv).
                     (KeyCode::Char('v'), KeyModifiers::NONE) => {
-                        self.pending_key = None;
-                        self.editor.textarea.start_selection();
-                        self.mode = Mode::Visual;
+                        self.pending_key = Some('v');
                     }
 
                     // Paste.
@@ -4885,6 +4956,17 @@ impl App {
                         }
                         Action::GotoResults => {
                             self.focus = Focus::Grid;
+                            return;
+                        }
+                        Action::ToggleSidebar => {
+                            if self.sidebar_visible {
+                                self.sidebar_visible = false;
+                                if matches!(self.focus, Focus::Sidebar(_)) {
+                                    self.focus = Focus::Query;
+                                }
+                            } else {
+                                self.focus_schema();
+                            }
                             return;
                         }
                         _ => {}
@@ -5147,9 +5229,14 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
-        // Try to get the password from keychain or env var
-        // Use timeout to avoid blocking UI if keychain shows permission dialog
-        let password = match entry.get_password_with_timeout(500) {
+        // Try to get the password from keychain / env var / 1Password.
+        // Give 1Password more time since it shells out to `op`.
+        let timeout_ms = if entry.password_onepassword.is_some() {
+            5000
+        } else {
+            500
+        };
+        let password = match entry.get_password_with_timeout(timeout_ms) {
             Ok(Some(pwd)) => Some(pwd),
             Ok(None) => None,
             Err(e) => {
@@ -5198,7 +5285,7 @@ impl App {
         let entries: Vec<ConnectionEntry> =
             self.connections.sorted().into_iter().cloned().collect();
 
-        let picker = FuzzyPicker::with_display(entries, "Connect (Ctrl+O: manage)", |entry| {
+        let picker = FuzzyPicker::with_display(entries, "Connect (Ctrl+M: manage)", |entry| {
             // Display: "[fav] name - user@host/db"
             let fav = entry
                 .favorite
@@ -5212,8 +5299,8 @@ impl App {
 
     /// Handle key events when connection picker is open.
     fn handle_connection_picker_key(&mut self, key: KeyEvent) -> bool {
-        // Check for Ctrl+O to open connection manager
-        if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
+        // Check for Ctrl+M to open connection manager
+        if key.code == KeyCode::Char('m') && key.modifiers == KeyModifiers::CONTROL {
             self.connection_picker = None;
             self.open_connection_manager();
             return false;
@@ -5399,6 +5486,9 @@ impl App {
             }
             KeySequenceAction::GotoResults => {
                 self.focus = Focus::Grid;
+            }
+            KeySequenceAction::GotoHistory => {
+                self.open_history_picker();
             }
 
             KeySequenceAction::SchemaTableSelect
@@ -5837,6 +5927,64 @@ impl App {
 
             self.completion.close();
         }
+    }
+
+    fn open_in_external_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut tmp = tempfile::Builder::new().suffix(".sql").tempfile()?;
+        write!(tmp, "{}", self.editor.text())?;
+        tmp.flush()?;
+        let path = tmp.path().to_owned();
+
+        // Suspend TUI
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+
+        // Resolve editor: $VISUAL > $EDITOR > vi
+        let editor_bin = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+
+        let spawn_result = std::process::Command::new(&editor_bin).arg(&path).status();
+
+        // Always re-initialize terminal before handling spawn result
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )?;
+        terminal.clear()?;
+        self.last_cursor_style = None;
+
+        match spawn_result {
+            Ok(status) if status.success() => {
+                let content = std::fs::read_to_string(&path)?;
+                let content = content.trim_end_matches('\n').to_string();
+                self.editor.set_text(content);
+                self.last_status = Some(format!("Loaded from {}", editor_bin));
+            }
+            Ok(status) => {
+                self.last_error = Some(format!(
+                    "Editor '{}' exited with status {}",
+                    editor_bin, status
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed to launch '{}': {}", editor_bin, e));
+            }
+        }
+
+        Ok(())
     }
 
     fn execute_query(&mut self) {
@@ -6698,19 +6846,126 @@ impl App {
             return;
         }
 
-        // Create picker with history entries.
+        // Always pass the full history so that original_index values remain
+        // stable indices into self.history, regardless of any active pre-filter.
         let entries: Vec<HistoryEntry> = self.history.entries().to_vec();
-        let picker = FuzzyPicker::with_display(
-            entries,
-            format!("History (Ctrl-R) - {} queries", self.history.len()),
-            |entry| entry.query.clone(),
-        );
+        let pinned_count = entries.iter().filter(|e| e.pinned).count();
+
+        if self.history_picker_pinned_only && pinned_count == 0 {
+            self.last_status = Some("No pinned queries".to_string());
+            self.history_picker = None;
+            return;
+        }
+
+        let total = self.history.len();
+        let title = if self.history_picker_pinned_only {
+            format!(
+                "History [PINNED] - {} pinned | C-t all  C-b unpin  C-d delete",
+                pinned_count
+            )
+        } else if pinned_count > 0 {
+            format!(
+                "History - {} queries, {} pinned | C-t pinned  C-b pin/unpin  C-d delete",
+                total, pinned_count
+            )
+        } else {
+            format!("History - {} queries | C-b pin  C-d delete", total)
+        };
+
+        let picker = FuzzyPicker::with_display(entries, title, |entry| entry.query.clone())
+            .with_filter(if self.history_picker_pinned_only {
+                |entry: &HistoryEntry| entry.pinned
+            } else {
+                |_: &HistoryEntry| true
+            })
+            .with_prefix(|entry| {
+                if entry.pinned {
+                    Some(("* ", Style::default().fg(Color::Magenta)))
+                } else {
+                    None
+                }
+            });
 
         self.history_picker = Some(picker);
     }
 
     /// Handle key events when history picker is open.
     fn handle_history_picker_key(&mut self, key: KeyEvent) -> bool {
+        // Intercept Ctrl-t to toggle between full history and pinned-only view.
+        if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
+            let saved_query = self.history_picker.as_ref().map(|p| p.query().to_string());
+            let saved_selected = self.history_picker.as_ref().map(|p| p.selected());
+            self.history_picker_pinned_only = !self.history_picker_pinned_only;
+            self.open_history_picker();
+            if let Some(picker) = self.history_picker.as_mut() {
+                if let Some(q) = saved_query {
+                    if !q.is_empty() {
+                        picker.set_query(q);
+                    }
+                }
+                if let Some(sel) = saved_selected {
+                    picker.set_selected(sel);
+                }
+            }
+            return false;
+        }
+
+        // Intercept Ctrl-b to toggle pin on the currently highlighted entry.
+        if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL {
+            let saved_query = self.history_picker.as_ref().map(|p| p.query().to_string());
+            let saved_selected = self.history_picker.as_ref().map(|p| p.selected());
+            let original_idx = self
+                .history_picker
+                .as_ref()
+                .and_then(|p| p.selected_original_index());
+            if let Some(idx) = original_idx {
+                self.history.toggle_pin(idx);
+                self.open_history_picker();
+                if let Some(picker) = self.history_picker.as_mut() {
+                    if let Some(q) = saved_query {
+                        if !q.is_empty() {
+                            picker.set_query(q);
+                        }
+                    }
+                    if let Some(sel) = saved_selected {
+                        picker.set_selected(sel);
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Intercept Ctrl-d to delete the currently highlighted entry without confirmation.
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            let saved_query = self.history_picker.as_ref().map(|p| p.query().to_string());
+            let saved_selected = self.history_picker.as_ref().map(|p| p.selected());
+            let original_idx = self
+                .history_picker
+                .as_ref()
+                .and_then(|p| p.selected_original_index());
+            if let Some(idx) = original_idx {
+                self.history.remove(idx);
+                if self.history.is_empty() {
+                    self.history_picker = None;
+                    self.history_picker_pinned_only = false;
+                    self.last_status = Some("History cleared".to_string());
+                } else {
+                    self.open_history_picker();
+                    if let Some(picker) = self.history_picker.as_mut() {
+                        if let Some(q) = saved_query {
+                            if !q.is_empty() {
+                                picker.set_query(q);
+                            }
+                        }
+                        if let Some(sel) = saved_selected {
+                            picker.set_selected(sel);
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
         let picker = match self.history_picker.as_mut() {
             Some(p) => p,
             None => return false,
@@ -6723,11 +6978,13 @@ impl App {
                 self.editor.set_text(entry.query);
                 self.editor.mark_saved(); // Mark as unmodified since it's loaded content
                 self.history_picker = None;
+                self.history_picker_pinned_only = false;
                 self.last_status = Some("Loaded from history".to_string());
                 false
             }
             PickerAction::Cancelled => {
                 self.history_picker = None;
+                self.history_picker_pinned_only = false;
                 false
             }
         }
@@ -7825,8 +8082,9 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_string(&mut app, "postgres");
 
-        // Tab to Password, then SavePassword, then SSL mode, then Host
+        // Tab to Password, then OnePasswordRef, then SavePassword, then SSL mode, then Host
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Password
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // OnePasswordRef
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SavePassword
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SslMode
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host (already localhost)

@@ -551,11 +551,8 @@ impl Keymap {
             Action::ClearSelection,
         );
 
-        // Copy
-        km.bind(
-            KeyBinding::new(KeyCode::Char('y'), KeyModifiers::NONE),
-            Action::CopySelection,
-        );
+        // Copy — y enters pending-yank mode (handled directly in GridState::handle_key).
+        // Ctrl+C copies current row / selection as TSV (legacy shortcut).
         km.bind(
             KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Action::CopySelection,
@@ -670,10 +667,6 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('a'), KeyModifiers::NONE),
             Action::EnterInsertMode,
         ); // append
-        km.bind(
-            KeyBinding::new(KeyCode::Char('v'), KeyModifiers::NONE),
-            Action::EnterVisualMode,
-        );
         km.bind(
             KeyBinding::new(KeyCode::Char(':'), KeyModifiers::NONE),
             Action::EnterCommandMode,

@@ -181,6 +181,9 @@ pub struct ConnectionEntry {
     /// Environment variable name containing password (fallback)
     #[serde(default)]
     pub password_env: Option<String>,
+    /// 1Password secret reference (e.g. "op://vault/item/field")
+    #[serde(default)]
+    pub password_onepassword: Option<String>,
     /// Whether this connection requires no password (auto-detected when saved with empty password)
     #[serde(default)]
     pub no_password_required: bool,
@@ -209,6 +212,7 @@ impl Default for ConnectionEntry {
             user: String::new(),
             password_in_keychain: false,
             password_env: None,
+            password_onepassword: None,
             no_password_required: false,
             color: ConnectionColor::None,
             favorite: None,
@@ -318,6 +322,7 @@ impl ConnectionEntry {
             user,
             password_in_keychain: false,
             password_env: None,
+            password_onepassword: None,
             no_password_required,
             color: ConnectionColor::None,
             favorite: None,
@@ -381,6 +386,21 @@ impl ConnectionEntry {
             }
         }
 
+        // Try 1Password CLI (via shell to inherit PATH and op session)
+        if let Some(ref op_ref) = self.password_onepassword {
+            let cmd = format!("op read '{}'", op_ref.replace('\'', "'\\''"));
+            if let Ok(out) = std::process::Command::new("/bin/sh")
+                .args(["-c", &cmd])
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                if out.status.success() {
+                    let pwd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    return Ok(Some(pwd));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -407,17 +427,40 @@ impl ConnectionEntry {
             }
         }
 
-        // If not configured for keychain, return None
-        if !self.password_in_keychain {
+        // If neither keychain nor 1Password is configured, return None
+        if !self.password_in_keychain && self.password_onepassword.is_none() {
             return Ok(None);
         }
 
-        // Spawn keychain access in a separate thread with timeout
+        let use_keychain = self.password_in_keychain;
+        let op_ref = self.password_onepassword.clone();
+
+        // Spawn blocking retrieval in a separate thread with timeout
         let name = self.name.clone();
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
             let result = (|| -> Result<Option<String>> {
+                // Try 1Password CLI first if configured (via shell to
+                // inherit PATH and op session tokens)
+                if let Some(ref op_ref) = op_ref {
+                    let cmd = format!("op read '{}'", op_ref.replace('\'', "'\\''"));
+                    if let Ok(out) = std::process::Command::new("/bin/sh")
+                        .args(["-c", &cmd])
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                    {
+                        if out.status.success() {
+                            let pwd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            return Ok(Some(pwd));
+                        }
+                    }
+                }
+
+                if !use_keychain {
+                    return Ok(None);
+                }
+
                 let entry = keyring::Entry::new(KEYRING_SERVICE, &name)
                     .context("Failed to create keyring entry")?;
 
