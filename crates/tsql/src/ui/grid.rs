@@ -42,8 +42,10 @@ pub enum GridKeyResult {
     OpenSearch,
     /// Open command prompt.
     OpenCommand,
-    /// Copy text to clipboard.
+    /// Copy text to clipboard (no status message).
     CopyToClipboard(String),
+    /// Copy text to clipboard and show a status message.
+    Yank { text: String, status: String },
     /// Resize a column.
     ResizeColumn { col: usize, action: ResizeAction },
     /// Edit the current cell.
@@ -195,6 +197,8 @@ pub struct GridState {
     pub search: GridSearch,
     /// Whether to show full UUIDs (true) or truncated (false, default).
     pub uuid_expanded: bool,
+    /// True when the user has pressed `y` and we are waiting for the format key.
+    pub pending_yank: bool,
 }
 
 impl GridState {
@@ -202,6 +206,65 @@ impl GridState {
     pub fn handle_key(&mut self, key: KeyEvent, model: &GridModel) -> GridKeyResult {
         let row_count = model.rows.len();
         let col_count = model.headers.len();
+
+        // Pending yank: y was pressed, now waiting for the format key.
+        if self.pending_yank {
+            self.pending_yank = false;
+            if row_count == 0 {
+                return GridKeyResult::None;
+            }
+            let indices: Vec<usize> = if self.selected_rows.is_empty() {
+                vec![self.cursor_row]
+            } else {
+                self.selected_rows.iter().copied().collect()
+            };
+            let n = indices.len();
+            let label = if n == 1 {
+                "row".to_string()
+            } else {
+                format!("{} rows", n)
+            };
+            return match (key.code, key.modifiers) {
+                // yy - TSV (no headers)
+                (KeyCode::Char('y'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: model.rows_as_tsv(&indices, false),
+                    status: format!("Yanked {} as TSV", label),
+                },
+                // yY - TSV with headers
+                (KeyCode::Char('Y'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('Y'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: model.rows_as_tsv(&indices, true),
+                    status: format!("Yanked {} as TSV (with headers)", label),
+                },
+                // yj - JSON
+                (KeyCode::Char('j'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: if n == 1 {
+                        model.row_as_json(indices[0]).unwrap_or_default()
+                    } else {
+                        model.rows_as_json(&indices)
+                    },
+                    status: format!("Yanked {} as JSON", label),
+                },
+                // yc - CSV (no headers)
+                (KeyCode::Char('c'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: model.rows_as_csv(&indices, false),
+                    status: format!("Yanked {} as CSV", label),
+                },
+                // yC - CSV with headers
+                (KeyCode::Char('C'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('C'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: model.rows_as_csv(&indices, true),
+                    status: format!("Yanked {} as CSV (with headers)", label),
+                },
+                // ym - Markdown table
+                (KeyCode::Char('m'), KeyModifiers::NONE) => GridKeyResult::Yank {
+                    text: model.rows_as_markdown(&indices),
+                    status: format!("Yanked {} as Markdown", label),
+                },
+                // Unknown second key: cancel silently
+                _ => GridKeyResult::None,
+            };
+        }
 
         match (key.code, key.modifiers) {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
@@ -262,12 +325,22 @@ impl GridState {
                 } else {
                     self.selected_rows.insert(self.cursor_row);
                 }
+                // Advance cursor so holding Space continuously selects rows.
+                self.cursor_row = (self.cursor_row + 1).min(row_count - 1);
             }
+            // a - select all; deselect all if everything is already selected
             (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                self.selected_rows.clear();
-                for i in 0..row_count {
-                    self.selected_rows.insert(i);
+                if self.selected_rows.len() == row_count {
+                    self.selected_rows.clear();
+                } else {
+                    self.selected_rows = (0..row_count).collect();
                 }
+            }
+            // A - invert selection
+            (KeyCode::Char('A'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('A'), KeyModifiers::NONE) => {
+                let all: BTreeSet<usize> = (0..row_count).collect();
+                self.selected_rows = all.difference(&self.selected_rows).copied().collect();
             }
 
             // Search controls.
@@ -296,39 +369,11 @@ impl GridState {
                 }
             }
 
-            // Copy controls.
-            // y - yank current row (or selected rows if any)
+            // Copy controls — y enters pending-yank mode; format key follows.
+            // yy=TSV  yY=TSV+headers  yj=JSON  yc=CSV  yC=CSV+headers  ym=Markdown
             (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                if row_count == 0 {
-                    return GridKeyResult::None;
-                }
-
-                let text = if self.selected_rows.is_empty() {
-                    // Copy current row
-                    model.row_as_tsv(self.cursor_row).unwrap_or_default()
-                } else {
-                    // Copy selected rows
-                    let indices: Vec<usize> = self.selected_rows.iter().copied().collect();
-                    model.rows_as_tsv(&indices, false)
-                };
-
-                return GridKeyResult::CopyToClipboard(text);
-            }
-            // Y - yank with headers (Shift+Y sends SHIFT modifier)
-            (KeyCode::Char('Y'), KeyModifiers::SHIFT)
-            | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
-                if row_count == 0 {
-                    return GridKeyResult::None;
-                }
-
-                let indices: Vec<usize> = if self.selected_rows.is_empty() {
-                    vec![self.cursor_row]
-                } else {
-                    self.selected_rows.iter().copied().collect()
-                };
-
-                let text = model.rows_as_tsv(&indices, true);
-                return GridKeyResult::CopyToClipboard(text);
+                self.pending_yank = true;
+                return GridKeyResult::None;
             }
             // c - copy current cell
             (KeyCode::Char('c'), KeyModifiers::NONE) => {
@@ -477,11 +522,13 @@ impl GridState {
                 } else {
                     self.selected_rows.insert(self.cursor_row);
                 }
+                self.cursor_row = (self.cursor_row + 1).min(row_count - 1);
             }
             Action::GridSelectAll => {
-                self.selected_rows.clear();
-                for i in 0..row_count {
-                    self.selected_rows.insert(i);
+                if self.selected_rows.len() == row_count {
+                    self.selected_rows.clear();
+                } else {
+                    self.selected_rows = (0..row_count).collect();
                 }
             }
             Action::ClearSelection => {
@@ -966,6 +1013,42 @@ impl GridModel {
             .collect();
 
         format!("[\n{}\n]", objects.join(",\n"))
+    }
+
+    /// Format rows as a GitHub-flavored markdown table (always includes headers).
+    pub fn rows_as_markdown(&self, row_indices: &[usize]) -> String {
+        if self.headers.is_empty() {
+            return String::new();
+        }
+
+        let escape_cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+
+        let header_row = format!(
+            "| {} |",
+            self.headers
+                .iter()
+                .map(|h| escape_cell(h))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        let sep_row = format!("| {} |", vec!["---"; self.headers.len()].join(" | "));
+        let data_rows: Vec<String> = row_indices
+            .iter()
+            .filter_map(|&idx| self.rows.get(idx))
+            .map(|row| {
+                format!(
+                    "| {} |",
+                    row.iter()
+                        .map(|v| escape_cell(v))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
+            })
+            .collect();
+
+        let mut lines = vec![header_row, sep_row];
+        lines.extend(data_rows);
+        lines.join("\n")
     }
 
     /// Widen a column by a given amount.
@@ -1890,21 +1973,28 @@ mod tests {
         let mut state = GridState::default();
         let model = create_test_model();
 
-        // Press 'Y' (shift+y) to yank with headers
-        // Note: In real terminal, Shift+Y sends KeyModifiers::SHIFT
-        let key = KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT);
-        let result = state.handle_key(key, &model);
+        // Press 'y' to enter pending-yank mode, then 'Y' for TSV with headers.
+        let y_key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let result = state.handle_key(y_key, &model);
+        assert!(
+            matches!(result, GridKeyResult::None),
+            "First 'y' should return None (pending)"
+        );
+        assert!(state.pending_yank, "'y' should set pending_yank");
+
+        let upper_y = KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT);
+        let result = state.handle_key(upper_y, &model);
 
         match result {
-            GridKeyResult::CopyToClipboard(text) => {
+            GridKeyResult::Yank { text, .. } => {
                 assert!(
                     text.starts_with("id\tname\n"),
-                    "Yank with headers should start with header row, got: {}",
+                    "yY should start with header row, got: {}",
                     text
                 );
                 assert!(text.contains("1\tAlice"), "Should contain the row data");
             }
-            _ => panic!("Expected CopyToClipboard result, got {:?}", result),
+            _ => panic!("Expected Yank result, got {:?}", result),
         }
     }
 

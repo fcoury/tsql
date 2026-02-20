@@ -26,6 +26,7 @@ pub enum FormField {
     Database,
     User,
     Password,
+    OnePasswordRef,
     SavePassword,
     SslMode,
     Color,
@@ -34,12 +35,13 @@ pub enum FormField {
 
 impl FormField {
     /// Get the next field in tab order
-    /// Order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+    /// Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
     pub fn next(self) -> Self {
         match self {
             FormField::Name => FormField::User,
             FormField::User => FormField::Password,
-            FormField::Password => FormField::SavePassword,
+            FormField::Password => FormField::OnePasswordRef,
+            FormField::OnePasswordRef => FormField::SavePassword,
             FormField::SavePassword => FormField::SslMode,
             FormField::SslMode => FormField::Host,
             FormField::Host => FormField::Port,
@@ -56,7 +58,8 @@ impl FormField {
             FormField::Name => FormField::UrlPaste,
             FormField::User => FormField::Name,
             FormField::Password => FormField::User,
-            FormField::SavePassword => FormField::Password,
+            FormField::OnePasswordRef => FormField::Password,
+            FormField::SavePassword => FormField::OnePasswordRef,
             FormField::SslMode => FormField::SavePassword,
             FormField::Host => FormField::SslMode,
             FormField::Port => FormField::Host,
@@ -107,6 +110,7 @@ pub struct ConnectionFormModal {
     database: String,
     user: String,
     password: String,
+    op_ref: String,
     save_password: bool,
     ssl_mode: SslMode,
     color: ConnectionColor,
@@ -119,6 +123,7 @@ pub struct ConnectionFormModal {
     database_cursor: usize,
     user_cursor: usize,
     password_cursor: usize,
+    op_ref_cursor: usize,
     url_paste_cursor: usize,
 
     /// Currently focused field
@@ -158,6 +163,7 @@ struct OriginalFormValues {
     database: String,
     user: String,
     password: String,
+    op_ref: String,
     save_password: bool,
     ssl_mode: SslMode,
     color: ConnectionColor,
@@ -178,6 +184,7 @@ impl ConnectionFormModal {
             database: String::new(),
             user: String::new(),
             password: String::new(),
+            op_ref: String::new(),
             save_password: false,
             ssl_mode: SslMode::Disable,
             color: ConnectionColor::None,
@@ -189,6 +196,7 @@ impl ConnectionFormModal {
             database_cursor: 0,
             user_cursor: 0,
             password_cursor: 0,
+            op_ref_cursor: 0,
             url_paste_cursor: 0,
 
             focused: FormField::Name,
@@ -219,6 +227,7 @@ impl ConnectionFormModal {
         keymap: Keymap,
     ) -> Self {
         let password = existing_password.unwrap_or_default();
+        let op_ref = entry.password_onepassword.clone().unwrap_or_default();
         let color_index = ConnectionColor::all_names()
             .iter()
             .position(|&c| c == entry.color.to_string())
@@ -231,6 +240,7 @@ impl ConnectionFormModal {
             database: entry.database.clone(),
             user: entry.user.clone(),
             password: password.clone(),
+            op_ref: op_ref.clone(),
             save_password: entry.password_in_keychain,
             ssl_mode: entry.ssl_mode.unwrap_or(SslMode::Disable),
             color: entry.color,
@@ -246,6 +256,7 @@ impl ConnectionFormModal {
             database: entry.database.clone(),
             user: entry.user.clone(),
             password: password.clone(),
+            op_ref: op_ref.clone(),
             save_password: entry.password_in_keychain,
             ssl_mode,
             color: entry.color,
@@ -257,6 +268,7 @@ impl ConnectionFormModal {
             database_cursor: entry.database.len(),
             user_cursor: entry.user.len(),
             password_cursor: password.len(),
+            op_ref_cursor: op_ref.len(),
             url_paste_cursor: 0,
 
             focused: FormField::Name,
@@ -296,6 +308,7 @@ impl ConnectionFormModal {
                 || self.database != orig.database
                 || self.user != orig.user
                 || self.password != orig.password
+                || self.op_ref != orig.op_ref
                 || self.save_password != orig.save_password
                 || self.ssl_mode != orig.ssl_mode
                 || self.color != orig.color;
@@ -475,6 +488,7 @@ impl ConnectionFormModal {
             FormField::Database => Some((&mut self.database, &mut self.database_cursor)),
             FormField::User => Some((&mut self.user, &mut self.user_cursor)),
             FormField::Password => Some((&mut self.password, &mut self.password_cursor)),
+            FormField::OnePasswordRef => Some((&mut self.op_ref, &mut self.op_ref_cursor)),
             FormField::UrlPaste => Some((&mut self.url_paste, &mut self.url_paste_cursor)),
             FormField::SavePassword | FormField::SslMode | FormField::Color => None,
         }
@@ -649,6 +663,11 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: self.save_password && !self.password.is_empty(),
             password_env: None,
+            password_onepassword: if self.op_ref.is_empty() {
+                None
+            } else {
+                Some(self.op_ref.clone())
+            },
             no_password_required,
             color: self.color,
             favorite: None, // Preserve from original if editing
@@ -701,6 +720,7 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: false,
             password_env: None,
+            password_onepassword: None,
             no_password_required: false,
             color: ConnectionColor::None,
             favorite: None,
@@ -723,7 +743,7 @@ impl ConnectionFormModal {
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         // Calculate modal size
         let modal_width = 60u16.min(area.width - 4);
-        let modal_height = 19u16.min(area.height - 2);
+        let modal_height = 20u16.min(area.height - 2);
         let modal_x = (area.width - modal_width) / 2;
         let modal_y = (area.height - modal_height) / 2;
 
@@ -751,12 +771,13 @@ impl ConnectionFormModal {
         frame.render_widget(block, modal_area);
 
         // Layout the form fields
-        // Order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+        // Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
         let chunks = Layout::vertical([
             Constraint::Length(1), // Name
             Constraint::Length(1), // Separator
             Constraint::Length(1), // User
             Constraint::Length(1), // Password
+            Constraint::Length(1), // 1Password ref
             Constraint::Length(1), // Save password checkbox
             Constraint::Length(1), // SSL mode
             Constraint::Length(1), // Separator
@@ -790,18 +811,26 @@ impl ConnectionFormModal {
             FormField::User,
         );
         self.render_password_field(frame, chunks[3]);
-        self.render_checkbox(
+        self.render_text_field(
             frame,
             chunks[4],
+            "op ref:",
+            &self.op_ref,
+            self.op_ref_cursor,
+            FormField::OnePasswordRef,
+        );
+        self.render_checkbox(
+            frame,
+            chunks[5],
             "Save to keychain",
             self.save_password,
             FormField::SavePassword,
         );
-        self.render_ssl_mode_field(frame, chunks[5]);
-        self.render_separator(frame, chunks[6]);
+        self.render_ssl_mode_field(frame, chunks[6]);
+        self.render_separator(frame, chunks[7]);
         self.render_text_field(
             frame,
-            chunks[7],
+            chunks[8],
             "Host:",
             &self.host,
             self.host_cursor,
@@ -809,7 +838,7 @@ impl ConnectionFormModal {
         );
         self.render_text_field(
             frame,
-            chunks[8],
+            chunks[9],
             "Port:",
             &self.port,
             self.port_cursor,
@@ -817,17 +846,17 @@ impl ConnectionFormModal {
         );
         self.render_text_field(
             frame,
-            chunks[9],
+            chunks[10],
             "Database:",
             &self.database,
             self.database_cursor,
             FormField::Database,
         );
-        self.render_separator(frame, chunks[10]);
-        self.render_color_field(frame, chunks[11]);
-        self.render_url_paste_field(frame, chunks[12]);
-        self.render_separator(frame, chunks[13]);
-        self.render_help(frame, chunks[14]);
+        self.render_separator(frame, chunks[11]);
+        self.render_color_field(frame, chunks[12]);
+        self.render_url_paste_field(frame, chunks[13]);
+        self.render_separator(frame, chunks[14]);
+        self.render_help(frame, chunks[15]);
     }
 
     fn render_text_field(
@@ -1097,15 +1126,19 @@ mod tests {
 
     #[test]
     fn test_form_field_navigation() {
-        // New order: Name → User → Password → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+        // Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
         assert_eq!(FormField::Name.next(), FormField::User);
         assert_eq!(FormField::User.next(), FormField::Password);
-        assert_eq!(FormField::Password.next(), FormField::SavePassword);
+        assert_eq!(FormField::Password.next(), FormField::OnePasswordRef);
+        assert_eq!(FormField::OnePasswordRef.next(), FormField::SavePassword);
         assert_eq!(FormField::SavePassword.next(), FormField::SslMode);
         assert_eq!(FormField::SslMode.next(), FormField::Host);
         assert_eq!(FormField::UrlPaste.next(), FormField::Name);
         assert_eq!(FormField::Name.prev(), FormField::UrlPaste);
         assert_eq!(FormField::User.prev(), FormField::Name);
+        assert_eq!(FormField::Password.prev(), FormField::User);
+        assert_eq!(FormField::OnePasswordRef.prev(), FormField::Password);
+        assert_eq!(FormField::SavePassword.prev(), FormField::OnePasswordRef);
         assert_eq!(FormField::Host.prev(), FormField::SslMode);
     }
 

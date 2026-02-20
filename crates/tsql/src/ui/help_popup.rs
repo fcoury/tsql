@@ -56,12 +56,16 @@ pub struct HelpPopup {
     sections: &'static [HelpSection],
     /// Current scroll offset (in lines).
     scroll_offset: usize,
-    /// Total number of renderable lines.
+    /// Total number of renderable lines (recalculated when filter changes).
     total_lines: usize,
     /// Visible height (set during render).
     visible_height: usize,
     /// Popup area (set during render, used for mouse hit testing).
     popup_area: Option<Rect>,
+    /// Active filter query (empty = show all).
+    filter: String,
+    /// Whether the user is actively typing a filter.
+    searching: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,10 +78,10 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("Tab", "Switch focus (Query/Grid)"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
-        KeyBinding::new("?", "Toggle this help"),
-        KeyBinding::new("Ctrl+O", "Open connection picker"),
-        KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
-        KeyBinding::new("Ctrl+Shift+B / Ctrl+\\ / Ctrl+4", "Toggle sidebar"),
+        KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
+        KeyBinding::new("Ctrl+o", "Open connection picker"),
+        KeyBinding::new("Ctrl+M", "Open connection manager"),
+        KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
     ],
 );
 
@@ -89,6 +93,15 @@ const GOTO: HelpSection = HelpSection::new(
         KeyBinding::new("gc", "Go to connections sidebar"),
         KeyBinding::new("gs", "Go to schema sidebar"),
         KeyBinding::new("gr", "Go to results grid"),
+    ],
+);
+
+const SIDEBAR_CONNECTIONS: HelpSection = HelpSection::new(
+    "Sidebar - Connections",
+    &[
+        KeyBinding::new("j/k or arrows", "Navigate connections"),
+        KeyBinding::new("Enter", "Connect to selected"),
+        KeyBinding::new("a / e", "Open connection manager"),
     ],
 );
 
@@ -137,7 +150,7 @@ const QUERY_EDITING: HelpSection = HelpSection::new(
 const QUERY_VISUAL: HelpSection = HelpSection::new(
     "Query Editor - Visual Mode",
     &[
-        KeyBinding::new("v", "Enter visual mode"),
+        KeyBinding::new("v / vv", "Enter visual mode / open in $EDITOR"),
         KeyBinding::new("h/j/k/l", "Extend selection"),
         KeyBinding::new("y", "Yank (copy) selection"),
         KeyBinding::new("d", "Delete selection"),
@@ -179,6 +192,7 @@ const GRID_SELECTION: HelpSection = HelpSection::new(
     &[
         KeyBinding::new("Space", "Toggle row selection"),
         KeyBinding::new("a", "Select all rows"),
+        KeyBinding::new("A", "Invert selection"),
         KeyBinding::new("Esc", "Clear selection"),
     ],
 );
@@ -187,12 +201,28 @@ const GRID_ACTIONS: HelpSection = HelpSection::new(
     "Results Grid - Actions",
     &[
         KeyBinding::new("c", "Copy cell to clipboard"),
-        KeyBinding::new("y", "Yank (copy) row as TSV"),
-        KeyBinding::new("Y", "Yank row with headers"),
+        KeyBinding::new("yy / yY", "Yank row(s) as TSV / TSV+headers"),
+        KeyBinding::new("yj", "Yank row(s) as JSON"),
+        KeyBinding::new("yc / yC", "Yank row(s) as CSV / CSV+headers"),
+        KeyBinding::new("ym", "Yank row(s) as Markdown table"),
         KeyBinding::new("e / Enter", "Edit cell"),
         KeyBinding::new("o", "Open row detail view"),
         KeyBinding::new("/", "Search in results"),
         KeyBinding::new("n/N", "Next/previous match"),
+    ],
+);
+
+const ROW_DETAIL: HelpSection = HelpSection::new(
+    "Row Detail (o to open)",
+    &[
+        KeyBinding::new("j/k", "Next/previous field"),
+        KeyBinding::new("g/G", "First/last field"),
+        KeyBinding::new("yy / yY", "Copy row as TSV / TSV+headers"),
+        KeyBinding::new("yj", "Copy row as JSON"),
+        KeyBinding::new("yc / yC", "Copy row as CSV / CSV+headers"),
+        KeyBinding::new("ym", "Copy row as Markdown table"),
+        KeyBinding::new("e/Enter", "Edit selected field"),
+        KeyBinding::new("q/Esc", "Close"),
     ],
 );
 
@@ -213,6 +243,7 @@ const COMMANDS: HelpSection = HelpSection::new(
         KeyBinding::new(":export <fmt> <path>", "Export results (csv/json/tsv)"),
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
+        KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
         KeyBinding::new(":q / :quit", "Quit application"),
         KeyBinding::new(":help / :?", "Show this help"),
     ],
@@ -236,6 +267,7 @@ const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
 const ALL_SECTIONS: &[HelpSection] = &[
     GLOBAL,
     GOTO,
+    SIDEBAR_CONNECTIONS,
     SIDEBAR_SCHEMA,
     QUERY_NAVIGATION,
     QUERY_EDITING,
@@ -244,6 +276,7 @@ const ALL_SECTIONS: &[HelpSection] = &[
     GRID_NAVIGATION,
     GRID_SELECTION,
     GRID_ACTIONS,
+    ROW_DETAIL,
     GRID_COLUMNS,
     COMMANDS,
     SCHEMA_COMMANDS,
@@ -269,6 +302,8 @@ impl HelpPopup {
             total_lines,
             visible_height: 0,
             popup_area: None,
+            filter: String::new(),
+            searching: false,
         }
     }
 
@@ -288,11 +323,108 @@ impl HelpPopup {
         lines
     }
 
+    /// Return sections and their matching bindings after applying the current filter.
+    /// Each entry is `(section_title, matching_bindings)`.
+    fn filtered_sections(&self) -> Vec<(&'static str, Vec<&'static KeyBinding>)> {
+        if self.filter.is_empty() {
+            return self
+                .sections
+                .iter()
+                .map(|s| (s.title, s.bindings.iter().collect()))
+                .collect();
+        }
+
+        let q = self.filter.to_lowercase();
+        let mut result = Vec::new();
+        for section in self.sections {
+            let title_matches = section.title.to_lowercase().contains(&q);
+            let matching: Vec<&'static KeyBinding> = section
+                .bindings
+                .iter()
+                .filter(|b| {
+                    b.keys.to_lowercase().contains(&q) || b.description.to_lowercase().contains(&q)
+                })
+                .collect();
+
+            if title_matches || !matching.is_empty() {
+                // If the title matched but no bindings did, show all bindings for context.
+                let bindings = if title_matches && matching.is_empty() {
+                    section.bindings.iter().collect()
+                } else {
+                    matching
+                };
+                result.push((section.title, bindings));
+            }
+        }
+        result
+    }
+
+    /// Recalculate `total_lines` based on the current filter and reset scroll.
+    fn recompute_total_lines_and_reset(&mut self) {
+        let filtered = self.filtered_sections();
+        let n = filtered.len();
+        self.total_lines = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, (_, bindings))| {
+                // header + separator + bindings + optional blank line
+                2 + bindings.len() + usize::from(i < n.saturating_sub(1))
+            })
+            .sum();
+        self.scroll_offset = 0;
+    }
+
     /// Handle a key event, returning the action to take.
     pub fn handle_key(&mut self, key: KeyEvent) -> HelpAction {
+        use crossterm::event::KeyModifiers;
+
+        // ── Filter / search input mode ────────────────────────────────────────
+        if self.searching {
+            match key.code {
+                // Confirm search (keep filter, exit typing mode)
+                KeyCode::Enter => {
+                    self.searching = false;
+                }
+                // Cancel search — clear filter and exit typing mode
+                KeyCode::Esc => {
+                    self.searching = false;
+                    self.filter.clear();
+                    self.recompute_total_lines_and_reset();
+                }
+                // Delete last character
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.recompute_total_lines_and_reset();
+                }
+                // Append printable character
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.filter.push(c);
+                    self.recompute_total_lines_and_reset();
+                }
+                _ => {}
+            }
+            return HelpAction::Continue;
+        }
+
+        // ── Normal navigation mode ─────────────────────────────────────────────
         match key.code {
+            // Open search
+            KeyCode::Char('/') => {
+                self.searching = true;
+                HelpAction::Continue
+            }
+
             // Close help
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => HelpAction::Close,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                if !self.filter.is_empty() {
+                    // First Esc clears filter without closing
+                    self.filter.clear();
+                    self.recompute_total_lines_and_reset();
+                    HelpAction::Continue
+                } else {
+                    HelpAction::Close
+                }
+            }
 
             // Scroll down
             KeyCode::Char('j') | KeyCode::Down => {
@@ -512,12 +644,21 @@ impl HelpPopup {
     }
 
     fn render_content(&self, frame: &mut Frame, area: Rect) {
+        let filtered = self.filtered_sections();
+        let section_count = filtered.len();
         let mut lines: Vec<Line> = Vec::new();
 
-        for (section_idx, section) in self.sections.iter().enumerate() {
+        if filtered.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  No results for \"{}\"", self.filter),
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+
+        for (section_idx, (title, bindings)) in filtered.iter().enumerate() {
             // Section header
             lines.push(Line::from(vec![Span::styled(
-                format!(" {} ", section.title),
+                format!(" {} ", title),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -531,12 +672,12 @@ impl HelpPopup {
             )));
 
             // Keybindings
-            for binding in section.bindings.iter() {
-                lines.push(self.render_keybinding(binding, area.width as usize));
+            for binding in bindings.iter() {
+                lines.push(self.render_keybinding(binding, &self.filter, area.width as usize));
             }
 
             // Blank line between sections (except last)
-            if section_idx < self.sections.len() - 1 {
+            if section_idx < section_count - 1 {
                 lines.push(Line::from(""));
             }
         }
@@ -552,10 +693,29 @@ impl HelpPopup {
         frame.render_widget(content, area);
     }
 
-    fn render_keybinding(&self, binding: &KeyBinding, _width: usize) -> Line<'static> {
-        // Fixed width for keys column
-        let key_width = 20;
-        let keys = format!("{:width$}", binding.keys, width = key_width);
+    fn render_keybinding(
+        &self,
+        binding: &KeyBinding,
+        filter: &str,
+        _width: usize,
+    ) -> Line<'static> {
+        let keys = format!("{:20}", binding.keys);
+        let desc = binding.description.to_string();
+
+        let highlighted =
+            !filter.is_empty() && desc.to_lowercase().contains(&filter.to_lowercase());
+
+        let desc_span = if highlighted {
+            Span::styled(
+                desc,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(desc, Style::default().fg(Color::White))
+        };
 
         Line::from(vec![
             Span::raw("  "),
@@ -565,10 +725,7 @@ impl HelpPopup {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                binding.description.to_string(),
-                Style::default().fg(Color::White),
-            ),
+            desc_span,
         ])
     }
 
@@ -584,16 +741,56 @@ impl HelpPopup {
             "All".to_string()
         };
 
-        let footer = Line::from(vec![
-            Span::styled(" j/k ", Style::default().fg(Color::Yellow)),
-            Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(" g/G ", Style::default().fg(Color::Yellow)),
-            Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(" PgUp/PgDn ", Style::default().fg(Color::Yellow)),
-            Span::styled("page  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(" ".repeat(area.width.saturating_sub(50) as usize)),
-            Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
-        ]);
+        let footer = if self.searching {
+            // Show filter input
+            let prompt = format!("/{}_", self.filter);
+            let hint = "  Enter to confirm  Esc to cancel";
+            let padding = area
+                .width
+                .saturating_sub((prompt.len() + hint.len()) as u16);
+            Line::from(vec![
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}{}", hint, " ".repeat(padding as usize)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        } else if !self.filter.is_empty() {
+            // Show active filter hint
+            let filter_info = format!("/{}", self.filter);
+            let fixed = " j/k scroll  / to edit  Esc to clear  ";
+            let padding = area
+                .width
+                .saturating_sub((filter_info.len() + fixed.len() + scroll_info.len()) as u16);
+            Line::from(vec![
+                Span::styled(
+                    filter_info,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(fixed, Style::default().fg(Color::DarkGray)),
+                Span::raw(" ".repeat(padding as usize)),
+                Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
+            ])
+        } else {
+            // Normal footer
+            Line::from(vec![
+                Span::styled(" j/k ", Style::default().fg(Color::Yellow)),
+                Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" g/G ", Style::default().fg(Color::Yellow)),
+                Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" / ", Style::default().fg(Color::Yellow)),
+                Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(" ".repeat(area.width.saturating_sub(50) as usize)),
+                Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
+            ])
+        };
         frame.render_widget(Paragraph::new(footer), area);
     }
 

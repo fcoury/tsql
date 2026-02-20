@@ -19,6 +19,23 @@ use tui_syntax::{html, json, themes, Highlighter};
 
 use crate::util::{detect_content_type, ContentType};
 
+/// Format to use when yanking from the row detail view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YankFormat {
+    /// Tab-separated values, no headers.
+    Tsv,
+    /// Tab-separated values with a header row.
+    TsvHeaders,
+    /// JSON object.
+    Json,
+    /// Comma-separated values, no headers.
+    Csv,
+    /// Comma-separated values with a header row.
+    CsvHeaders,
+    /// GitHub-flavored markdown table.
+    Markdown,
+}
+
 /// The result of handling a key event in the row detail view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowDetailAction {
@@ -28,6 +45,8 @@ pub enum RowDetailAction {
     Close,
     /// Open editor for the current field.
     Edit { col: usize },
+    /// Copy the row in the given format.
+    Yank(YankFormat),
 }
 
 /// A modal view showing all columns for a single row.
@@ -50,6 +69,8 @@ pub struct RowDetailModal {
     visible_height: usize,
     /// Syntax highlighter
     highlighter: Highlighter,
+    /// True when `y` has been pressed and we are waiting for the format key.
+    pending_yank: bool,
 }
 
 impl RowDetailModal {
@@ -77,6 +98,7 @@ impl RowDetailModal {
             field_count,
             visible_height: 10,
             highlighter,
+            pending_yank: false,
         }
     }
 
@@ -87,6 +109,28 @@ impl RowDetailModal {
 
     /// Handle a key event and return the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> RowDetailAction {
+        // Pending yank: y was pressed, waiting for format key.
+        if self.pending_yank {
+            self.pending_yank = false;
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), KeyModifiers::NONE) => RowDetailAction::Yank(YankFormat::Tsv),
+                (KeyCode::Char('Y'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+                    RowDetailAction::Yank(YankFormat::TsvHeaders)
+                }
+                (KeyCode::Char('j'), KeyModifiers::NONE) => RowDetailAction::Yank(YankFormat::Json),
+                (KeyCode::Char('c'), KeyModifiers::NONE) => RowDetailAction::Yank(YankFormat::Csv),
+                (KeyCode::Char('C'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('C'), KeyModifiers::NONE) => {
+                    RowDetailAction::Yank(YankFormat::CsvHeaders)
+                }
+                (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                    RowDetailAction::Yank(YankFormat::Markdown)
+                }
+                _ => RowDetailAction::Continue,
+            };
+        }
+
         match (key.code, key.modifiers) {
             // Close view
             (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
@@ -164,6 +208,13 @@ impl RowDetailModal {
                 RowDetailAction::Edit {
                     col: self.selected_field,
                 }
+            }
+
+            // y enters pending-yank mode; the format key follows.
+            // yy=TSV  yY=TSV+headers  yj=JSON  yc=CSV  yC=CSV+headers  ym=Markdown
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                self.pending_yank = true;
+                RowDetailAction::Continue
             }
 
             _ => RowDetailAction::Continue,
@@ -421,11 +472,13 @@ impl RowDetailModal {
             Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
             Span::styled("e/Enter ", Style::default().fg(Color::Yellow)),
             Span::styled("edit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("y… ", Style::default().fg(Color::Yellow)),
+            Span::styled("yank  ", Style::default().fg(Color::DarkGray)),
             Span::styled("g/G ", Style::default().fg(Color::Yellow)),
             Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q/Esc ", Style::default().fg(Color::Yellow)),
             Span::styled("close  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(" ".repeat(area.width.saturating_sub(60) as usize)),
+            Span::raw(" ".repeat(area.width.saturating_sub(80) as usize)),
             Span::styled(
                 format!("{}/{}", self.selected_field + 1, self.field_count),
                 Style::default().fg(Color::Cyan),

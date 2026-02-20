@@ -23,6 +23,9 @@ pub struct HistoryEntry {
     /// Optional connection string (sanitized - no passwords).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
+    /// Whether this entry is pinned (immune to pruning).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl HistoryEntry {
@@ -31,6 +34,7 @@ impl HistoryEntry {
             query,
             timestamp: Utc::now(),
             connection,
+            pinned: false,
         }
     }
 }
@@ -93,13 +97,15 @@ impl History {
             Vec::new()
         };
 
-        // Enforce max_entries limit on load.
-        let entries = if entries.len() > max_entries {
-            let skip_count = entries.len() - max_entries;
-            entries.into_iter().skip(skip_count).collect()
-        } else {
-            entries
-        };
+        // Enforce max_entries limit on load, skipping pinned entries when pruning.
+        let mut entries = entries;
+        while entries.len() > max_entries {
+            if let Some(oldest_unpinned) = entries.iter().position(|e| !e.pinned) {
+                entries.remove(oldest_unpinned);
+            } else {
+                break;
+            }
+        }
 
         Ok(Self {
             entries,
@@ -155,12 +161,35 @@ impl History {
         let entry = HistoryEntry::new(trimmed.to_string(), connection);
         self.entries.push(entry);
 
-        // Enforce max_entries limit.
+        // Enforce max_entries limit, but never remove pinned entries.
+        // If the only unpinned entry is the one just added (last position), allow
+        // overflow rather than immediately discarding what was just pushed.
         while self.entries.len() > self.max_entries {
-            self.entries.remove(0);
+            match self.entries.iter().position(|e| !e.pinned) {
+                Some(idx) if idx < self.entries.len() - 1 => {
+                    self.entries.remove(idx);
+                }
+                _ => break,
+            }
         }
 
         self.dirty = true;
+    }
+
+    /// Toggle the pinned state of the entry at the given index.
+    pub fn toggle_pin(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.pinned = !entry.pinned;
+            self.dirty = true;
+        }
+    }
+
+    /// Remove the entry at the given index.
+    pub fn remove(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+            self.dirty = true;
+        }
     }
 
     /// Get all history entries (oldest first).
@@ -368,6 +397,88 @@ mod tests {
         assert!(!matches.is_empty());
         // The orders query should match.
         assert!(matches.iter().any(|m| m.entry.query.contains("orders")));
+    }
+
+    #[test]
+    fn test_toggle_pin() {
+        let mut history = History::new_empty(100);
+        history.push("query1".to_string(), None);
+        history.push("query2".to_string(), None);
+
+        assert!(!history.entries()[0].pinned);
+        history.toggle_pin(0);
+        assert!(history.entries()[0].pinned);
+        history.toggle_pin(0);
+        assert!(!history.entries()[0].pinned);
+
+        // Out-of-bounds index is a no-op.
+        history.toggle_pin(99);
+    }
+
+    #[test]
+    fn test_push_does_not_prune_pinned() {
+        let mut history = History::new_empty(3);
+        history.push("query1".to_string(), None);
+        history.push("query2".to_string(), None);
+        history.push("query3".to_string(), None);
+
+        // Pin query1 (index 0).
+        history.toggle_pin(0);
+
+        // Adding a fourth entry should remove query2 (oldest unpinned), not query1.
+        history.push("query4".to_string(), None);
+
+        assert_eq!(history.len(), 3);
+        assert!(history
+            .entries()
+            .iter()
+            .any(|e| e.query == "query1" && e.pinned));
+        assert!(!history.entries().iter().any(|e| e.query == "query2"));
+        assert!(history.entries().iter().any(|e| e.query == "query3"));
+        assert!(history.entries().iter().any(|e| e.query == "query4"));
+    }
+
+    #[test]
+    fn test_push_allows_overflow_when_all_pinned() {
+        let mut history = History::new_empty(2);
+        history.push("query1".to_string(), None);
+        history.push("query2".to_string(), None);
+        history.toggle_pin(0);
+        history.toggle_pin(1);
+
+        // Both pinned; adding more should not remove any.
+        history.push("query3".to_string(), None);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn test_load_preserves_pinned_on_prune() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+
+        let mut entries: Vec<HistoryEntry> = (1..=5)
+            .map(|i| HistoryEntry::new(format!("query{}", i), None))
+            .collect();
+        // Pin query1 (oldest).
+        entries[0].pinned = true;
+
+        let file = HistoryFile {
+            version: 1,
+            entries,
+        };
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(serde_json::to_string(&file).unwrap().as_bytes())
+            .unwrap();
+
+        // Load with max_entries = 3; query1 is pinned so should survive.
+        let history = History::load_from_path(&path, 3).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(history
+            .entries()
+            .iter()
+            .any(|e| e.query == "query1" && e.pinned));
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]
