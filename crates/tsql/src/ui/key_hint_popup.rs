@@ -219,9 +219,20 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 50);
         let area = popup.popup_area(frame_area);
 
-        // Should be in bottom-right
-        assert!(area.x > 50);
-        assert!(area.y >= 40);
+        // Should be in bottom-right using configured padding.
+        let padding = 2;
+        assert_eq!(
+            area.x,
+            frame_area
+                .x
+                .saturating_add(frame_area.width.saturating_sub(area.width + padding))
+        );
+        assert_eq!(
+            area.y,
+            frame_area
+                .y
+                .saturating_add(frame_area.height.saturating_sub(area.height + padding))
+        );
 
         // Should have reasonable size
         assert!(area.width >= 15);
