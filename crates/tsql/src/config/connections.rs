@@ -183,7 +183,11 @@ pub struct ConnectionEntry {
     pub uri: Option<String>,
     /// Database host
     pub host: String,
-    /// Database port (default: 5432)
+    /// Database port.
+    ///
+    /// Defaults via `default_port` (5432), which is Postgres-centric.
+    /// For Mongo connections, the port in `uri` is authoritative and this
+    /// field is mostly legacy/backward-compat metadata.
     #[serde(default = "default_port")]
     pub port: u16,
     /// Database name
@@ -214,6 +218,7 @@ pub struct ConnectionEntry {
 }
 
 fn default_port() -> u16 {
+    // Postgres default. Mongo defaults come from the parsed URI.
     5432
 }
 
