@@ -152,6 +152,8 @@ pub struct ConnectionFormModal {
 
     /// Keymap for form actions
     keymap: Keymap,
+    /// Whether the 1Password reference field is enabled in the UI.
+    onepassword_enabled: bool,
 }
 
 /// Original form values for tracking modifications
@@ -177,6 +179,11 @@ impl ConnectionFormModal {
 
     /// Create a new form with a custom keymap.
     pub fn with_keymap(keymap: Keymap) -> Self {
+        Self::with_keymap_and_onepassword(keymap, true)
+    }
+
+    /// Create a new form with a custom keymap and explicit 1Password UI toggle.
+    pub fn with_keymap_and_onepassword(keymap: Keymap, onepassword_enabled: bool) -> Self {
         Self {
             name: String::new(),
             host: "localhost".to_string(),
@@ -208,6 +215,7 @@ impl ConnectionFormModal {
             modified: false,
             original_values: None,
             keymap,
+            onepassword_enabled,
         }
     }
 
@@ -225,6 +233,16 @@ impl ConnectionFormModal {
         entry: &ConnectionEntry,
         existing_password: Option<String>,
         keymap: Keymap,
+    ) -> Self {
+        Self::edit_with_keymap_and_onepassword(entry, existing_password, keymap, true)
+    }
+
+    /// Create a form for editing an existing connection with explicit 1Password UI toggle.
+    pub fn edit_with_keymap_and_onepassword(
+        entry: &ConnectionEntry,
+        existing_password: Option<String>,
+        keymap: Keymap,
+        onepassword_enabled: bool,
     ) -> Self {
         let password = existing_password.unwrap_or_default();
         let op_ref = entry.password_onepassword.clone().unwrap_or_default();
@@ -280,6 +298,7 @@ impl ConnectionFormModal {
             modified: false,
             original_values: Some(original_values),
             keymap,
+            onepassword_enabled,
         }
     }
 
@@ -370,13 +389,13 @@ impl ConnectionFormModal {
 
             // Tab - next field
             (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
-                self.focused = self.focused.next();
+                self.focused = self.next_focus(self.focused);
                 ConnectionFormAction::Continue
             }
 
             // Shift+Tab - previous field
             (KeyCode::BackTab, _) | (KeyCode::Up, KeyModifiers::NONE) => {
-                self.focused = self.focused.prev();
+                self.focused = self.prev_focus(self.focused);
                 ConnectionFormAction::Continue
             }
 
@@ -479,6 +498,22 @@ impl ConnectionFormModal {
 
             _ => ConnectionFormAction::Continue,
         }
+    }
+
+    fn next_focus(&self, current: FormField) -> FormField {
+        let mut next = current.next();
+        if !self.onepassword_enabled && next == FormField::OnePasswordRef {
+            next = next.next();
+        }
+        next
+    }
+
+    fn prev_focus(&self, current: FormField) -> FormField {
+        let mut prev = current.prev();
+        if !self.onepassword_enabled && prev == FormField::OnePasswordRef {
+            prev = prev.prev();
+        }
+        prev
     }
 
     fn get_current_field_and_cursor(&mut self) -> Option<(&mut String, &mut usize)> {
@@ -781,14 +816,18 @@ impl ConnectionFormModal {
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
 
-        // Layout the form fields
-        // Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
-        let chunks = Layout::vertical([
+        // Layout the form fields.
+        // Order: Name → User → Password → [OnePasswordRef] → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+        let mut constraints = vec![
             Constraint::Length(1), // Name
             Constraint::Length(1), // Separator
             Constraint::Length(1), // User
             Constraint::Length(1), // Password
-            Constraint::Length(1), // 1Password ref
+        ];
+        if self.onepassword_enabled {
+            constraints.push(Constraint::Length(1)); // 1Password ref
+        }
+        constraints.extend([
             Constraint::Length(1), // Save password checkbox
             Constraint::Length(1), // SSL mode
             Constraint::Length(1), // Separator
@@ -800,74 +839,91 @@ impl ConnectionFormModal {
             Constraint::Length(1), // URL paste
             Constraint::Length(1), // Separator
             Constraint::Length(1), // Help line
-        ])
-        .split(inner);
+        ]);
+        let chunks = Layout::vertical(constraints).split(inner);
 
-        // Render each field in the new order
+        let mut i = 0usize;
         self.render_text_field(
             frame,
-            chunks[0],
+            chunks[i],
             "Name:",
             &self.name,
             self.name_cursor,
             FormField::Name,
         );
-        self.render_separator(frame, chunks[1]);
+        i += 1;
+        self.render_separator(frame, chunks[i]);
+        i += 1;
         self.render_text_field(
             frame,
-            chunks[2],
+            chunks[i],
             "User:",
             &self.user,
             self.user_cursor,
             FormField::User,
         );
-        self.render_password_field(frame, chunks[3]);
-        self.render_text_field(
-            frame,
-            chunks[4],
-            "op ref:",
-            &self.op_ref,
-            self.op_ref_cursor,
-            FormField::OnePasswordRef,
-        );
+        i += 1;
+        self.render_password_field(frame, chunks[i]);
+        i += 1;
+        if self.onepassword_enabled {
+            self.render_text_field(
+                frame,
+                chunks[i],
+                "op ref:",
+                &self.op_ref,
+                self.op_ref_cursor,
+                FormField::OnePasswordRef,
+            );
+            i += 1;
+        }
         self.render_checkbox(
             frame,
-            chunks[5],
+            chunks[i],
             "Save to keychain",
             self.save_password,
             FormField::SavePassword,
         );
-        self.render_ssl_mode_field(frame, chunks[6]);
-        self.render_separator(frame, chunks[7]);
+        i += 1;
+        self.render_ssl_mode_field(frame, chunks[i]);
+        i += 1;
+        self.render_separator(frame, chunks[i]);
+        i += 1;
         self.render_text_field(
             frame,
-            chunks[8],
+            chunks[i],
             "Host:",
             &self.host,
             self.host_cursor,
             FormField::Host,
         );
+        i += 1;
         self.render_text_field(
             frame,
-            chunks[9],
+            chunks[i],
             "Port:",
             &self.port,
             self.port_cursor,
             FormField::Port,
         );
+        i += 1;
         self.render_text_field(
             frame,
-            chunks[10],
+            chunks[i],
             "Database:",
             &self.database,
             self.database_cursor,
             FormField::Database,
         );
-        self.render_separator(frame, chunks[11]);
-        self.render_color_field(frame, chunks[12]);
-        self.render_url_paste_field(frame, chunks[13]);
-        self.render_separator(frame, chunks[14]);
-        self.render_help(frame, chunks[15]);
+        i += 1;
+        self.render_separator(frame, chunks[i]);
+        i += 1;
+        self.render_color_field(frame, chunks[i]);
+        i += 1;
+        self.render_url_paste_field(frame, chunks[i]);
+        i += 1;
+        self.render_separator(frame, chunks[i]);
+        i += 1;
+        self.render_help(frame, chunks[i]);
     }
 
     fn render_text_field(
@@ -1194,6 +1250,53 @@ mod tests {
 
         form.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(form.focused, FormField::Name);
+    }
+
+    #[test]
+    fn test_tab_navigation_skips_onepassword_when_disabled() {
+        let mut form = ConnectionFormModal::with_keymap_and_onepassword(
+            Keymap::default_connection_form_keymap(),
+            false,
+        );
+        assert_eq!(form.focused, FormField::Name);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::User);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Password);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            form.focused,
+            FormField::SavePassword,
+            "Tab should skip OnePasswordRef when disabled"
+        );
+
+        form.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(form.focused, FormField::Password);
+    }
+
+    #[test]
+    fn test_tab_navigation_includes_onepassword_when_enabled() {
+        let mut form = ConnectionFormModal::with_keymap_and_onepassword(
+            Keymap::default_connection_form_keymap(),
+            true,
+        );
+        assert_eq!(form.focused, FormField::Name);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::User);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Password);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            form.focused,
+            FormField::OnePasswordRef,
+            "Tab should land on OnePasswordRef when enabled"
+        );
     }
 
     #[test]

@@ -5559,8 +5559,9 @@ impl App {
                 }
             }
             ConnectionManagerAction::Add => {
-                self.connection_form = Some(ConnectionFormModal::with_keymap(
+                self.connection_form = Some(ConnectionFormModal::with_keymap_and_onepassword(
                     self.connection_form_keymap.clone(),
+                    self.config.connection.enable_onepassword,
                 ));
             }
             ConnectionManagerAction::Edit { entry } => {
@@ -5569,10 +5570,11 @@ impl App {
                     .get_password_with_options(self.config.connection.enable_onepassword)
                     .ok()
                     .flatten();
-                self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
+                self.connection_form = Some(ConnectionFormModal::edit_with_keymap_and_onepassword(
                     &entry,
                     password,
                     self.connection_form_keymap.clone(),
+                    self.config.connection.enable_onepassword,
                 ));
             }
             ConnectionManagerAction::Delete { name } => {
@@ -5637,8 +5639,9 @@ impl App {
                 self.focus = Focus::Query;
             }
             SidebarAction::OpenAddConnection => {
-                self.connection_form = Some(ConnectionFormModal::with_keymap(
+                self.connection_form = Some(ConnectionFormModal::with_keymap_and_onepassword(
                     self.connection_form_keymap.clone(),
+                    self.config.connection.enable_onepassword,
                 ));
             }
             SidebarAction::OpenEditConnection(name) => {
@@ -5652,11 +5655,13 @@ impl App {
                         .get_password_with_options(self.config.connection.enable_onepassword)
                         .ok()
                         .flatten();
-                    self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
-                        entry,
-                        password,
-                        self.connection_form_keymap.clone(),
-                    ));
+                    self.connection_form =
+                        Some(ConnectionFormModal::edit_with_keymap_and_onepassword(
+                            entry,
+                            password,
+                            self.connection_form_keymap.clone(),
+                            self.config.connection.enable_onepassword,
+                        ));
                 }
             }
             SidebarAction::RefreshSchema => {
@@ -8220,9 +8225,8 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_string(&mut app, "postgres");
 
-        // Tab to Password, then OnePasswordRef, then SavePassword, then SSL mode, then Host
+        // Tab to Password, then SavePassword, then SSL mode, then Host
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Password
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // OnePasswordRef
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SavePassword
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SslMode
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host (already localhost)

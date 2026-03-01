@@ -1,7 +1,7 @@
 //! Connection management for saved database connections.
 //!
 //! This module handles:
-//! - Loading and saving connections to ~/.config/tsql/connections.toml
+//! - Loading and saving connections to ~/.tsql/connections.toml
 //! - Secure password storage via OS keychain (keyring crate)
 //! - URL parsing and construction
 //! - Connection entry validation
@@ -794,7 +794,7 @@ impl ConnectionsFile {
     }
 }
 
-/// Returns the connections file path (~/.config/tsql/connections.toml)
+/// Returns the connections file path (inside `config_dir()`).
 pub fn connections_path() -> Option<PathBuf> {
     super::config_dir().map(|p| p.join("connections.toml"))
 }

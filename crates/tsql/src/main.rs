@@ -225,7 +225,14 @@ fn main() -> Result<()> {
         return run_debug_keys(debug_mouse);
     }
 
-    // Load configuration from ~/.config/tsql/config.toml
+    if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
+        eprintln!(
+            "Warning: Failed to migrate legacy config directory to ~/.tsql: {}",
+            err
+        );
+    }
+
+    // Load configuration from ~/.tsql/config.toml
     let cfg = config::load_config().unwrap_or_else(|e| {
         eprintln!("Warning: Failed to load config: {}", e);
         config::Config::default()

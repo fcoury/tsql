@@ -57,7 +57,7 @@ tsql postgres://user:password@localhost:5432/mydb
 export DATABASE_URL=postgres://user:password@localhost:5432/mydb
 tsql
 
-# Or configure a default connection in ~/.config/tsql/config.toml
+# Or configure a default connection in ~/.tsql/config.toml
 tsql
 ```
 
@@ -179,7 +179,8 @@ tsql --debug-keys --mouse
 
 ## Configuration
 
-tsql looks for configuration at `~/.config/tsql/config.toml`.
+tsql looks for configuration at `~/.tsql/config.toml` by default.
+On Linux/macOS startup, legacy config folders are auto-migrated to `~/.tsql`.
 
 ```toml
 [connection]
