@@ -244,7 +244,7 @@ const COMMANDS: HelpSection = HelpSection::new(
         KeyBinding::new(":export <fmt> <path>", "Export results (csv/json/tsv)"),
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
-        KeyBinding::new(":update [check|status]", "Check update status"),
+        KeyBinding::new(":update [check|status|apply]", "Check/apply updates"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
         KeyBinding::new(":q / :quit", "Quit application"),
         KeyBinding::new(":help / :?", "Show this help"),

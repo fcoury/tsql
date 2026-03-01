@@ -15,6 +15,7 @@ use ratatui::Frame;
 use tui_confirm_dialog_with_mouse::{ConfirmDialog, ConfirmDialogState};
 
 use crate::config::ConnectionEntry;
+use crate::update::UpdateInfo;
 
 /// Widget ID for the confirmation dialog (only one dialog is used at a time).
 const CONFIRM_DIALOG_ID: u16 = 0;
@@ -47,6 +48,8 @@ pub enum ConfirmContext {
     CloseConnectionForm,
     /// Switching to a new connection with unsaved query changes.
     SwitchConnection { entry: ConnectionEntry },
+    /// Applying an in-app binary update.
+    ApplyUpdate { info: UpdateInfo },
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -117,6 +120,7 @@ impl ConfirmPrompt {
             | ConfirmContext::SwitchConnection { .. } => " Unsaved Changes ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
+            ConfirmContext::ApplyUpdate { .. } => " Apply Update ",
         }
     }
 

@@ -106,13 +106,16 @@ check_on_startup = true
 channel = "stable"
 
 # Update mode:
-# - "auto": phase 1 behavior is notify-only
+# - "auto": notify + allow `:update apply` for standalone installs
 # - "notify-only": check and show upgrade hints
 # - "off": disable update checks
 mode = "auto"
 
 # Minimum interval between checks (hours)
 interval_hours = 24
+
+# Allow in-app apply only when running a standalone binary
+allow_apply_for_standalone = true
 
 # GitHub repository used for release checks
 github_repo = "fcoury/tsql"

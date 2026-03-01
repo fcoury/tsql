@@ -169,7 +169,7 @@ tsql --debug-keys --mouse
 | `:connect <url>`                | Connect to database |
 | `:disconnect`                   | Disconnect          |
 | `:export csv\|json\|tsv <path>` | Export results      |
-| `:update [check\|status]`       | Check update status |
+| `:update [check\|status\|apply]` | Check/apply updates |
 | `:sbt` / `:sidebar-toggle`      | Toggle sidebar      |
 | `:q` / `:quit`                  | Quit                |
 | `:\dt`                          | List tables         |
@@ -178,6 +178,9 @@ tsql --debug-keys --mouse
 | `:\di`                          | List indexes        |
 | `:\l`                           | List databases      |
 | `:\du`                          | List roles          |
+
+`:\update apply` is only available in `updates.mode = "auto"` and only for
+standalone binary installs.
 
 ## Configuration
 
@@ -192,12 +195,13 @@ default_url = "postgres://localhost/mydb"
 enable_onepassword = false
 
 [updates]
-# Notify-only update checks (phase 1)
+# Update checks + optional in-app apply for standalone installs
 enabled = true
 check_on_startup = true
 channel = "stable"
 mode = "auto"
 interval_hours = 24
+allow_apply_for_standalone = true
 github_repo = "fcoury/tsql"
 
 [keymap]

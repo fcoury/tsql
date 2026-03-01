@@ -2,6 +2,36 @@ use std::path::Path;
 
 use super::types::InstallMethod;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn current_target_triple() -> Option<&'static str> {
+    Some("aarch64-apple-darwin")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub fn current_target_triple() -> Option<&'static str> {
+    Some("x86_64-apple-darwin")
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn current_target_triple() -> Option<&'static str> {
+    Some("x86_64-unknown-linux-gnu")
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub fn current_target_triple() -> Option<&'static str> {
+    Some("x86_64-pc-windows-msvc")
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
+pub fn current_target_triple() -> Option<&'static str> {
+    None
+}
+
 pub fn detect_install_method(path: &Path) -> InstallMethod {
     let normalized = path.to_string_lossy().to_ascii_lowercase();
 
@@ -65,6 +95,14 @@ mod tests {
         assert_eq!(
             upgrade_hint(InstallMethod::Homebrew),
             Some("brew upgrade tsql")
+        );
+    }
+
+    #[test]
+    fn test_current_target_triple_is_known() {
+        assert!(
+            current_target_triple().is_some(),
+            "unsupported target for update apply"
         );
     }
 }

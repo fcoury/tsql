@@ -5,6 +5,7 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::config::UpdateChannel;
+use crate::update::detect::current_target_triple;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseCandidate {
@@ -67,14 +68,7 @@ impl ReleaseProvider for GitHubReleasesProvider {
                 continue;
             };
 
-            let asset_url = release
-                .assets
-                .iter()
-                .find(|asset| {
-                    asset.name.ends_with(".tar.gz")
-                        || asset.name.ends_with(".zip")
-                        || asset.name.ends_with(".tar.xz")
-                })
+            let asset_url = select_archive_asset(&release.assets, current_target_triple())
                 .map(|asset| asset.browser_download_url.clone());
 
             let checksum_url = release
@@ -126,6 +120,28 @@ fn parse_tag_version(tag: &str) -> Option<Version> {
     Version::parse(trimmed).ok()
 }
 
+fn select_archive_asset<'a>(
+    assets: &'a [GitHubAsset],
+    target_triple: Option<&str>,
+) -> Option<&'a GitHubAsset> {
+    let matches_archive = |asset: &&GitHubAsset| {
+        asset.name.ends_with(".tar.gz")
+            || asset.name.ends_with(".tgz")
+            || asset.name.ends_with(".zip")
+            || asset.name.ends_with(".tar.xz")
+    };
+
+    if let Some(target) = target_triple {
+        assets
+            .iter()
+            .filter(matches_archive)
+            .find(|asset| asset.name.contains(target))
+            .or_else(|| assets.iter().filter(matches_archive).next())
+    } else {
+        assets.iter().filter(matches_archive).next()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -173,5 +189,41 @@ mod tests {
                 .contains("GitHub API returned 403 Forbidden"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn test_select_archive_asset_prefers_target_triple() {
+        let assets = vec![
+            GitHubAsset {
+                name: "tsql-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                browser_download_url: "linux".to_string(),
+            },
+            GitHubAsset {
+                name: "tsql-aarch64-apple-darwin.tar.gz".to_string(),
+                browser_download_url: "mac".to_string(),
+            },
+        ];
+
+        let selected = select_archive_asset(&assets, Some("aarch64-apple-darwin"))
+            .expect("targeted asset should be selected");
+        assert_eq!(selected.browser_download_url, "mac");
+    }
+
+    #[test]
+    fn test_select_archive_asset_falls_back_to_first_archive() {
+        let assets = vec![
+            GitHubAsset {
+                name: "README.txt".to_string(),
+                browser_download_url: "readme".to_string(),
+            },
+            GitHubAsset {
+                name: "tsql-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                browser_download_url: "linux".to_string(),
+            },
+        ];
+
+        let selected = select_archive_asset(&assets, Some("no-such-target"))
+            .expect("first archive should be selected");
+        assert_eq!(selected.browser_download_url, "linux");
     }
 }

@@ -34,7 +34,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::config::{
     load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
-    ConnectionsFile, KeyBinding, Keymap, SslMode,
+    ConnectionsFile, KeyBinding, Keymap, SslMode, UpdateMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -51,8 +51,8 @@ use crate::ui::{
     YankFormat,
 };
 use crate::update::{
-    check_for_update, detect_current_install_method, upgrade_hint, GitHubReleasesProvider,
-    UpdateCheckOutcome, UpdateState,
+    apply_update, check_for_update, detect_current_install_method, upgrade_hint, ApplyResult,
+    GitHubReleasesProvider, InstallMethod, UpdateCheckOutcome, UpdateInfo, UpdateState,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -798,6 +798,10 @@ pub enum DbEvent {
         outcome: UpdateCheckOutcome,
         manual: bool,
     },
+    /// A background update apply completed.
+    UpdateApplyFinished {
+        result: std::result::Result<ApplyResult, String>,
+    },
 }
 
 pub struct DbSession {
@@ -1129,6 +1133,8 @@ pub struct App {
 
     /// Runtime state for update checks.
     update_state: UpdateState,
+    /// True while an update apply flow is running in the background.
+    update_apply_in_flight: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1286,6 +1292,7 @@ impl App {
 
             query_ui: QueryRunUi::default(),
             update_state: UpdateState::default(),
+            update_apply_in_flight: false,
         };
 
         // Load saved connections
@@ -3459,6 +3466,10 @@ impl App {
                 self.connect_to_entry(entry);
                 false
             }
+            ConfirmContext::ApplyUpdate { info } => {
+                self.start_update_apply(info);
+                false
+            }
         }
     }
 
@@ -3488,6 +3499,9 @@ impl App {
             ConfirmContext::SwitchConnection { .. } => {
                 // Cancelled connection switch
                 self.last_status = Some("Connection switch cancelled".to_string());
+            }
+            ConfirmContext::ApplyUpdate { .. } => {
+                self.last_status = Some("Update apply cancelled".to_string());
             }
         }
     }
@@ -4027,8 +4041,9 @@ impl App {
         match subcommand {
             "check" | "" => self.start_update_check(true, false),
             "status" => self.show_update_status(),
+            "apply" => self.request_update_apply(),
             _ => {
-                self.last_status = Some("Usage: :update [check|status]".to_string());
+                self.last_status = Some("Usage: :update [check|status|apply]".to_string());
             }
         }
     }
@@ -4114,6 +4129,89 @@ impl App {
 
             let _ = tx.send(DbEvent::UpdateChecked { outcome, manual });
         });
+    }
+
+    fn request_update_apply(&mut self) {
+        if self.update_apply_in_flight {
+            self.last_status = Some("Update apply already running".to_string());
+            return;
+        }
+
+        let install_method = detect_current_install_method();
+        if !UpdateState::apply_allowed(&self.config.updates, install_method) {
+            self.last_status = Some(self.apply_not_allowed_message(install_method));
+            return;
+        }
+
+        let Some(outcome) = self.update_state.last_outcome.as_ref() else {
+            self.last_status =
+                Some("No update info available. Run :update check first".to_string());
+            return;
+        };
+
+        let info = match outcome {
+            UpdateCheckOutcome::UpdateAvailable(info) => info.clone(),
+            UpdateCheckOutcome::UpToDate { .. } => {
+                self.last_status = Some("Already up to date; nothing to apply".to_string());
+                return;
+            }
+            UpdateCheckOutcome::Error(error) => {
+                self.last_status = Some(format!("Cannot apply update: {}", error));
+                return;
+            }
+            UpdateCheckOutcome::Disabled => {
+                self.last_status = Some("Update checks are disabled".to_string());
+                return;
+            }
+        };
+
+        self.confirm_prompt = Some(ConfirmPrompt::new(
+            format!(
+                "Apply update now? {} -> {}. This will replace the current tsql binary.",
+                info.current, info.latest
+            ),
+            ConfirmContext::ApplyUpdate { info },
+        ));
+    }
+
+    fn start_update_apply(&mut self, info: UpdateInfo) {
+        if self.update_apply_in_flight {
+            self.last_status = Some("Update apply already running".to_string());
+            return;
+        }
+
+        self.update_apply_in_flight = true;
+        self.last_status = Some(format!(
+            "Applying update {} -> {}...",
+            info.current, info.latest
+        ));
+        let tx = self.db_events_tx.clone();
+
+        self.rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                apply_update(&info).map_err(|error| format!("Update apply failed: {}", error))
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("Update apply task failed: {}", error)));
+
+            let _ = tx.send(DbEvent::UpdateApplyFinished { result });
+        });
+    }
+
+    fn apply_not_allowed_message(&self, method: InstallMethod) -> String {
+        if matches!(self.config.updates.mode, UpdateMode::Off) || !self.config.updates.enabled {
+            return "Update checks are disabled".to_string();
+        }
+        if matches!(self.config.updates.mode, UpdateMode::NotifyOnly) {
+            return "In-app apply is disabled in notify-only mode".to_string();
+        }
+        if !self.config.updates.allow_apply_for_standalone {
+            return "In-app apply is disabled by config (`updates.allow_apply_for_standalone = false`)".to_string();
+        }
+        if let Some(hint) = upgrade_hint(method) {
+            return format!("In-app apply is unavailable for this install. Use {}", hint);
+        }
+        "In-app apply is only available for standalone binaries".to_string()
     }
 
     fn update_status_message(&self, outcome: &UpdateCheckOutcome, manual: bool) -> String {
@@ -6899,6 +6997,25 @@ impl App {
                     self.last_status = Some(status);
                 }
             }
+            DbEvent::UpdateApplyFinished { result } => {
+                self.update_apply_in_flight = false;
+                match result {
+                    Ok(applied) => {
+                        self.update_state.last_outcome = Some(UpdateCheckOutcome::UpToDate {
+                            current: applied.to.clone(),
+                        });
+                        self.last_status = Some(format!(
+                            "Updated to v{} (backup: {}). Restart tsql to run the new binary",
+                            applied.to,
+                            applied.backup_path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        self.last_status = Some("Update apply failed (see error)".to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -7562,6 +7679,63 @@ mod tests {
             app.last_status.as_deref(),
             Some("You're up to date (v0.4.2)")
         );
+    }
+
+    #[test]
+    fn test_update_apply_requires_existing_update_info() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.execute_command("update apply");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No update info available. Run :update check first")
+        );
+        assert!(app.confirm_prompt.is_none());
+    }
+
+    #[test]
+    fn test_update_apply_disallowed_in_notify_only_mode() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.config.updates.mode = UpdateMode::NotifyOnly;
+        app.execute_command("update apply");
+
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("In-app apply is disabled in notify-only mode")
+        );
+        assert!(app.confirm_prompt.is_none());
+    }
+
+    #[test]
+    fn test_update_apply_prompts_when_update_available() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.update_state.last_outcome = Some(UpdateCheckOutcome::UpdateAvailable(UpdateInfo {
+            current: Version::new(0, 4, 2),
+            latest: Version::new(0, 4, 3),
+            notes_url: Some("https://example.com/release".to_string()),
+            asset_url: Some("https://example.com/tsql-x86_64-unknown-linux-gnu.tar.gz".to_string()),
+            checksum_url: Some("https://example.com/SHA256SUMS.txt".to_string()),
+        }));
+
+        app.execute_command("update apply");
+        assert!(app.confirm_prompt.is_some());
     }
 
     // ========== CellEditor Tests ==========

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{UpdateMode, UpdatesConfig};
 
-use super::types::{UpdateCheckOutcome, UpdatePolicy};
+use super::types::{InstallMethod, UpdateCheckOutcome, UpdatePolicy};
 
 #[derive(Debug, Clone)]
 pub struct UpdateState {
@@ -56,6 +56,13 @@ impl UpdateState {
         }
     }
 
+    pub fn apply_allowed(config: &UpdatesConfig, install_method: InstallMethod) -> bool {
+        config.enabled
+            && matches!(config.mode, UpdateMode::Auto)
+            && config.allow_apply_for_standalone
+            && matches!(install_method, InstallMethod::StandaloneBinary)
+    }
+
     pub fn mark_check_started(&mut self, from_startup: bool) {
         self.check_in_flight = true;
         if from_startup {
@@ -83,6 +90,7 @@ mod tests {
             channel: UpdateChannel::Stable,
             mode: UpdateMode::Auto,
             interval_hours: 24,
+            allow_apply_for_standalone: true,
             github_repo: "fcoury/tsql".to_string(),
         };
 
@@ -114,5 +122,18 @@ mod tests {
 
         state.last_checked_at = Some(now - Duration::from_secs(3600));
         assert!(!state.should_check_by_interval(&config, now));
+    }
+
+    #[test]
+    fn test_apply_allowed_only_for_auto_mode_standalone() {
+        let config = UpdatesConfig::default();
+        assert!(UpdateState::apply_allowed(
+            &config,
+            InstallMethod::StandaloneBinary
+        ));
+        assert!(!UpdateState::apply_allowed(
+            &config,
+            InstallMethod::Homebrew
+        ));
     }
 }

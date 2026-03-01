@@ -226,6 +226,8 @@ pub struct UpdatesConfig {
     pub mode: UpdateMode,
     /// Minimum interval between checks (hours).
     pub interval_hours: u64,
+    /// Allow in-app apply only when running a standalone binary.
+    pub allow_apply_for_standalone: bool,
     /// GitHub repository slug used for release checks.
     pub github_repo: String,
 }
@@ -238,6 +240,7 @@ impl Default for UpdatesConfig {
             channel: UpdateChannel::Stable,
             mode: UpdateMode::Auto,
             interval_hours: 24,
+            allow_apply_for_standalone: true,
             github_repo: "fcoury/tsql".to_string(),
         }
     }
@@ -338,6 +341,7 @@ check_on_startup = true
 channel = "stable"
 mode = "notify-only"
 interval_hours = 12
+allow_apply_for_standalone = true
 github_repo = "fcoury/tsql"
 
 [[keymap.normal]]
@@ -392,6 +396,7 @@ description = "Export results as CSV"
         assert_eq!(config.updates.channel, UpdateChannel::Stable);
         assert_eq!(config.updates.mode, UpdateMode::NotifyOnly);
         assert_eq!(config.updates.interval_hours, 12);
+        assert!(config.updates.allow_apply_for_standalone);
         assert_eq!(config.updates.github_repo, "fcoury/tsql");
     }
 
