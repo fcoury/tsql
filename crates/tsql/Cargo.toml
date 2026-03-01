@@ -35,6 +35,8 @@ unicode-width.workspace = true
 nucleo-matcher.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+semver.workspace = true
+ureq.workspace = true
 
 # Secure password storage
 keyring.workspace = true

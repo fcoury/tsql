@@ -17,7 +17,8 @@ pub use connections::{
 pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{
     ClipboardBackend, ClipboardConfig, Config, ConnectionConfig, CustomKeyBinding, DisplayConfig,
-    EditorConfig, IdentifierStyle, KeymapConfig, SqlConfig,
+    EditorConfig, IdentifierStyle, KeymapConfig, SqlConfig, UpdateChannel, UpdateMode,
+    UpdatesConfig,
 };
 
 use anyhow::{Context, Result};

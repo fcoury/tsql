@@ -92,6 +92,31 @@ auto_reconnect = true
 # connections. When enabled, `op` must be installed and available on PATH.
 enable_onepassword = false
 
+# Update checking
+[updates]
+# Enable update checks
+enabled = true
+
+# Check once during startup (non-blocking)
+check_on_startup = true
+
+# Release channel:
+# - "stable": only stable releases
+# - "prerelease": include prereleases
+channel = "stable"
+
+# Update mode:
+# - "auto": phase 1 behavior is notify-only
+# - "notify-only": check and show upgrade hints
+# - "off": disable update checks
+mode = "auto"
+
+# Minimum interval between checks (hours)
+interval_hours = 24
+
+# GitHub repository used for release checks
+github_repo = "fcoury/tsql"
+
 # Clipboard settings
 [clipboard]
 # Clipboard backend:

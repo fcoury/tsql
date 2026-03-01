@@ -4,5 +4,6 @@ pub mod config;
 pub mod history;
 pub mod session;
 pub mod ui;
+pub mod update;
 pub mod util;
 pub mod vim;

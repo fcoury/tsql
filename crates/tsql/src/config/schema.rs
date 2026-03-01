@@ -19,6 +19,8 @@ pub struct Config {
     pub clipboard: ClipboardConfig,
     /// Keymap customizations
     pub keymap: KeymapConfig,
+    /// Update checking settings
+    pub updates: UpdatesConfig,
 }
 
 /// Display-related settings
@@ -210,6 +212,55 @@ impl Default for KeymapConfig {
     }
 }
 
+/// Update checking settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Enable update checks.
+    pub enabled: bool,
+    /// Check for updates on startup.
+    pub check_on_startup: bool,
+    /// Release channel to query.
+    pub channel: UpdateChannel,
+    /// Update mode behavior.
+    pub mode: UpdateMode,
+    /// Minimum interval between checks (hours).
+    pub interval_hours: u64,
+    /// GitHub repository slug used for release checks.
+    pub github_repo: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_on_startup: true,
+            channel: UpdateChannel::Stable,
+            mode: UpdateMode::Auto,
+            interval_hours: 24,
+            github_repo: "fcoury/tsql".to_string(),
+        }
+    }
+}
+
+/// Release channel for update checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateChannel {
+    Stable,
+    Prerelease,
+}
+
+/// Update behavior mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateMode {
+    /// Auto mode currently behaves like notify-only in phase 1.
+    Auto,
+    NotifyOnly,
+    Off,
+}
+
 /// SQL generation / templating settings
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -281,6 +332,14 @@ wl_copy_trim_newline = true
 [keymap]
 vim_mode = true
 
+[updates]
+enabled = true
+check_on_startup = true
+channel = "stable"
+mode = "notify-only"
+interval_hours = 12
+github_repo = "fcoury/tsql"
+
 [[keymap.normal]]
 key = "ctrl+s"
 action = "save_query"
@@ -326,6 +385,14 @@ description = "Export results as CSV"
 
         assert_eq!(config.keymap.grid.len(), 1);
         assert_eq!(config.keymap.grid[0].key, "ctrl+e");
+
+        // Updates
+        assert!(config.updates.enabled);
+        assert!(config.updates.check_on_startup);
+        assert_eq!(config.updates.channel, UpdateChannel::Stable);
+        assert_eq!(config.updates.mode, UpdateMode::NotifyOnly);
+        assert_eq!(config.updates.interval_hours, 12);
+        assert_eq!(config.updates.github_repo, "fcoury/tsql");
     }
 
     #[test]
@@ -335,5 +402,6 @@ description = "Export results as CSV"
         assert!(toml_str.contains("[display]"));
         assert!(toml_str.contains("[editor]"));
         assert!(toml_str.contains("[connection]"));
+        assert!(toml_str.contains("[updates]"));
     }
 }

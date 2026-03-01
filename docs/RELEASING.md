@@ -95,6 +95,15 @@ For each platform in the matrix:
 - Creates a GitHub Release with auto-generated notes
 - Uploads all binaries and checksums
 
+### Update Check Compatibility
+
+`tsql`'s in-app update checks read GitHub releases from `fcoury/tsql`.
+To keep update notifications working:
+
+- Use semver tags (for example `v0.4.3`)
+- Keep release artifacts attached (`.tar.gz` / `.zip`)
+- Keep `SHA256SUMS.txt` uploaded with each release
+
 ### Publish Job
 
 - Publishes `tui-syntax` to crates.io

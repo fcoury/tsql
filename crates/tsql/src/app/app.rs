@@ -23,6 +23,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use semver::Version;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
@@ -48,6 +49,10 @@ use crate::ui::{
     PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
     SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
     YankFormat,
+};
+use crate::update::{
+    check_for_update, detect_current_install_method, upgrade_hint, GitHubReleasesProvider,
+    UpdateCheckOutcome, UpdateState,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -788,6 +793,11 @@ pub enum DbEvent {
         primary_keys: Vec<String>,
         col_types: Vec<String>,
     },
+    /// A background update check completed.
+    UpdateChecked {
+        outcome: UpdateCheckOutcome,
+        manual: bool,
+    },
 }
 
 pub struct DbSession {
@@ -1116,6 +1126,9 @@ pub struct App {
 
     /// Query execution UI state (spinner animation, timing).
     query_ui: QueryRunUi,
+
+    /// Runtime state for update checks.
+    update_state: UpdateState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1272,6 +1285,7 @@ impl App {
             last_cursor_style: None,
 
             query_ui: QueryRunUi::default(),
+            update_state: UpdateState::default(),
         };
 
         // Load saved connections
@@ -1420,6 +1434,8 @@ impl App {
             if self.db.running {
                 self.query_ui.tick();
             }
+
+            self.maybe_start_scheduled_update_check();
 
             // Pre-compute highlighted lines before the draw closure
             let query_text = self.editor.text();
@@ -3995,12 +4011,137 @@ impl App {
             "sbt" | "sidebar-toggle" => {
                 self.toggle_sidebar();
             }
+            "update" => {
+                self.handle_update_command(args);
+            }
             _ => {
                 self.last_status = Some(format!("Unknown command: {}", command));
             }
         }
 
         false
+    }
+
+    fn handle_update_command(&mut self, args: &str) {
+        let subcommand = args.split_whitespace().next().unwrap_or("check");
+        match subcommand {
+            "check" | "" => self.start_update_check(true, false),
+            "status" => self.show_update_status(),
+            _ => {
+                self.last_status = Some("Usage: :update [check|status]".to_string());
+            }
+        }
+    }
+
+    fn show_update_status(&mut self) {
+        let Some(outcome) = self.update_state.last_outcome.as_ref() else {
+            self.last_status = Some("No update check has run yet. Use :update check".to_string());
+            return;
+        };
+
+        self.last_status = Some(self.update_status_message(outcome, true));
+    }
+
+    fn maybe_start_scheduled_update_check(&mut self) {
+        if self
+            .update_state
+            .should_check_on_startup(&self.config.updates)
+        {
+            self.start_update_check(false, true);
+            return;
+        }
+
+        if self
+            .update_state
+            .should_check_by_interval(&self.config.updates, Instant::now())
+        {
+            self.start_update_check(false, false);
+        }
+    }
+
+    fn start_update_check(&mut self, manual: bool, from_startup: bool) {
+        if self.update_state.check_in_flight {
+            if manual {
+                self.last_status = Some("Update check already running".to_string());
+            }
+            return;
+        }
+
+        if matches!(
+            UpdateState::policy(&self.config.updates),
+            crate::update::UpdatePolicy::Off
+        ) {
+            let outcome = UpdateCheckOutcome::Disabled;
+            self.update_state.mark_check_finished(outcome.clone());
+            if manual {
+                self.last_status = Some(self.update_status_message(&outcome, true));
+            }
+            return;
+        }
+
+        self.update_state.mark_check_started(from_startup);
+
+        if manual {
+            self.last_status = Some("Checking for updates...".to_string());
+        }
+
+        let repo = self.config.updates.github_repo.clone();
+        let channel = self.config.updates.channel;
+        let tx = self.db_events_tx.clone();
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+        self.rt.spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let current = Version::parse(&current_version).map_err(|error| {
+                    format!(
+                        "Current version '{}' is not valid semver: {}",
+                        current_version, error
+                    )
+                });
+
+                match current {
+                    Ok(current) => {
+                        let provider = GitHubReleasesProvider::new(repo);
+                        check_for_update(&provider, &current, channel)
+                    }
+                    Err(error) => UpdateCheckOutcome::Error(error),
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                UpdateCheckOutcome::Error(format!("Update task failed: {}", error))
+            });
+
+            let _ = tx.send(DbEvent::UpdateChecked { outcome, manual });
+        });
+    }
+
+    fn update_status_message(&self, outcome: &UpdateCheckOutcome, manual: bool) -> String {
+        match outcome {
+            UpdateCheckOutcome::Disabled => "Update checks are disabled".to_string(),
+            UpdateCheckOutcome::Error(error) => error.clone(),
+            UpdateCheckOutcome::UpToDate { current } => {
+                if manual {
+                    format!("You're up to date (v{})", current)
+                } else {
+                    format!("Running v{}", current)
+                }
+            }
+            UpdateCheckOutcome::UpdateAvailable(info) => {
+                let install_method = detect_current_install_method();
+                if let Some(hint) = upgrade_hint(install_method) {
+                    format!(
+                        "Update available: v{} -> v{} ({})",
+                        info.current, info.latest, hint
+                    )
+                } else {
+                    format!(
+                        "Update available: v{} -> v{} (see release notes)",
+                        info.current, info.latest
+                    )
+                }
+            }
+        }
     }
 
     fn goto_result_row(&mut self, row_num: usize) -> bool {
@@ -6746,6 +6887,18 @@ impl App {
                 self.grid.primary_keys = primary_keys;
                 self.grid.col_types = col_types;
             }
+            DbEvent::UpdateChecked { outcome, manual } => {
+                let show_status = manual
+                    || matches!(
+                        outcome,
+                        UpdateCheckOutcome::UpdateAvailable(_) | UpdateCheckOutcome::Error(_)
+                    );
+                let status = self.update_status_message(&outcome, manual);
+                self.update_state.mark_check_finished(outcome);
+                if show_status {
+                    self.last_status = Some(status);
+                }
+            }
         }
     }
 
@@ -7317,6 +7470,98 @@ mod tests {
         assert_eq!(effective_max_rows(0), 2000);
         assert_eq!(effective_max_rows(1), 1);
         assert_eq!(effective_max_rows(10_000), 10_000);
+    }
+
+    #[test]
+    fn test_update_status_reports_when_no_check_has_run() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.execute_command("update status");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No update check has run yet. Use :update check")
+        );
+    }
+
+    #[test]
+    fn test_update_check_respects_disabled_config() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.updates.enabled = false;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        app.execute_command("update check");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Update checks are disabled")
+        );
+    }
+
+    #[test]
+    fn test_background_up_to_date_check_does_not_override_status_line() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.last_status = Some("Ready".to_string());
+        app.update_state.mark_check_started(true);
+        app.apply_db_event(DbEvent::UpdateChecked {
+            outcome: UpdateCheckOutcome::UpToDate {
+                current: Version::new(0, 4, 2),
+            },
+            manual: false,
+        });
+
+        assert_eq!(app.last_status.as_deref(), Some("Ready"));
+        assert!(!app.update_state.check_in_flight);
+        assert!(app.update_state.last_checked_at.is_some());
+        assert!(matches!(
+            app.update_state.last_outcome,
+            Some(UpdateCheckOutcome::UpToDate { .. })
+        ));
+    }
+
+    #[test]
+    fn test_manual_up_to_date_check_updates_status_line() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.apply_db_event(DbEvent::UpdateChecked {
+            outcome: UpdateCheckOutcome::UpToDate {
+                current: Version::new(0, 4, 2),
+            },
+            manual: true,
+        });
+
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("You're up to date (v0.4.2)")
+        );
     }
 
     // ========== CellEditor Tests ==========

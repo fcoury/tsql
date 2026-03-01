@@ -26,6 +26,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Query history** - Persistent history with fuzzy search, pinning, and deletion
 - **External editor** - Open the current query in `$VISUAL` / `$EDITOR` with `vv`
 - **1Password integration** - Store an `op://` secret reference per connection instead of a plain password
+- **Update checks** - Notify-only update checks with install-method specific upgrade hints
 - **Configurable** - Customize keybindings and appearance via config file
 
 ## Installation
@@ -168,6 +169,7 @@ tsql --debug-keys --mouse
 | `:connect <url>`                | Connect to database |
 | `:disconnect`                   | Disconnect          |
 | `:export csv\|json\|tsv <path>` | Export results      |
+| `:update [check\|status]`       | Check update status |
 | `:sbt` / `:sidebar-toggle`      | Toggle sidebar      |
 | `:q` / `:quit`                  | Quit                |
 | `:\dt`                          | List tables         |
@@ -189,8 +191,17 @@ default_url = "postgres://localhost/mydb"
 # Enable 1Password CLI support for `password_onepassword` refs
 enable_onepassword = false
 
-[keybindings]
-# Custom keybindings (see config.example.toml for options)
+[updates]
+# Notify-only update checks (phase 1)
+enabled = true
+check_on_startup = true
+channel = "stable"
+mode = "auto"
+interval_hours = 24
+github_repo = "fcoury/tsql"
+
+[keymap]
+# Custom keymap overrides (see config.example.toml for options)
 ```
 
 See [config.example.toml](config.example.toml) for all available options.
