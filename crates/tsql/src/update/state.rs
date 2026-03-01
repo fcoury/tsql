@@ -111,17 +111,23 @@ mod tests {
     fn test_should_check_by_interval_respects_elapsed_time() {
         let config = UpdatesConfig::default();
         let now = Instant::now();
+        let well_after_interval = now
+            .checked_add(Duration::from_secs(3600 * 25))
+            .expect("instant add should be representable");
+        let within_interval = now
+            .checked_add(Duration::from_secs(3600))
+            .expect("instant add should be representable");
 
         let mut state = UpdateState {
             startup_check_started: true,
             check_in_flight: false,
-            last_checked_at: Some(now - Duration::from_secs(3600 * 25)),
+            last_checked_at: Some(now),
             last_outcome: None,
         };
-        assert!(state.should_check_by_interval(&config, now));
+        assert!(state.should_check_by_interval(&config, well_after_interval));
 
-        state.last_checked_at = Some(now - Duration::from_secs(3600));
-        assert!(!state.should_check_by_interval(&config, now));
+        state.last_checked_at = Some(now);
+        assert!(!state.should_check_by_interval(&config, within_interval));
     }
 
     #[test]
