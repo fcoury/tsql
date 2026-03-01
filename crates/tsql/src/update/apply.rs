@@ -18,6 +18,11 @@ pub struct ApplyResult {
 }
 
 pub fn apply_update(info: &UpdateInfo) -> Result<ApplyResult> {
+    let current = std::env::current_exe().context("Failed to locate current executable")?;
+    apply_update_to_path(info, &current)
+}
+
+fn apply_update_to_path(info: &UpdateInfo, current_executable: &Path) -> Result<ApplyResult> {
     if cfg!(windows) {
         bail!("In-app apply is not supported on Windows yet");
     }
@@ -42,7 +47,7 @@ pub fn apply_update(info: &UpdateInfo) -> Result<ApplyResult> {
     verify_archive_checksum(&archive_path, &asset_filename, &checksum_text)?;
 
     let extracted_binary = extract_binary_from_archive(&archive_path, temp_dir.path())?;
-    let backup_path = replace_current_executable(&extracted_binary)?;
+    let backup_path = replace_executable_at_path(current_executable, &extracted_binary)?;
 
     Ok(ApplyResult {
         from: info.current.clone(),
@@ -165,11 +170,6 @@ fn extract_binary_from_archive(archive_path: &Path, out_dir: &Path) -> Result<Pa
     bail!("Could not find 'tsql' binary in release archive")
 }
 
-fn replace_current_executable(new_binary: &Path) -> Result<PathBuf> {
-    let current = std::env::current_exe().context("Failed to locate current executable")?;
-    replace_executable_at_path(&current, new_binary)
-}
-
 fn replace_executable_at_path(current: &Path, new_binary: &Path) -> Result<PathBuf> {
     let parent = current
         .parent()
@@ -286,8 +286,106 @@ fn filename_from_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::net::TcpListener;
+    use std::thread;
+
+    use semver::Version;
+
     use super::*;
     use tempfile::tempdir;
+
+    struct TestHttpServer {
+        base_url: String,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TestHttpServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn start_test_http_server(routes: HashMap<String, Vec<u8>>) -> TestHttpServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking listener");
+        let address = listener.local_addr().expect("read bound address");
+
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut served = 0_usize;
+
+            while served < routes.len() && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        served += 1;
+
+                        let mut request_buffer = [0_u8; 8192];
+                        let bytes_read = stream.read(&mut request_buffer).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&request_buffer[..bytes_read]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+
+                        let (status, body): (&str, &[u8]) = if let Some(body) = routes.get(path) {
+                            ("200 OK", body)
+                        } else {
+                            ("404 Not Found", b"not found")
+                        };
+
+                        let response_headers = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+
+                        let _ = stream.write_all(response_headers.as_bytes());
+                        let _ = stream.write_all(body);
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        TestHttpServer {
+            base_url: format!("http://{}", address),
+            handle: Some(handle),
+        }
+    }
+
+    fn build_test_tar_gz(binary_contents: &[u8]) -> Vec<u8> {
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gzip);
+
+        let mut header = tar::Header::new_gnu();
+        header
+            .set_path("tsql")
+            .expect("set tar entry path for test archive");
+        header.set_size(binary_contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append(&header, binary_contents)
+            .expect("append binary to test tar archive");
+
+        let gzip = archive.into_inner().expect("finish test tar archive");
+        gzip.finish().expect("finish test gzip encoding")
+    }
+
+    fn sha256_hex_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
 
     #[test]
     fn test_filename_from_url_extracts_last_segment() {
@@ -316,6 +414,98 @@ mod tests {
         assert_eq!(
             checksum,
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_apply_update_end_to_end_download_verify_extract_and_replace() {
+        let dir = tempdir().expect("tempdir");
+        let current = dir.path().join("tsql-current");
+        fs::write(&current, b"old-binary").expect("write current binary");
+
+        let archive_filename = "tsql-x86_64-unknown-linux-gnu.tar.gz";
+        let archive_bytes = build_test_tar_gz(b"new-binary");
+        let checksums = format!(
+            "{}  {}\n",
+            sha256_hex_bytes(&archive_bytes),
+            archive_filename
+        );
+
+        let mut routes = HashMap::new();
+        routes.insert(format!("/{}", archive_filename), archive_bytes);
+        routes.insert("/SHA256SUMS".to_string(), checksums.into_bytes());
+        let server = start_test_http_server(routes);
+
+        let info = UpdateInfo {
+            current: Version::new(0, 4, 2),
+            latest: Version::new(0, 4, 3),
+            notes_url: None,
+            asset_url: Some(format!("{}/{}", server.base_url, archive_filename)),
+            checksum_url: Some(format!("{}/SHA256SUMS", server.base_url)),
+        };
+
+        let result = apply_update_to_path(&info, &current).expect("apply should succeed");
+
+        assert_eq!(result.from, Version::new(0, 4, 2));
+        assert_eq!(result.to, Version::new(0, 4, 3));
+        assert_eq!(
+            fs::read_to_string(&current).expect("read installed binary"),
+            "new-binary"
+        );
+        assert_eq!(
+            fs::read_to_string(&result.backup_path).expect("read backup binary"),
+            "old-binary"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_apply_update_end_to_end_rejects_bad_checksum_without_replacing_binary() {
+        let dir = tempdir().expect("tempdir");
+        let current = dir.path().join("tsql-current");
+        fs::write(&current, b"old-binary").expect("write current binary");
+
+        let archive_filename = "tsql-x86_64-unknown-linux-gnu.tar.gz";
+        let archive_bytes = build_test_tar_gz(b"new-binary");
+        let checksums = format!("{:064x}  {}\n", 0_u8, archive_filename);
+
+        let mut routes = HashMap::new();
+        routes.insert(format!("/{}", archive_filename), archive_bytes);
+        routes.insert("/SHA256SUMS".to_string(), checksums.into_bytes());
+        let server = start_test_http_server(routes);
+
+        let info = UpdateInfo {
+            current: Version::new(0, 4, 2),
+            latest: Version::new(0, 4, 3),
+            notes_url: None,
+            asset_url: Some(format!("{}/{}", server.base_url, archive_filename)),
+            checksum_url: Some(format!("{}/SHA256SUMS", server.base_url)),
+        };
+
+        let error = apply_update_to_path(&info, &current).expect_err("checksum mismatch expected");
+        let error_message = format!("{error:#}");
+        assert!(
+            error_message.contains("Checksum mismatch"),
+            "unexpected error: {error_message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&current).expect("read unchanged current binary"),
+            "old-binary"
+        );
+        let backup_count = fs::read_dir(dir.path())
+            .expect("read directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tsql.backup.")
+            })
+            .count();
+        assert_eq!(
+            backup_count, 0,
+            "backup should not be created on checksum failure"
         );
     }
 
