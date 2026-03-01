@@ -2271,6 +2271,11 @@ impl App {
                 self.connection_picker = None;
                 self.pending_key = None;
                 self.last_error = None;
+                // Global Esc handling runs before mode-specific Visual handling.
+                // Ensure any active editor selection highlight is cleared here too.
+                if self.editor.textarea.is_selecting() {
+                    self.editor.textarea.cancel_selection();
+                }
                 self.mode = Mode::Normal;
             } else if matches!(self.focus, Focus::Grid) && !self.grid_state.selected_rows.is_empty()
             {
@@ -5278,7 +5283,7 @@ impl App {
             self.connections.sorted().into_iter().cloned().collect();
 
         let picker =
-            FuzzyPicker::with_display(entries, "Connect (Ctrl+Shift+C: manage)", |entry| {
+            FuzzyPicker::with_display(entries, "Connect (gm or Ctrl+C: manage)", |entry| {
                 // Display: "[fav] name - user@host/db"
                 let fav = entry
                     .favorite
@@ -5292,6 +5297,19 @@ impl App {
 
     /// Handle key events when connection picker is open.
     fn handle_connection_picker_key(&mut self, key: KeyEvent) -> bool {
+        // "gm" from inside picker: type 'g' then 'm' to jump to manager.
+        let gm_chord = key.code == KeyCode::Char('m')
+            && key.modifiers == KeyModifiers::NONE
+            && self
+                .connection_picker
+                .as_ref()
+                .is_some_and(|picker| picker.query() == "g");
+        if gm_chord {
+            self.connection_picker = None;
+            self.open_connection_manager();
+            return false;
+        }
+
         // Check for Ctrl+Shift+C (or Ctrl+C fallback) to open connection manager
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -8107,6 +8125,39 @@ mod tests {
         assert!(app.pending_external_edit);
     }
 
+    #[test]
+    fn test_esc_from_visual_mode_clears_selection() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.editor.set_text("select 1".to_string());
+
+        // Enter visual mode and extend selection.
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Visual);
+        assert!(
+            app.editor.textarea.is_selecting(),
+            "Selection should be active in visual mode"
+        );
+
+        // Esc should leave visual mode and clear selection highlight.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            !app.editor.textarea.is_selecting(),
+            "Selection should be cleared when leaving visual mode with Esc"
+        );
+    }
+
     // ========== Connection Manager Issue Tests ==========
 
     /// Helper to type a string into the app by simulating key presses
@@ -8483,6 +8534,48 @@ mod tests {
             app.current_connection_name,
             Some("testconn".to_string()),
             "Should have set current_connection_name after selecting connection"
+        );
+    }
+
+    #[test]
+    fn test_gm_in_connection_picker_opens_connection_manager() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "testconn".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            no_password_required: true,
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry).unwrap();
+
+        let entries: Vec<ConnectionEntry> = app.connections.sorted().into_iter().cloned().collect();
+        app.connection_picker = Some(FuzzyPicker::with_display(entries, "Connect", |entry| {
+            entry.name.clone()
+        }));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+
+        assert!(
+            app.connection_picker.is_none(),
+            "Connection picker should close on gm"
+        );
+        assert!(
+            app.connection_manager.is_some(),
+            "Connection manager should open on gm from picker"
         );
     }
 
