@@ -69,15 +69,21 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    /// Parse a PostgreSQL connection string
+    /// Parse a database connection string.
     /// Supports formats:
     /// - postgres://user:pass@host:port/database?params
     /// - postgresql://user:pass@host:port/database
+    /// - mongodb://user:pass@host:port/database?params
+    /// - mongodb+srv://user:pass@host/database?params
     /// - host=localhost user=postgres dbname=mydb port=5432
     pub fn parse(conn_str: &str) -> Self {
         let mut info = ConnectionInfo::default();
 
-        if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
+        if conn_str.starts_with("postgres://")
+            || conn_str.starts_with("postgresql://")
+            || conn_str.starts_with("mongodb://")
+            || conn_str.starts_with("mongodb+srv://")
+        {
             // URL format
             info.parse_url(conn_str);
         } else {
@@ -93,6 +99,8 @@ impl ConnectionInfo {
         let without_scheme = conn_str
             .strip_prefix("postgres://")
             .or_else(|| conn_str.strip_prefix("postgresql://"))
+            .or_else(|| conn_str.strip_prefix("mongodb://"))
+            .or_else(|| conn_str.strip_prefix("mongodb+srv://"))
             .unwrap_or(conn_str);
 
         // Split off query params

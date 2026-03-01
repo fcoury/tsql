@@ -47,6 +47,8 @@ ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
+futures-util = "0.3"
+mongodb = "3"
 
 # Secure password storage
 # Must enable platform-specific features for actual keychain storage

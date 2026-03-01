@@ -75,6 +75,7 @@ persist_session = true
 [connection]
 # Default database URL (can be overridden by DATABASE_URL env var or CLI arg)
 # default_url = "postgres://user:password@localhost:5432/database"
+# default_url = "mongodb://user:password@localhost:27017/database"
 
 # Connection timeout in seconds
 connect_timeout_secs = 10

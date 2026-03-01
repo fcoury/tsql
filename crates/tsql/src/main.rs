@@ -139,13 +139,14 @@ fn build_url_from_libpq_env() -> LibpqEnvResult {
 }
 
 fn print_usage() {
-    eprintln!("tsql - A modern PostgreSQL CLI");
+    eprintln!("tsql - A modern SQL and MongoDB CLI");
     eprintln!();
     eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL]");
     eprintln!();
     eprintln!("Arguments:");
-    eprintln!("  [CONNECTION_URL]  PostgreSQL connection URL");
+    eprintln!("  [CONNECTION_URL]  Connection URL");
     eprintln!("                    (e.g., postgres://user:pass@host:5432/dbname)");
+    eprintln!("                    (or mongodb://user:pass@host:27017/dbname)");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -h, --help        Print this help message");
@@ -171,6 +172,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
+    eprintln!("  tsql mongodb://localhost:27017/mydb");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
     eprintln!("  tsql --debug-keys");
     eprintln!("  tsql --debug-keys --mouse");

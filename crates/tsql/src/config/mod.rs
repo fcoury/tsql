@@ -12,7 +12,7 @@ mod schema;
 
 pub use connections::{
     connections_path, load_connections, save_connections, ConnectionColor, ConnectionEntry,
-    ConnectionsFile, SslMode,
+    ConnectionsFile, DbKind, SslMode,
 };
 pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{
