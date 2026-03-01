@@ -843,9 +843,15 @@ fn parse_grid_cell_to_bson(value: &str, type_hint: Option<&str>, conservative: b
                 }
                 return Bson::String(value.to_string());
             }
-            "double" | "decimal128" => {
+            "double" => {
                 if let Ok(v) = value.trim().parse::<f64>() {
                     return Bson::Double(v);
+                }
+                return Bson::String(value.to_string());
+            }
+            "decimal128" => {
+                if let Ok(v) = value.trim().parse::<bson::Decimal128>() {
+                    return Bson::Decimal128(v);
                 }
                 return Bson::String(value.to_string());
             }
@@ -1155,21 +1161,30 @@ fn parse_mongo_query(query: &str) -> std::result::Result<MongoQuery, String> {
     }
 
     let rest = &trimmed[3..];
-    let (collection, after_collection) = rest
-        .split_once('.')
-        .ok_or_else(|| "Invalid mongosh query: expected db.<collection>.<op>(...)".to_string())?;
-    let open_paren = after_collection
+    let open_paren = rest
         .find('(')
         .ok_or_else(|| "Invalid mongosh query: missing '('".to_string())?;
-    let close_paren = after_collection
+    let close_paren = rest
         .rfind(')')
         .ok_or_else(|| "Invalid mongosh query: missing ')'".to_string())?;
-    if !after_collection[close_paren + 1..].trim().is_empty() {
+    if close_paren < open_paren {
+        return Err("Invalid mongosh query: malformed parentheses".to_string());
+    }
+    if !rest[close_paren + 1..].trim().is_empty() {
         return Err("Invalid mongosh query: unexpected trailing text".to_string());
     }
 
-    let op = after_collection[..open_paren].trim().to_lowercase();
-    let args_raw = &after_collection[open_paren + 1..close_paren];
+    let before_paren = rest[..open_paren].trim();
+    let dot_idx = before_paren
+        .rfind('.')
+        .ok_or_else(|| "Invalid mongosh query: expected db.<collection>.<op>(...)".to_string())?;
+    let collection = before_paren[..dot_idx].trim();
+    let op = before_paren[dot_idx + 1..].trim().to_lowercase();
+    if collection.is_empty() || op.is_empty() {
+        return Err("Invalid mongosh query: expected db.<collection>.<op>(...)".to_string());
+    }
+
+    let args_raw = &rest[open_paren + 1..close_paren];
     let args = split_top_level_args(args_raw);
     let empty = serde_json::json!({});
 
@@ -10506,6 +10521,30 @@ mod tests {
             matches!(oid_like, Bson::String(ref s) if s == "507f1f77bcf86cd799439011"),
             "string-typed cells should not be coerced to ObjectId"
         );
+    }
+
+    #[test]
+    fn test_parse_grid_cell_to_bson_decimal128_hint_preserves_decimal_type() {
+        let decimal =
+            parse_grid_cell_to_bson("12345678901234567890.1234", Some("decimal128"), true);
+        assert!(
+            matches!(decimal, Bson::Decimal128(_)),
+            "decimal128-typed cells should remain Decimal128 instead of Double"
+        );
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_dotted_collection_names() {
+        let parsed = parse_mongo_query(r#"db.fs.chunks.find({"files_id": 1})"#).unwrap();
+        match parsed {
+            MongoQuery::Find {
+                collection, filter, ..
+            } => {
+                assert_eq!(collection, "fs.chunks");
+                assert!(filter.contains_key("files_id"));
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
     }
 
     // ========== Connection Manager Issue Tests ==========
