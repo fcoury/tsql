@@ -804,7 +804,74 @@ fn bson_to_grid_cell(value: &Bson) -> String {
     }
 }
 
-fn parse_grid_cell_to_bson(value: &str) -> Bson {
+fn parse_grid_cell_to_bson(value: &str, type_hint: Option<&str>, conservative: bool) -> Bson {
+    let normalized_hint = type_hint
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if conservative {
+        match normalized_hint.as_str() {
+            "string" | "symbol" | "javascript" | "javascript-with-scope" => {
+                return Bson::String(value.to_string());
+            }
+            "objectid" => {
+                let trimmed = value.trim();
+                if trimmed.len() == 24 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Ok(oid) = ObjectId::parse_str(trimmed) {
+                        return Bson::ObjectId(oid);
+                    }
+                }
+                return Bson::String(value.to_string());
+            }
+            "bool" | "boolean" => {
+                if value.trim().eq_ignore_ascii_case("true") {
+                    return Bson::Boolean(true);
+                }
+                if value.trim().eq_ignore_ascii_case("false") {
+                    return Bson::Boolean(false);
+                }
+                return Bson::String(value.to_string());
+            }
+            "int32" => {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    return Bson::Int32(v);
+                }
+                return Bson::String(value.to_string());
+            }
+            "int64" => {
+                if let Ok(v) = value.trim().parse::<i64>() {
+                    return Bson::Int64(v);
+                }
+                return Bson::String(value.to_string());
+            }
+            "double" | "decimal128" => {
+                if let Ok(v) = value.trim().parse::<f64>() {
+                    return Bson::Double(v);
+                }
+                return Bson::String(value.to_string());
+            }
+            "null" => {
+                if value.trim().eq_ignore_ascii_case("null") {
+                    return Bson::Null;
+                }
+                return Bson::String(value.to_string());
+            }
+            "array" | "object" => {
+                let trimmed = value.trim();
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Ok(b) = bson::to_bson(&json) {
+                        return b;
+                    }
+                }
+                return Bson::String(value.to_string());
+            }
+            _ => {
+                if !normalized_hint.is_empty() {
+                    return Bson::String(value.to_string());
+                }
+            }
+        }
+    }
+
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("null") || trimmed.eq_ignore_ascii_case("NULL") {
         return Bson::Null;
@@ -885,23 +952,6 @@ enum MongoQuery {
         collection: String,
         filter: Document,
     },
-}
-
-impl MongoQuery {
-    fn collection_name(&self) -> &str {
-        match self {
-            MongoQuery::Find { collection, .. }
-            | MongoQuery::FindOne { collection, .. }
-            | MongoQuery::Aggregate { collection, .. }
-            | MongoQuery::CountDocuments { collection, .. }
-            | MongoQuery::InsertOne { collection, .. }
-            | MongoQuery::InsertMany { collection, .. }
-            | MongoQuery::UpdateOne { collection, .. }
-            | MongoQuery::UpdateMany { collection, .. }
-            | MongoQuery::DeleteOne { collection, .. }
-            | MongoQuery::DeleteMany { collection, .. } => collection,
-        }
-    }
 }
 
 fn json_value_to_document(value: &serde_json::Value) -> std::result::Result<Document, String> {
@@ -1308,6 +1358,7 @@ pub enum DbEvent {
     QueryCancelled,
     SchemaLoaded {
         tables: Vec<TableInfo>,
+        source_database: Option<String>,
     },
     /// A cell was successfully updated.
     CellUpdated {
@@ -4308,7 +4359,15 @@ impl App {
         };
 
         let mut set_doc = Document::new();
-        set_doc.insert(field_name, parse_grid_cell_to_bson(&new_value));
+        let field_type_hint = self
+            .grid
+            .col_types
+            .get(col)
+            .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
+        set_doc.insert(
+            field_name,
+            parse_grid_cell_to_bson(&new_value, field_type_hint, true),
+        );
         let mut update = Document::new();
         update.insert("$set", Bson::Document(set_doc));
 
@@ -4330,7 +4389,12 @@ impl App {
         if let Some(id_idx) = self.grid.headers.iter().position(|h| h == "_id") {
             if let Some(id_value) = row_values.get(id_idx) {
                 let mut filter = Document::new();
-                filter.insert("_id", parse_grid_cell_to_bson(id_value));
+                let id_type_hint = self
+                    .grid
+                    .col_types
+                    .get(id_idx)
+                    .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
+                filter.insert("_id", parse_grid_cell_to_bson(id_value, id_type_hint, true));
                 return Ok(filter);
             }
         }
@@ -4343,7 +4407,15 @@ impl App {
                     value = original;
                 }
             }
-            filter.insert(header.clone(), parse_grid_cell_to_bson(value));
+            let type_hint = self
+                .grid
+                .col_types
+                .get(idx)
+                .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
+            filter.insert(
+                header.clone(),
+                parse_grid_cell_to_bson(value, type_hint, true),
+            );
         }
 
         Ok(filter)
@@ -5519,7 +5591,12 @@ impl App {
                 let mut full_doc = serde_json::Map::new();
                 for (i, header) in self.grid.headers.iter().enumerate() {
                     let cell = row_values.get(i).cloned().unwrap_or_default();
-                    let bson_value = parse_grid_cell_to_bson(&cell);
+                    let type_hint = self
+                        .grid
+                        .col_types
+                        .get(i)
+                        .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
+                    let bson_value = parse_grid_cell_to_bson(&cell, type_hint, true);
                     let json_value = bson::from_bson::<serde_json::Value>(bson_value.clone())
                         .unwrap_or_else(|_| {
                             serde_json::Value::String(bson_to_grid_cell(&bson_value))
@@ -7348,7 +7425,10 @@ impl App {
                         });
                     }
 
-                    let _ = tx.send(DbEvent::SchemaLoaded { tables });
+                    let _ = tx.send(DbEvent::SchemaLoaded {
+                        tables,
+                        source_database: None,
+                    });
                 }
                 Err(_) => {
                     // Schema loading failed silently - not critical
@@ -7393,7 +7473,10 @@ impl App {
                             columns,
                         });
                     }
-                    let _ = tx.send(DbEvent::SchemaLoaded { tables });
+                    let _ = tx.send(DbEvent::SchemaLoaded {
+                        tables,
+                        source_database: Some(db_name.clone()),
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(DbEvent::QueryError {
@@ -8011,7 +8094,6 @@ impl App {
                 }
             };
 
-            let source_collection = parsed.collection_name().to_string();
             let db = client.database(&db_name);
 
             let result = match parsed {
@@ -8033,12 +8115,23 @@ impl App {
                         Ok(mut cursor) => {
                             let mut docs = Vec::new();
                             let mut truncated = false;
-                            while let Ok(Some(doc)) = cursor.try_next().await {
-                                if docs.len() >= max_rows {
-                                    truncated = true;
-                                    break;
+                            loop {
+                                match cursor.try_next().await {
+                                    Ok(Some(doc)) => {
+                                        if docs.len() >= max_rows {
+                                            truncated = true;
+                                            break;
+                                        }
+                                        docs.push(doc);
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        let _ = tx.send(DbEvent::QueryError {
+                                            error: format!("Mongo find cursor error: {e}"),
+                                        });
+                                        return;
+                                    }
                                 }
-                                docs.push(doc);
                             }
                             mongo_result_from_documents(
                                 docs,
@@ -8089,12 +8182,23 @@ impl App {
                         Ok(mut cursor) => {
                             let mut docs = Vec::new();
                             let mut truncated = false;
-                            while let Ok(Some(doc)) = cursor.try_next().await {
-                                if docs.len() >= max_rows {
-                                    truncated = true;
-                                    break;
+                            loop {
+                                match cursor.try_next().await {
+                                    Ok(Some(doc)) => {
+                                        if docs.len() >= max_rows {
+                                            truncated = true;
+                                            break;
+                                        }
+                                        docs.push(doc);
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        let _ = tx.send(DbEvent::QueryError {
+                                            error: format!("Mongo aggregate cursor error: {e}"),
+                                        });
+                                        return;
+                                    }
                                 }
-                                docs.push(doc);
                             }
                             mongo_result_from_documents(
                                 docs,
@@ -8120,7 +8224,7 @@ impl App {
                             command_tag: Some("countDocuments".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec!["int64".to_string()],
                         },
@@ -8146,7 +8250,7 @@ impl App {
                                 command_tag: Some("insertOne".to_string()),
                                 truncated: false,
                                 elapsed: started.elapsed(),
-                                source_table: Some(collection),
+                                source_table: None,
                                 primary_keys: Vec::new(),
                                 col_types: vec!["string".to_string(), "objectId".to_string()],
                             }
@@ -8174,7 +8278,7 @@ impl App {
                             command_tag: Some("insertMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec!["string".to_string(), "int64".to_string()],
                         },
@@ -8207,7 +8311,7 @@ impl App {
                             command_tag: Some("updateOne".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec![
                                 "string".to_string(),
@@ -8244,7 +8348,7 @@ impl App {
                             command_tag: Some("updateMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec![
                                 "string".to_string(),
@@ -8272,7 +8376,7 @@ impl App {
                             command_tag: Some("deleteOne".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec!["string".to_string(), "int64".to_string()],
                         },
@@ -8296,7 +8400,7 @@ impl App {
                             command_tag: Some("deleteMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
-                            source_table: Some(collection),
+                            source_table: None,
                             primary_keys: Vec::new(),
                             col_types: vec!["string".to_string(), "int64".to_string()],
                         },
@@ -8318,12 +8422,7 @@ impl App {
                 },
                 col_types: result.col_types.clone(),
             });
-            let _ = tx.send(DbEvent::QueryFinished {
-                result: QueryResult {
-                    source_table: Some(source_collection),
-                    ..result
-                },
-            });
+            let _ = tx.send(DbEvent::QueryFinished { result });
         });
     }
 
@@ -8551,7 +8650,15 @@ impl App {
                 self.query_ui.clear();
                 self.last_status = Some("Query cancelled".to_string());
             }
-            DbEvent::SchemaLoaded { tables } => {
+            DbEvent::SchemaLoaded {
+                tables,
+                source_database,
+            } => {
+                if self.db.kind == Some(DbKind::Mongo)
+                    && source_database.as_deref() != self.db.mongo_database.as_deref()
+                {
+                    return;
+                }
                 self.schema_cache.tables = tables;
                 self.schema_cache.loaded = true;
                 // Apply any pending schema expanded state from session restore
@@ -10331,6 +10438,73 @@ mod tests {
         assert!(
             status.contains("Mongo database \"admin\""),
             "expected conninfo to show active Mongo DB after :use; got: {status}"
+        );
+    }
+
+    #[test]
+    fn test_schema_loaded_ignores_stale_mongo_database_events() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.db.kind = Some(DbKind::Mongo);
+        app.db.mongo_database = Some("analytics".to_string());
+
+        app.apply_db_event(DbEvent::SchemaLoaded {
+            tables: vec![TableInfo {
+                schema: "admin".to_string(),
+                name: "users".to_string(),
+                columns: vec![ColumnInfo {
+                    name: "_id".to_string(),
+                    data_type: "objectId".to_string(),
+                }],
+            }],
+            source_database: Some("admin".to_string()),
+        });
+
+        assert!(
+            app.schema_cache.tables.is_empty(),
+            "stale Mongo schema should be ignored"
+        );
+        assert!(
+            !app.schema_cache.loaded,
+            "stale Mongo schema should not mark cache as loaded"
+        );
+
+        app.apply_db_event(DbEvent::SchemaLoaded {
+            tables: vec![TableInfo {
+                schema: "analytics".to_string(),
+                name: "events".to_string(),
+                columns: vec![ColumnInfo {
+                    name: "_id".to_string(),
+                    data_type: "objectId".to_string(),
+                }],
+            }],
+            source_database: Some("analytics".to_string()),
+        });
+
+        assert!(app.schema_cache.loaded);
+        assert_eq!(app.schema_cache.tables.len(), 1);
+        assert_eq!(app.schema_cache.tables[0].name, "events");
+    }
+
+    #[test]
+    fn test_parse_grid_cell_to_bson_string_hint_is_conservative() {
+        let numeric = parse_grid_cell_to_bson("123", Some("string"), true);
+        assert!(
+            matches!(numeric, Bson::String(ref s) if s == "123"),
+            "string-typed cells should not be coerced to numbers"
+        );
+
+        let oid_like = parse_grid_cell_to_bson("507f1f77bcf86cd799439011", Some("string"), true);
+        assert!(
+            matches!(oid_like, Bson::String(ref s) if s == "507f1f77bcf86cd799439011"),
+            "string-typed cells should not be coerced to ObjectId"
         );
     }
 

@@ -325,19 +325,17 @@ impl ConnectionEntry {
         };
 
         let database = url.path().trim_start_matches('/').to_string();
-        if database.is_empty() {
+        if kind == DbKind::Postgres && database.is_empty() {
             return Err(anyhow!("URL must contain a database name"));
         }
 
         let user = if url.username().is_empty() {
-            // Try to get from environment or use a default
-            let fallback = match kind {
-                DbKind::Postgres => "postgres",
-                DbKind::Mongo => "mongo",
-            };
-            std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| fallback.to_string())
+            match kind {
+                DbKind::Postgres => std::env::var("USER")
+                    .or_else(|_| std::env::var("USERNAME"))
+                    .unwrap_or_else(|_| "postgres".to_string()),
+                DbKind::Mongo => String::new(),
+            }
         } else {
             url.username().to_string()
         };
@@ -1154,6 +1152,25 @@ mod tests {
         let uri = entry.uri.as_deref().unwrap_or("");
         assert!(!uri.contains("secret"));
         assert!(uri.contains("authSource=admin"));
+    }
+
+    #[test]
+    fn test_connection_from_url_mongodb_without_username_keeps_empty_user() {
+        let (entry, password) =
+            ConnectionEntry::from_url("mongo", "mongodb://mongo.example.com:27017/sample").unwrap();
+        assert_eq!(entry.kind, DbKind::Mongo);
+        assert_eq!(entry.user, "");
+        assert!(password.is_none());
+    }
+
+    #[test]
+    fn test_connection_from_url_mongodb_without_database_is_allowed() {
+        let (entry, password) = ConnectionEntry::from_url("mongo", "mongodb://localhost").unwrap();
+        assert_eq!(entry.kind, DbKind::Mongo);
+        assert_eq!(entry.database, "");
+        assert_eq!(entry.user, "");
+        assert!(password.is_none());
+        assert!(entry.uri.is_some());
     }
 
     #[test]
