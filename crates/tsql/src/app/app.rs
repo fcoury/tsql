@@ -4059,6 +4059,8 @@ impl App {
     }
 
     fn maybe_start_scheduled_update_check(&mut self) {
+        let now = Instant::now();
+
         if self
             .update_state
             .should_check_on_startup(&self.config.updates)
@@ -4067,9 +4069,14 @@ impl App {
             return;
         }
 
+        if !self.config.updates.check_on_startup && !self.update_state.startup_check_started {
+            self.update_state.mark_startup_skipped(now);
+            return;
+        }
+
         if self
             .update_state
-            .should_check_by_interval(&self.config.updates, Instant::now())
+            .should_check_by_interval(&self.config.updates, now)
         {
             self.start_update_check(false, false);
         }
@@ -7845,6 +7852,26 @@ mod tests {
         } else {
             assert!(app.confirm_prompt.is_some());
         }
+    }
+
+    #[test]
+    fn test_check_on_startup_false_does_not_run_interval_immediately() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.config.updates.check_on_startup = false;
+
+        assert!(!app.update_state.startup_check_started);
+        assert!(app.update_state.last_checked_at.is_none());
+
+        app.maybe_start_scheduled_update_check();
+
+        assert!(!app.update_state.check_in_flight);
+        assert!(app.update_state.startup_check_started);
+        assert!(app.update_state.last_checked_at.is_some());
     }
 
     // ========== CellEditor Tests ==========
