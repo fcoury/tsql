@@ -40,6 +40,8 @@ ureq.workspace = true
 sha2.workspace = true
 flate2.workspace = true
 tar.workspace = true
+futures-util.workspace = true
+mongodb.workspace = true
 
 # Secure password storage
 keyring.workspace = true

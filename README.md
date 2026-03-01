@@ -1,6 +1,6 @@
 # tsql
 
-A modern, keyboard-first PostgreSQL CLI with a TUI interface.
+A modern, keyboard-first PostgreSQL and MongoDB CLI with a TUI interface.
 
 [![CI](https://github.com/fcoury/tsql/actions/workflows/ci.yml/badge.svg)](https://github.com/fcoury/tsql/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/tsql.svg)](https://crates.io/crates/tsql)
@@ -22,7 +22,8 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Results grid** - Scrollable, searchable data grid with column resizing, multi-row selection, and flexible yank (TSV/CSV/JSON/Markdown)
 - **Inline editing** - Edit cells directly in the grid with automatic SQL generation
 - **JSON support** - Detect, format, and edit JSON/JSONB columns with syntax highlighting
-- **psql compatibility** - Familiar commands like `\dt`, `\d`, `\dn`, `\l`, and more
+- **Postgres + MongoDB** - Connect with `postgres://...` or `mongodb://...` URLs
+- **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`)
 - **Query history** - Persistent history with fuzzy search, pinning, and deletion
 - **External editor** - Open the current query in `$VISUAL` / `$EDITOR` with `vv`
 - **1Password integration** - Store an `op://` secret reference per connection instead of a plain password
@@ -53,6 +54,7 @@ Download pre-built binaries from the [GitHub Releases](https://github.com/fcoury
 ```bash
 # Connect with a connection URL
 tsql postgres://user:password@localhost:5432/mydb
+tsql mongodb://user:password@localhost:27017/mydb
 
 # Or set DATABASE_URL environment variable
 export DATABASE_URL=postgres://user:password@localhost:5432/mydb
@@ -178,6 +180,10 @@ tsql --debug-keys --mouse
 | `:\di`                          | List indexes        |
 | `:\l`                           | List databases      |
 | `:\du`                          | List roles          |
+| `:show dbs`                     | Mongo: list databases |
+| `:show collections`             | Mongo: list collections |
+| `:describe <collection>`        | Mongo: describe collection |
+| `:use <database>`               | Mongo: switch database |
 
 `:update apply` is only available in `updates.mode = "auto"` and only for
 standalone binary installs.
@@ -225,7 +231,7 @@ session (for example via `op signin`).
 
 ## Requirements
 
-- PostgreSQL 12 or later
+- PostgreSQL 12 or later, or MongoDB 6.0+
 - Terminal with 256-color support recommended
 
 ## Contributing

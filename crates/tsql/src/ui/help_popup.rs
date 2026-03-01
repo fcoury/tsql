@@ -252,8 +252,12 @@ const COMMANDS: HelpSection = HelpSection::new(
 );
 
 const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
-    "Schema Commands (psql-style)",
+    "Schema Commands",
     &[
+        KeyBinding::new(":show dbs", "Mongo: list databases"),
+        KeyBinding::new(":show collections", "Mongo: list collections"),
+        KeyBinding::new(":describe <collection>", "Mongo: describe collection"),
+        KeyBinding::new(":use <database>", "Mongo: switch active database"),
         KeyBinding::new(":\\dt", "List tables"),
         KeyBinding::new(":\\d <table>", "Describe table"),
         KeyBinding::new(":\\dn", "List schemas"),

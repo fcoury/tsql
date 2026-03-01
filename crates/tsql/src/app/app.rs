@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +10,8 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::execute;
+use futures_util::TryStreamExt;
+use mongodb::bson::{self, doc, oid::ObjectId, Bson, Document};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Alignment;
@@ -34,7 +37,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::config::{
     load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
-    ConnectionsFile, KeyBinding, Keymap, SslMode, UpdateMode,
+    ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -745,13 +748,550 @@ fn extract_table_from_query(query: &str) -> Option<String> {
     }
 }
 
+fn is_mongo_connection_string(conn_str: &str) -> bool {
+    conn_str.starts_with("mongodb://") || conn_str.starts_with("mongodb+srv://")
+}
+
+fn mongo_database_from_connection_string(conn_str: &str) -> String {
+    if let Ok(url) = url::Url::parse(conn_str) {
+        let db = url.path().trim_start_matches('/').trim();
+        if !db.is_empty() {
+            return db.to_string();
+        }
+    }
+    "admin".to_string()
+}
+
+fn bson_type_name(value: &Bson) -> &'static str {
+    match value {
+        Bson::Double(_) => "double",
+        Bson::String(_) => "string",
+        Bson::Array(_) => "array",
+        Bson::Document(_) => "object",
+        Bson::Boolean(_) => "bool",
+        Bson::Null => "null",
+        Bson::RegularExpression(_) => "regex",
+        Bson::JavaScriptCode(_) => "javascript",
+        Bson::JavaScriptCodeWithScope(_) => "javascript-with-scope",
+        Bson::Int32(_) => "int32",
+        Bson::Int64(_) => "int64",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::Binary(_) => "binary",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Symbol(_) => "symbol",
+        Bson::Decimal128(_) => "decimal128",
+        Bson::Undefined => "undefined",
+        Bson::MaxKey => "maxKey",
+        Bson::MinKey => "minKey",
+        Bson::DbPointer(_) => "dbPointer",
+    }
+}
+
+fn bson_to_grid_cell(value: &Bson) -> String {
+    match value {
+        Bson::Null => "NULL".to_string(),
+        Bson::String(s) => s.clone(),
+        Bson::Boolean(v) => v.to_string(),
+        Bson::Int32(v) => v.to_string(),
+        Bson::Int64(v) => v.to_string(),
+        Bson::Double(v) => v.to_string(),
+        Bson::ObjectId(oid) => oid.to_hex(),
+        Bson::Document(_) | Bson::Array(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+        }
+        _ => format!("{value:?}"),
+    }
+}
+
+fn parse_grid_cell_to_bson(value: &str) -> Bson {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("null") || trimmed.eq_ignore_ascii_case("NULL") {
+        return Bson::Null;
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Bson::Boolean(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Bson::Boolean(false);
+    }
+    if trimmed.len() == 24 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(oid) = ObjectId::parse_str(trimmed) {
+            return Bson::ObjectId(oid);
+        }
+    }
+    if let Ok(v) = trimmed.parse::<i64>() {
+        return Bson::Int64(v);
+    }
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Bson::Double(v);
+    }
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(b) = bson::to_bson(&json) {
+                return b;
+            }
+        }
+    }
+    Bson::String(value.to_string())
+}
+
+#[derive(Debug, Clone)]
+enum MongoQuery {
+    Find {
+        collection: String,
+        filter: Document,
+        projection: Option<Document>,
+        limit: Option<i64>,
+    },
+    FindOne {
+        collection: String,
+        filter: Document,
+        projection: Option<Document>,
+    },
+    Aggregate {
+        collection: String,
+        pipeline: Vec<Document>,
+    },
+    CountDocuments {
+        collection: String,
+        filter: Document,
+    },
+    InsertOne {
+        collection: String,
+        document: Document,
+    },
+    InsertMany {
+        collection: String,
+        documents: Vec<Document>,
+    },
+    UpdateOne {
+        collection: String,
+        filter: Document,
+        update: Document,
+    },
+    UpdateMany {
+        collection: String,
+        filter: Document,
+        update: Document,
+    },
+    DeleteOne {
+        collection: String,
+        filter: Document,
+    },
+    DeleteMany {
+        collection: String,
+        filter: Document,
+    },
+}
+
+impl MongoQuery {
+    fn collection_name(&self) -> &str {
+        match self {
+            MongoQuery::Find { collection, .. }
+            | MongoQuery::FindOne { collection, .. }
+            | MongoQuery::Aggregate { collection, .. }
+            | MongoQuery::CountDocuments { collection, .. }
+            | MongoQuery::InsertOne { collection, .. }
+            | MongoQuery::InsertMany { collection, .. }
+            | MongoQuery::UpdateOne { collection, .. }
+            | MongoQuery::UpdateMany { collection, .. }
+            | MongoQuery::DeleteOne { collection, .. }
+            | MongoQuery::DeleteMany { collection, .. } => collection,
+        }
+    }
+}
+
+fn json_value_to_document(value: &serde_json::Value) -> std::result::Result<Document, String> {
+    let bson = bson::to_bson(value).map_err(|e| format!("Invalid BSON value: {e}"))?;
+    if let Bson::Document(doc) = bson {
+        Ok(doc)
+    } else {
+        Err("Expected JSON object".to_string())
+    }
+}
+
+fn json_value_to_documents(
+    value: &serde_json::Value,
+) -> std::result::Result<Vec<Document>, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "Expected JSON array".to_string())?;
+    arr.iter().map(json_value_to_document).collect()
+}
+
+fn split_top_level_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth_brace: usize = 0;
+    let mut depth_bracket: usize = 0;
+    let mut depth_paren: usize = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if in_string {
+            current.push(ch);
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                current.push(ch);
+            }
+            '{' => {
+                depth_brace += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth_brace = depth_brace.saturating_sub(1);
+                current.push(ch);
+            }
+            '[' => {
+                depth_bracket += 1;
+                current.push(ch);
+            }
+            ']' => {
+                depth_bracket = depth_bracket.saturating_sub(1);
+                current.push(ch);
+            }
+            '(' => {
+                depth_paren += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth_paren = depth_paren.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth_brace == 0 && depth_bracket == 0 && depth_paren == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    args.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        args.push(trimmed.to_string());
+    }
+
+    args
+}
+
+fn parse_mongo_query(query: &str) -> std::result::Result<MongoQuery, String> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return Err("Empty Mongo query".to_string());
+    }
+
+    if trimmed.starts_with('{') {
+        let payload: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("Invalid JSON command: {e}"))?;
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| "Mongo command JSON must be an object".to_string())?;
+        let op = obj
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Mongo command requires string field 'op'".to_string())?
+            .to_lowercase();
+        let collection = obj
+            .get("collection")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Mongo command requires string field 'collection'".to_string())?
+            .to_string();
+
+        let empty_obj = serde_json::json!({});
+        let filter_v = obj.get("filter").unwrap_or(&empty_obj);
+        let filter = json_value_to_document(filter_v)?;
+        let projection = obj
+            .get("projection")
+            .map(json_value_to_document)
+            .transpose()?;
+        let limit = obj.get("limit").and_then(|v| v.as_i64());
+
+        return match op.as_str() {
+            "find" => Ok(MongoQuery::Find {
+                collection,
+                filter,
+                projection,
+                limit,
+            }),
+            "findone" | "find_one" => Ok(MongoQuery::FindOne {
+                collection,
+                filter,
+                projection,
+            }),
+            "aggregate" => {
+                let pipeline_v = obj
+                    .get("pipeline")
+                    .ok_or_else(|| "aggregate requires field 'pipeline'".to_string())?;
+                let pipeline = json_value_to_documents(pipeline_v)?;
+                Ok(MongoQuery::Aggregate {
+                    collection,
+                    pipeline,
+                })
+            }
+            "countdocuments" | "count_documents" => {
+                Ok(MongoQuery::CountDocuments { collection, filter })
+            }
+            "insertone" | "insert_one" => {
+                let doc_v = obj
+                    .get("document")
+                    .ok_or_else(|| "insertOne requires field 'document'".to_string())?;
+                Ok(MongoQuery::InsertOne {
+                    collection,
+                    document: json_value_to_document(doc_v)?,
+                })
+            }
+            "insertmany" | "insert_many" => {
+                let docs_v = obj
+                    .get("documents")
+                    .ok_or_else(|| "insertMany requires field 'documents'".to_string())?;
+                Ok(MongoQuery::InsertMany {
+                    collection,
+                    documents: json_value_to_documents(docs_v)?,
+                })
+            }
+            "updateone" | "update_one" => {
+                let update_v = obj
+                    .get("update")
+                    .ok_or_else(|| "updateOne requires field 'update'".to_string())?;
+                Ok(MongoQuery::UpdateOne {
+                    collection,
+                    filter,
+                    update: json_value_to_document(update_v)?,
+                })
+            }
+            "updatemany" | "update_many" => {
+                let update_v = obj
+                    .get("update")
+                    .ok_or_else(|| "updateMany requires field 'update'".to_string())?;
+                Ok(MongoQuery::UpdateMany {
+                    collection,
+                    filter,
+                    update: json_value_to_document(update_v)?,
+                })
+            }
+            "deleteone" | "delete_one" => Ok(MongoQuery::DeleteOne { collection, filter }),
+            "deletemany" | "delete_many" => Ok(MongoQuery::DeleteMany { collection, filter }),
+            _ => Err(format!("Unsupported Mongo op '{op}'")),
+        };
+    }
+
+    if !trimmed.starts_with("db.") {
+        return Err(
+            "Mongo queries must use JSON command or mongosh-like db.collection.op(...) syntax"
+                .to_string(),
+        );
+    }
+
+    let rest = &trimmed[3..];
+    let (collection, after_collection) = rest
+        .split_once('.')
+        .ok_or_else(|| "Invalid mongosh query: expected db.<collection>.<op>(...)".to_string())?;
+    let open_paren = after_collection
+        .find('(')
+        .ok_or_else(|| "Invalid mongosh query: missing '('".to_string())?;
+    let close_paren = after_collection
+        .rfind(')')
+        .ok_or_else(|| "Invalid mongosh query: missing ')'".to_string())?;
+    if !after_collection[close_paren + 1..].trim().is_empty() {
+        return Err("Invalid mongosh query: unexpected trailing text".to_string());
+    }
+
+    let op = after_collection[..open_paren].trim().to_lowercase();
+    let args_raw = &after_collection[open_paren + 1..close_paren];
+    let args = split_top_level_args(args_raw);
+    let empty = serde_json::json!({});
+
+    let parse_arg = |idx: usize| -> std::result::Result<serde_json::Value, String> {
+        if let Some(arg) = args.get(idx) {
+            serde_json::from_str(arg).map_err(|e| format!("Invalid JSON argument {idx}: {e}"))
+        } else {
+            Ok(empty.clone())
+        }
+    };
+
+    match op.as_str() {
+        "find" => {
+            let filter = json_value_to_document(&parse_arg(0)?)?;
+            let projection = if args.len() > 1 {
+                Some(json_value_to_document(&parse_arg(1)?)?)
+            } else {
+                None
+            };
+            Ok(MongoQuery::Find {
+                collection: collection.to_string(),
+                filter,
+                projection,
+                limit: None,
+            })
+        }
+        "findone" => {
+            let filter = json_value_to_document(&parse_arg(0)?)?;
+            let projection = if args.len() > 1 {
+                Some(json_value_to_document(&parse_arg(1)?)?)
+            } else {
+                None
+            };
+            Ok(MongoQuery::FindOne {
+                collection: collection.to_string(),
+                filter,
+                projection,
+            })
+        }
+        "aggregate" => {
+            let pipeline = if let Some(arg0) = args.first() {
+                let value: serde_json::Value = serde_json::from_str(arg0)
+                    .map_err(|e| format!("Invalid pipeline JSON: {e}"))?;
+                json_value_to_documents(&value)?
+            } else {
+                Vec::new()
+            };
+            Ok(MongoQuery::Aggregate {
+                collection: collection.to_string(),
+                pipeline,
+            })
+        }
+        "countdocuments" => Ok(MongoQuery::CountDocuments {
+            collection: collection.to_string(),
+            filter: json_value_to_document(&parse_arg(0)?)?,
+        }),
+        "insertone" => Ok(MongoQuery::InsertOne {
+            collection: collection.to_string(),
+            document: json_value_to_document(&parse_arg(0)?)?,
+        }),
+        "insertmany" => {
+            let value = parse_arg(0)?;
+            Ok(MongoQuery::InsertMany {
+                collection: collection.to_string(),
+                documents: json_value_to_documents(&value)?,
+            })
+        }
+        "updateone" => Ok(MongoQuery::UpdateOne {
+            collection: collection.to_string(),
+            filter: json_value_to_document(&parse_arg(0)?)?,
+            update: json_value_to_document(&parse_arg(1)?)?,
+        }),
+        "updatemany" => Ok(MongoQuery::UpdateMany {
+            collection: collection.to_string(),
+            filter: json_value_to_document(&parse_arg(0)?)?,
+            update: json_value_to_document(&parse_arg(1)?)?,
+        }),
+        "deleteone" => Ok(MongoQuery::DeleteOne {
+            collection: collection.to_string(),
+            filter: json_value_to_document(&parse_arg(0)?)?,
+        }),
+        "deletemany" => Ok(MongoQuery::DeleteMany {
+            collection: collection.to_string(),
+            filter: json_value_to_document(&parse_arg(0)?)?,
+        }),
+        _ => Err(format!("Unsupported mongosh operation '{op}'")),
+    }
+}
+
+fn mongo_result_from_documents(
+    docs: Vec<Document>,
+    source_table: Option<String>,
+    elapsed: Duration,
+    truncated: bool,
+) -> QueryResult {
+    if docs.is_empty() {
+        return QueryResult {
+            headers: vec!["status".to_string()],
+            rows: vec![vec!["No documents".to_string()]],
+            command_tag: Some("0 rows".to_string()),
+            truncated,
+            elapsed,
+            source_table,
+            primary_keys: Vec::new(),
+            col_types: vec!["string".to_string()],
+        };
+    }
+
+    let mut seen = HashSet::new();
+    let mut headers = Vec::new();
+    for doc in &docs {
+        for key in doc.keys() {
+            if seen.insert(key.clone()) {
+                headers.push(key.clone());
+            }
+        }
+    }
+
+    let mut rows = Vec::with_capacity(docs.len());
+    for doc in &docs {
+        let mut row = Vec::with_capacity(headers.len());
+        for header in &headers {
+            let value = doc.get(header).map(bson_to_grid_cell).unwrap_or_default();
+            row.push(value);
+        }
+        rows.push(row);
+    }
+
+    let mut type_map: HashMap<String, String> = HashMap::new();
+    for header in &headers {
+        for doc in &docs {
+            if let Some(v) = doc.get(header) {
+                type_map.insert(header.clone(), bson_type_name(v).to_string());
+                break;
+            }
+        }
+    }
+    let col_types = headers
+        .iter()
+        .map(|h| type_map.get(h).cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    let primary_keys = if headers.iter().any(|h| h == "_id") {
+        vec!["_id".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    QueryResult {
+        command_tag: Some(format!("{} rows", rows.len())),
+        headers,
+        rows,
+        truncated,
+        elapsed,
+        source_table,
+        primary_keys,
+        col_types,
+    }
+}
+
 pub type SharedClient = Arc<Mutex<Client>>;
+pub type SharedMongoClient = Arc<mongodb::Client>;
 
 pub enum DbEvent {
     Connected {
         client: SharedClient,
         cancel_token: CancelToken,
         connected_with_tls: bool,
+    },
+    MongoConnected {
+        client: SharedMongoClient,
+        database: String,
     },
     ConnectError {
         error: String,
@@ -807,8 +1347,11 @@ pub enum DbEvent {
 
 pub struct DbSession {
     pub status: DbStatus,
+    pub kind: Option<DbKind>,
     pub conn_str: Option<String>,
     pub client: Option<SharedClient>,
+    pub mongo_client: Option<SharedMongoClient>,
+    pub mongo_database: Option<String>,
     pub cancel_token: Option<CancelToken>,
     pub last_command_tag: Option<String>,
     pub last_elapsed: Option<Duration>,
@@ -823,8 +1366,11 @@ impl DbSession {
     pub fn new() -> Self {
         Self {
             status: DbStatus::Disconnected,
+            kind: None,
             conn_str: None,
             client: None,
+            mongo_client: None,
+            mongo_database: None,
             cancel_token: None,
             last_command_tag: None,
             last_elapsed: None,
@@ -3334,7 +3880,14 @@ impl App {
             return;
         }
 
-        if !self.grid.has_valid_pk() {
+        if self.db.kind == Some(DbKind::Mongo) {
+            if !self.grid.headers.iter().any(|h| h == "_id") {
+                self.last_status = Some(
+                    "No _id column detected; Mongo updates will use best-effort field matching."
+                        .to_string(),
+                );
+            }
+        } else if !self.grid.has_valid_pk() {
             self.last_status = Some(
                 "No primary key detected; updates will match the first row by values.".to_string(),
             );
@@ -3622,6 +4175,11 @@ impl App {
 
     /// Commit a JSON edit to the database.
     fn commit_json_edit(&mut self, new_value: String, row: usize, col: usize) {
+        if self.db.kind == Some(DbKind::Mongo) {
+            self.commit_mongo_edit(new_value, row, col, None);
+            return;
+        }
+
         // Generate UPDATE SQL (similar to commit_cell_edit)
         let table = match &self.grid.source_table {
             Some(t) => t.clone(),
@@ -3672,6 +4230,12 @@ impl App {
             return;
         }
 
+        if self.db.kind == Some(DbKind::Mongo) {
+            self.cell_editor.close();
+            self.commit_mongo_edit(new_value, row, col, Some(original_value.as_str()));
+            return;
+        }
+
         // Generate UPDATE SQL
         let table = match &self.grid.source_table {
             Some(t) => t.clone(),
@@ -3712,6 +4276,139 @@ impl App {
         // Close editor and execute update
         self.cell_editor.close();
         self.execute_cell_update(update_sql, row, col, new_value);
+    }
+
+    fn commit_mongo_edit(
+        &mut self,
+        new_value: String,
+        row: usize,
+        col: usize,
+        edited_original_value: Option<&str>,
+    ) {
+        let collection = match &self.grid.source_table {
+            Some(t) => t.clone(),
+            None => {
+                self.last_error = Some("Cannot update: unknown source collection".to_string());
+                return;
+            }
+        };
+        let field_name = match self.grid.headers.get(col) {
+            Some(name) => name.clone(),
+            None => {
+                self.last_error = Some("Cannot update: invalid column".to_string());
+                return;
+            }
+        };
+        let filter = match self.build_mongo_update_filter(row, col, edited_original_value) {
+            Ok(f) => f,
+            Err(e) => {
+                self.last_error = Some(e);
+                return;
+            }
+        };
+
+        let mut set_doc = Document::new();
+        set_doc.insert(field_name, parse_grid_cell_to_bson(&new_value));
+        let mut update = Document::new();
+        update.insert("$set", Bson::Document(set_doc));
+
+        self.execute_mongo_cell_update(collection, filter, update, row, col, new_value);
+    }
+
+    fn build_mongo_update_filter(
+        &self,
+        row: usize,
+        edited_col: usize,
+        edited_original_value: Option<&str>,
+    ) -> Result<Document, String> {
+        let row_values = self
+            .grid
+            .rows
+            .get(row)
+            .ok_or_else(|| "Cannot update: invalid row".to_string())?;
+
+        if let Some(id_idx) = self.grid.headers.iter().position(|h| h == "_id") {
+            if let Some(id_value) = row_values.get(id_idx) {
+                let mut filter = Document::new();
+                filter.insert("_id", parse_grid_cell_to_bson(id_value));
+                return Ok(filter);
+            }
+        }
+
+        let mut filter = Document::new();
+        for (idx, header) in self.grid.headers.iter().enumerate() {
+            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
+            if idx == edited_col {
+                if let Some(original) = edited_original_value {
+                    value = original;
+                }
+            }
+            filter.insert(header.clone(), parse_grid_cell_to_bson(value));
+        }
+
+        Ok(filter)
+    }
+
+    fn execute_mongo_cell_update(
+        &mut self,
+        collection: String,
+        filter: Document,
+        update: Document,
+        row: usize,
+        col: usize,
+        new_value: String,
+    ) {
+        let Some(client) = self.db.mongo_client.clone() else {
+            self.last_error = Some("Not connected".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_error = Some("Another query is running".to_string());
+            return;
+        }
+        let db_name = self
+            .db
+            .mongo_database
+            .clone()
+            .unwrap_or_else(|| "admin".to_string());
+
+        self.db.running = true;
+        self.last_status = Some("Updating...".to_string());
+        self.query_ui.start();
+
+        let tx = self.db_events_tx.clone();
+        self.rt.spawn(async move {
+            let db = client.database(&db_name);
+            let coll = db.collection::<Document>(&collection);
+            match coll.update_one(filter, update).await {
+                Ok(res) => {
+                    if res.matched_count == 1 {
+                        let _ = tx.send(DbEvent::CellUpdated {
+                            row,
+                            col,
+                            value: new_value,
+                        });
+                    } else if res.matched_count == 0 {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: "Update matched 0 documents (document may have changed)"
+                                .to_string(),
+                        });
+                    } else {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!(
+                                "Update matched {} documents (ambiguous best-effort match)",
+                                res.matched_count
+                            ),
+                        });
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Mongo update error: {e}"),
+                    });
+                }
+            }
+        });
     }
 
     fn execute_cell_update(&mut self, sql: String, row: usize, col: usize, new_value: String) {
@@ -3964,6 +4661,9 @@ impl App {
             }
             "disconnect" | "dc" => {
                 self.db.client = None;
+                self.db.mongo_client = None;
+                self.db.mongo_database = None;
+                self.db.kind = None;
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
@@ -3979,36 +4679,118 @@ impl App {
             "gen" | "generate" => {
                 self.handle_gen_command(args);
             }
+            "show" => {
+                if self.db.kind != Some(DbKind::Mongo) {
+                    self.last_status = Some(
+                        "Mongo command ':show ...' is only available for Mongo connections"
+                            .to_string(),
+                    );
+                } else {
+                    match args {
+                        "dbs" | "databases" => self.execute_mongo_show_databases(),
+                        "collections" => self.execute_mongo_show_collections(),
+                        _ => {
+                            self.last_status =
+                                Some("Usage: :show dbs | :show collections".to_string());
+                        }
+                    }
+                }
+            }
+            "describe" => {
+                if self.db.kind != Some(DbKind::Mongo) {
+                    self.last_status = Some(
+                        "':describe <collection>' is only available for Mongo connections"
+                            .to_string(),
+                    );
+                } else if args.is_empty() {
+                    self.last_status = Some("Usage: :describe <collection>".to_string());
+                } else {
+                    self.execute_mongo_describe_collection(args);
+                }
+            }
+            "use" => {
+                if self.db.kind != Some(DbKind::Mongo) {
+                    self.last_status = Some(
+                        "':use <database>' is only available for Mongo connections".to_string(),
+                    );
+                } else if args.is_empty() {
+                    self.last_status = Some("Usage: :use <database>".to_string());
+                } else {
+                    self.db.mongo_database = Some(args.to_string());
+                    self.last_status = Some(format!("Switched to Mongo database '{}'", args));
+                    self.load_schema();
+                }
+            }
             // psql-style backslash commands
             "\\dt" | "dt" => {
-                self.execute_meta_query(META_QUERY_TABLES, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.execute_mongo_show_collections();
+                } else {
+                    self.execute_meta_query(META_QUERY_TABLES, None);
+                }
             }
             "\\dn" | "dn" => {
-                self.execute_meta_query(META_QUERY_SCHEMAS, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.last_status = Some("Use ':show dbs' for Mongo databases".to_string());
+                } else {
+                    self.execute_meta_query(META_QUERY_SCHEMAS, None);
+                }
             }
             "\\d" | "d" => {
-                if args.is_empty() {
-                    // \d without args is same as \dt
-                    self.execute_meta_query(META_QUERY_TABLES, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    if args.is_empty() {
+                        self.execute_mongo_show_collections();
+                    } else {
+                        self.execute_mongo_describe_collection(args);
+                    }
                 } else {
-                    // \d <table> - describe table
-                    self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
+                    if args.is_empty() {
+                        // \d without args is same as \dt
+                        self.execute_meta_query(META_QUERY_TABLES, None);
+                    } else {
+                        // \d <table> - describe table
+                        self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
+                    }
                 }
             }
             "\\di" | "di" => {
-                self.execute_meta_query(META_QUERY_INDEXES, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.last_status =
+                        Some("Mongo index listing via :\\di is not implemented yet".to_string());
+                } else {
+                    self.execute_meta_query(META_QUERY_INDEXES, None);
+                }
             }
             "\\l" | "l" => {
-                self.execute_meta_query(META_QUERY_DATABASES, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.execute_mongo_show_databases();
+                } else {
+                    self.execute_meta_query(META_QUERY_DATABASES, None);
+                }
             }
             "\\du" | "du" => {
-                self.execute_meta_query(META_QUERY_ROLES, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.last_status =
+                        Some("Mongo users listing via :\\du is not implemented yet".to_string());
+                } else {
+                    self.execute_meta_query(META_QUERY_ROLES, None);
+                }
             }
             "\\dv" | "dv" => {
-                self.execute_meta_query(META_QUERY_VIEWS, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.last_status =
+                        Some("Mongo views listing via :\\dv is not implemented yet".to_string());
+                } else {
+                    self.execute_meta_query(META_QUERY_VIEWS, None);
+                }
             }
             "\\df" | "df" => {
-                self.execute_meta_query(META_QUERY_FUNCTIONS, None);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    self.last_status =
+                        Some("Mongo functions via :\\df are not applicable".to_string());
+                } else {
+                    self.execute_meta_query(META_QUERY_FUNCTIONS, None);
+                }
             }
             "\\conninfo" | "conninfo" => {
                 self.show_connection_info();
@@ -4414,6 +5196,148 @@ impl App {
         });
     }
 
+    fn execute_mongo_show_databases(&mut self) {
+        let Some(client) = self.db.mongo_client.clone() else {
+            self.last_error = Some("Not connected to Mongo.".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+        self.query_ui.start();
+
+        let tx = self.db_events_tx.clone();
+        let started = Instant::now();
+        self.rt.spawn(async move {
+            match client.list_database_names().await {
+                Ok(names) => {
+                    let rows = names.into_iter().map(|n| vec![n]).collect::<Vec<_>>();
+                    let result = QueryResult {
+                        headers: vec!["name".to_string()],
+                        rows,
+                        command_tag: Some("show dbs".to_string()),
+                        truncated: false,
+                        elapsed: started.elapsed(),
+                        source_table: None,
+                        primary_keys: Vec::new(),
+                        col_types: vec!["string".to_string()],
+                    };
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Mongo show dbs error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    fn execute_mongo_show_collections(&mut self) {
+        let Some(client) = self.db.mongo_client.clone() else {
+            self.last_error = Some("Not connected to Mongo.".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        let db_name = self
+            .db
+            .mongo_database
+            .clone()
+            .unwrap_or_else(|| "admin".to_string());
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+        self.query_ui.start();
+
+        let tx = self.db_events_tx.clone();
+        let started = Instant::now();
+        self.rt.spawn(async move {
+            let db = client.database(&db_name);
+            match db.list_collection_names().await {
+                Ok(names) => {
+                    let rows = names.into_iter().map(|n| vec![n]).collect::<Vec<_>>();
+                    let result = QueryResult {
+                        headers: vec!["collection".to_string()],
+                        rows,
+                        command_tag: Some("show collections".to_string()),
+                        truncated: false,
+                        elapsed: started.elapsed(),
+                        source_table: None,
+                        primary_keys: Vec::new(),
+                        col_types: vec!["string".to_string()],
+                    };
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Mongo show collections error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    fn execute_mongo_describe_collection(&mut self, collection_name: &str) {
+        let Some(client) = self.db.mongo_client.clone() else {
+            self.last_error = Some("Not connected to Mongo.".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        let db_name = self
+            .db
+            .mongo_database
+            .clone()
+            .unwrap_or_else(|| "admin".to_string());
+        let collection_name = collection_name.to_string();
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+        self.query_ui.start();
+
+        let tx = self.db_events_tx.clone();
+        let started = Instant::now();
+        self.rt.spawn(async move {
+            let db = client.database(&db_name);
+            let coll = db.collection::<Document>(&collection_name);
+            match coll.find_one(doc! {}).await {
+                Ok(sample) => {
+                    let mut rows = Vec::new();
+                    if let Some(doc) = sample {
+                        for (field, value) in doc {
+                            rows.push(vec![field, bson_type_name(&value).to_string()]);
+                        }
+                    }
+                    let result = QueryResult {
+                        headers: vec!["field".to_string(), "type".to_string()],
+                        rows,
+                        command_tag: Some(format!("describe {}", collection_name)),
+                        truncated: false,
+                        elapsed: started.elapsed(),
+                        source_table: Some(collection_name),
+                        primary_keys: Vec::new(),
+                        col_types: vec!["string".to_string(), "string".to_string()],
+                    };
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Mongo describe error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     fn handle_export_command(&mut self, args: &str) {
         if self.grid.rows.is_empty() {
             self.last_error = Some("No data to export".to_string());
@@ -4488,15 +5412,33 @@ impl App {
             }
             DbStatus::Connected => {
                 if let Some(ref conn_str) = self.db.conn_str {
-                    let info = ConnectionInfo::parse(conn_str);
+                    let mut info = ConnectionInfo::parse(conn_str);
+                    if self.db.kind == Some(DbKind::Mongo) {
+                        if let Some(active_db) = self.db.mongo_database.as_ref() {
+                            info.database = Some(active_db.clone());
+                        }
+                    }
                     let user = info.user.as_deref().unwrap_or("unknown");
                     let host = info.host.as_deref().unwrap_or("localhost");
-                    let port = info.port.unwrap_or(5432);
+                    let port = info.port.unwrap_or_else(|| {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            27017
+                        } else {
+                            5432
+                        }
+                    });
                     let database = info.database.as_deref().unwrap_or("unknown");
-                    self.last_status = Some(format!(
-                        "Connected to database \"{}\" as user \"{}\" on host \"{}\" port {}.",
-                        database, user, host, port
-                    ));
+                    if self.db.kind == Some(DbKind::Mongo) {
+                        self.last_status = Some(format!(
+                            "Connected to Mongo database \"{}\" as user \"{}\" on host \"{}\" port {}.",
+                            database, user, host, port
+                        ));
+                    } else {
+                        self.last_status = Some(format!(
+                            "Connected to database \"{}\" as user \"{}\" on host \"{}\" port {}.",
+                            database, user, host, port
+                        ));
+                    }
                 } else {
                     self.last_status =
                         Some("Connected (no connection string available).".to_string());
@@ -4566,6 +5508,98 @@ impl App {
                 None
             }
         });
+
+        if self.db.kind == Some(DbKind::Mongo) {
+            let mut commands = Vec::new();
+            for row_idx in &row_indices {
+                let Some(row_values) = self.grid.rows.get(*row_idx) else {
+                    continue;
+                };
+
+                let mut full_doc = serde_json::Map::new();
+                for (i, header) in self.grid.headers.iter().enumerate() {
+                    let cell = row_values.get(i).cloned().unwrap_or_default();
+                    let bson_value = parse_grid_cell_to_bson(&cell);
+                    let json_value = bson::from_bson::<serde_json::Value>(bson_value.clone())
+                        .unwrap_or_else(|_| {
+                            serde_json::Value::String(bson_to_grid_cell(&bson_value))
+                        });
+                    full_doc.insert(header.clone(), json_value);
+                }
+
+                let filter_keys = key_columns
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| {
+                        if self.grid.headers.iter().any(|h| h == "_id") {
+                            Some(vec!["_id".to_string()])
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| self.grid.headers.clone());
+
+                let mut filter = serde_json::Map::new();
+                for key in &filter_keys {
+                    if let Some(value) = full_doc.get(key) {
+                        filter.insert(key.clone(), value.clone());
+                    }
+                }
+
+                let command = match gen_type.as_str() {
+                    "update" | "u" => {
+                        let mut set_obj = serde_json::Map::new();
+                        for (k, v) in &full_doc {
+                            if !filter_keys.iter().any(|fk| fk == k) {
+                                set_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                        serde_json::json!({
+                            "op": "updateOne",
+                            "collection": table.clone(),
+                            "filter": serde_json::Value::Object(filter.clone()),
+                            "update": { "$set": serde_json::Value::Object(set_obj) }
+                        })
+                    }
+                    "delete" | "d" => serde_json::json!({
+                        "op": "deleteOne",
+                        "collection": table.clone(),
+                        "filter": serde_json::Value::Object(filter.clone())
+                    }),
+                    "insert" | "i" => serde_json::json!({
+                        "op": "insertOne",
+                        "collection": table.clone(),
+                        "document": serde_json::Value::Object(full_doc.clone())
+                    }),
+                    _ => {
+                        self.last_error = Some(format!(
+                            "Unknown generate type: {}. Use update, delete, or insert.",
+                            gen_type
+                        ));
+                        return;
+                    }
+                };
+                commands.push(command);
+            }
+
+            let generated = commands
+                .into_iter()
+                .map(|c| serde_json::to_string_pretty(&c).unwrap_or_else(|_| c.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            self.editor.textarea.select_all();
+            self.editor.textarea.cut();
+            self.editor.textarea.insert_str(&generated);
+            self.focus = Focus::Query;
+            self.mode = Mode::Normal;
+            self.last_status = Some(format!(
+                "Generated {} Mongo command statement{}",
+                row_indices.len(),
+                if row_indices.len() == 1 { "" } else { "s" }
+            ));
+            return;
+        }
 
         let sql = match gen_type.as_str() {
             "update" | "u" => {
@@ -5363,8 +6397,11 @@ impl App {
 
     pub fn start_connect(&mut self, conn_str: String) {
         self.db.status = DbStatus::Connecting;
+        self.db.kind = None;
         self.db.conn_str = Some(conn_str.clone());
         self.db.client = None;
+        self.db.mongo_client = None;
+        self.db.mongo_database = None;
         self.db.running = false;
         self.query_ui.clear();
         self.db.connected_with_tls = false;
@@ -5375,6 +6412,32 @@ impl App {
         let rt = self.rt.clone();
 
         self.rt.spawn(async move {
+            if is_mongo_connection_string(&conn_str) {
+                match mongodb::Client::with_uri_str(&conn_str).await {
+                    Ok(client) => {
+                        let db_name = mongo_database_from_connection_string(&conn_str);
+                        // Best-effort ping to fail fast for invalid credentials/transport.
+                        let ping_db = client.database("admin");
+                        if let Err(e) = ping_db.run_command(doc! { "ping": 1 }).await {
+                            let _ = tx.send(DbEvent::ConnectError {
+                                error: format!("Mongo connection error: {e}"),
+                            });
+                            return;
+                        }
+                        let _ = tx.send(DbEvent::MongoConnected {
+                            client: Arc::new(client),
+                            database: db_name,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::ConnectError {
+                            error: format!("Mongo connection error: {e}"),
+                        });
+                    }
+                }
+                return;
+            }
+
             let ssl_mode = match resolve_ssl_mode(&conn_str) {
                 Ok(m) => m,
                 Err(msg) => {
@@ -5832,11 +6895,53 @@ impl App {
                 };
 
                 let sql = match completed.action {
-                    KeySequenceAction::SchemaTableSelect => self.build_select_template(&ctx),
-                    KeySequenceAction::SchemaTableInsert => self.build_insert_template(&ctx),
-                    KeySequenceAction::SchemaTableUpdate => self.build_update_template(&ctx),
-                    KeySequenceAction::SchemaTableDelete => self.build_delete_template(&ctx),
-                    KeySequenceAction::SchemaTableName => self.format_table_name_only(&ctx.table),
+                    KeySequenceAction::SchemaTableSelect => {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            format!(
+                                "{{\n  \"op\": \"find\",\n  \"collection\": \"{}\",\n  \"filter\": {{}},\n  \"limit\": {}\n}}",
+                                ctx.table, self.config.sql.default_select_limit
+                            )
+                        } else {
+                            self.build_select_template(&ctx)
+                        }
+                    }
+                    KeySequenceAction::SchemaTableInsert => {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            format!(
+                                "{{\n  \"op\": \"insertOne\",\n  \"collection\": \"{}\",\n  \"document\": {{}}\n}}",
+                                ctx.table
+                            )
+                        } else {
+                            self.build_insert_template(&ctx)
+                        }
+                    }
+                    KeySequenceAction::SchemaTableUpdate => {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            format!(
+                                "{{\n  \"op\": \"updateMany\",\n  \"collection\": \"{}\",\n  \"filter\": {{}},\n  \"update\": {{\"$set\": {{}}}}\n}}",
+                                ctx.table
+                            )
+                        } else {
+                            self.build_update_template(&ctx)
+                        }
+                    }
+                    KeySequenceAction::SchemaTableDelete => {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            format!(
+                                "{{\n  \"op\": \"deleteMany\",\n  \"collection\": \"{}\",\n  \"filter\": {{}}\n}}",
+                                ctx.table
+                            )
+                        } else {
+                            self.build_delete_template(&ctx)
+                        }
+                    }
+                    KeySequenceAction::SchemaTableName => {
+                        if self.db.kind == Some(DbKind::Mongo) {
+                            ctx.table.clone()
+                        } else {
+                            self.format_table_name_only(&ctx.table)
+                        }
+                    }
                     _ => return,
                 };
 
@@ -6058,17 +7163,6 @@ impl App {
 
                 let tx = self.db_events_tx.clone();
                 self.rt.spawn(async move {
-                    let ssl_mode = match resolve_ssl_mode(&url) {
-                        Ok(m) => m,
-                        Err(msg) => {
-                            let _ = tx.send(DbEvent::TestConnectionResult {
-                                success: false,
-                                message: format!("Connection failed: {msg}"),
-                            });
-                            return;
-                        }
-                    };
-
                     let send_ok = |tx: &mpsc::UnboundedSender<DbEvent>| {
                         let _ = tx.send(DbEvent::TestConnectionResult {
                             success: true,
@@ -6081,6 +7175,41 @@ impl App {
                             success: false,
                             message: format!("Connection failed: {}", format_pg_error(&e)),
                         });
+                    };
+                    if entry.kind == DbKind::Mongo {
+                        match mongodb::Client::with_uri_str(&url).await {
+                            Ok(client) => match client
+                                .database("admin")
+                                .run_command(doc! { "ping": 1 })
+                                .await
+                            {
+                                Ok(_) => send_ok(&tx),
+                                Err(e) => {
+                                    let _ = tx.send(DbEvent::TestConnectionResult {
+                                        success: false,
+                                        message: format!("Connection failed: {}", e),
+                                    });
+                                }
+                            },
+                            Err(e) => {
+                                let _ = tx.send(DbEvent::TestConnectionResult {
+                                    success: false,
+                                    message: format!("Connection failed: {}", e),
+                                });
+                            }
+                        }
+                        return;
+                    }
+
+                    let ssl_mode = match resolve_ssl_mode(&url) {
+                        Ok(m) => m,
+                        Err(msg) => {
+                            let _ = tx.send(DbEvent::TestConnectionResult {
+                                success: false,
+                                message: format!("Connection failed: {msg}"),
+                            });
+                            return;
+                        }
                     };
 
                     match ssl_mode {
@@ -6147,6 +7276,11 @@ impl App {
     }
 
     fn load_schema(&mut self) {
+        if self.db.kind == Some(DbKind::Mongo) {
+            self.load_mongo_schema();
+            return;
+        }
+
         let Some(client) = self.db.client.clone() else {
             return;
         };
@@ -6218,6 +7352,53 @@ impl App {
                 }
                 Err(_) => {
                     // Schema loading failed silently - not critical
+                }
+            }
+        });
+    }
+
+    fn load_mongo_schema(&mut self) {
+        let Some(client) = self.db.mongo_client.clone() else {
+            return;
+        };
+        let db_name = self
+            .db
+            .mongo_database
+            .clone()
+            .unwrap_or_else(|| "admin".to_string());
+        let tx = self.db_events_tx.clone();
+
+        self.rt.spawn(async move {
+            let db = client.database(&db_name);
+            let mut tables = Vec::new();
+
+            match db.list_collection_names().await {
+                Ok(collections) => {
+                    for collection_name in collections {
+                        let coll = db.collection::<Document>(&collection_name);
+                        let sample = coll.find_one(doc! {}).await.ok().flatten();
+                        let columns = sample
+                            .map(|doc| {
+                                doc.iter()
+                                    .map(|(k, v)| ColumnInfo {
+                                        name: k.clone(),
+                                        data_type: bson_type_name(v).to_string(),
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        tables.push(TableInfo {
+                            schema: db_name.clone(),
+                            name: collection_name,
+                            columns,
+                        });
+                    }
+                    let _ = tx.send(DbEvent::SchemaLoaded { tables });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Mongo schema load failed: {e}"),
+                    });
                 }
             }
         });
@@ -6356,19 +7537,6 @@ impl App {
             .map(|s| ConnectionInfo::parse(s).format(50));
         self.history.push(query.clone(), conn_info);
 
-        let Some(client) = self.db.client.clone() else {
-            self.last_error =
-                Some("Not connected. Use :connect <url> or set DATABASE_URL.".to_string());
-            return;
-        };
-
-        // If a previous paged query is still active, abandon it so we can run a new one.
-        // Dropping `paged_query` closes the fetch-more channel; the background cursor task
-        // will see `recv().await` return None, issue `CLOSE tsql_cursor`, and exit.
-        if self.paged_query.is_some() {
-            self.paged_query = None;
-        }
-
         // Only block if a query is actively running (not just an idle paged cursor)
         if self.db.running {
             self.last_status = Some("Query already running".to_string());
@@ -6380,8 +7548,42 @@ impl App {
         self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
-        let source_table = extract_table_from_query(&query);
         let max_rows = effective_max_rows(self.config.connection.max_rows);
+
+        if self.db.kind == Some(DbKind::Mongo) {
+            let Some(client) = self.db.mongo_client.clone() else {
+                self.last_error =
+                    Some("Not connected. Use :connect <mongodb://...> first.".to_string());
+                self.db.running = false;
+                self.query_ui.clear();
+                return;
+            };
+            let db_name = self
+                .db
+                .mongo_database
+                .clone()
+                .unwrap_or_else(|| "admin".to_string());
+            self.paged_query = None;
+            self.execute_query_mongo(client, db_name, query, max_rows, tx);
+            return;
+        }
+
+        let Some(client) = self.db.client.clone() else {
+            self.last_error =
+                Some("Not connected. Use :connect <url> or set DATABASE_URL.".to_string());
+            self.db.running = false;
+            self.query_ui.clear();
+            return;
+        };
+
+        // If a previous paged query is still active, abandon it so we can run a new one.
+        // Dropping `paged_query` closes the fetch-more channel; the background cursor task
+        // will see `recv().await` return None, issue `CLOSE tsql_cursor`, and exit.
+        if self.paged_query.is_some() {
+            self.paged_query = None;
+        }
+
+        let source_table = extract_table_from_query(&query);
         let page_size = DEFAULT_PAGE_SIZE;
 
         // Use cursor-based paging for simple SELECT queries
@@ -6790,6 +7992,341 @@ impl App {
         });
     }
 
+    fn execute_query_mongo(
+        &self,
+        client: SharedMongoClient,
+        db_name: String,
+        query: String,
+        max_rows: usize,
+        tx: mpsc::UnboundedSender<DbEvent>,
+    ) {
+        let started = Instant::now();
+
+        self.rt.spawn(async move {
+            let parsed = match parse_mongo_query(&query) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError { error: e });
+                    return;
+                }
+            };
+
+            let source_collection = parsed.collection_name().to_string();
+            let db = client.database(&db_name);
+
+            let result = match parsed {
+                MongoQuery::Find {
+                    collection,
+                    filter,
+                    projection,
+                    limit,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    let mut action = coll.find(filter);
+                    if let Some(proj) = projection {
+                        action = action.projection(proj);
+                    }
+                    if let Some(limit) = limit {
+                        action = action.limit(limit);
+                    }
+                    match action.await {
+                        Ok(mut cursor) => {
+                            let mut docs = Vec::new();
+                            let mut truncated = false;
+                            while let Ok(Some(doc)) = cursor.try_next().await {
+                                if docs.len() >= max_rows {
+                                    truncated = true;
+                                    break;
+                                }
+                                docs.push(doc);
+                            }
+                            mongo_result_from_documents(
+                                docs,
+                                Some(collection),
+                                started.elapsed(),
+                                truncated,
+                            )
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo find error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::FindOne {
+                    collection,
+                    filter,
+                    projection,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    let mut action = coll.find_one(filter);
+                    if let Some(proj) = projection {
+                        action = action.projection(proj);
+                    }
+                    match action.await {
+                        Ok(doc) => mongo_result_from_documents(
+                            doc.into_iter().collect(),
+                            Some(collection),
+                            started.elapsed(),
+                            false,
+                        ),
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo findOne error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::Aggregate {
+                    collection,
+                    pipeline,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.aggregate(pipeline).await {
+                        Ok(mut cursor) => {
+                            let mut docs = Vec::new();
+                            let mut truncated = false;
+                            while let Ok(Some(doc)) = cursor.try_next().await {
+                                if docs.len() >= max_rows {
+                                    truncated = true;
+                                    break;
+                                }
+                                docs.push(doc);
+                            }
+                            mongo_result_from_documents(
+                                docs,
+                                Some(collection),
+                                started.elapsed(),
+                                truncated,
+                            )
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo aggregate error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::CountDocuments { collection, filter } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.count_documents(filter).await {
+                        Ok(count) => QueryResult {
+                            headers: vec!["count".to_string()],
+                            rows: vec![vec![count.to_string()]],
+                            command_tag: Some("countDocuments".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec!["int64".to_string()],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo countDocuments error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::InsertOne {
+                    collection,
+                    document,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.insert_one(document).await {
+                        Ok(res) => {
+                            let inserted_id = bson_to_grid_cell(&res.inserted_id);
+                            QueryResult {
+                                headers: vec!["status".to_string(), "inserted_id".to_string()],
+                                rows: vec![vec!["insertOne".to_string(), inserted_id]],
+                                command_tag: Some("insertOne".to_string()),
+                                truncated: false,
+                                elapsed: started.elapsed(),
+                                source_table: Some(collection),
+                                primary_keys: Vec::new(),
+                                col_types: vec!["string".to_string(), "objectId".to_string()],
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo insertOne error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::InsertMany {
+                    collection,
+                    documents,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.insert_many(documents).await {
+                        Ok(res) => QueryResult {
+                            headers: vec!["status".to_string(), "inserted_count".to_string()],
+                            rows: vec![vec![
+                                "insertMany".to_string(),
+                                res.inserted_ids.len().to_string(),
+                            ]],
+                            command_tag: Some("insertMany".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec!["string".to_string(), "int64".to_string()],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo insertMany error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::UpdateOne {
+                    collection,
+                    filter,
+                    update,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.update_one(filter, update).await {
+                        Ok(res) => QueryResult {
+                            headers: vec![
+                                "status".to_string(),
+                                "matched".to_string(),
+                                "modified".to_string(),
+                            ],
+                            rows: vec![vec![
+                                "updateOne".to_string(),
+                                res.matched_count.to_string(),
+                                res.modified_count.to_string(),
+                            ]],
+                            command_tag: Some("updateOne".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec![
+                                "string".to_string(),
+                                "int64".to_string(),
+                                "int64".to_string(),
+                            ],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo updateOne error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::UpdateMany {
+                    collection,
+                    filter,
+                    update,
+                } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.update_many(filter, update).await {
+                        Ok(res) => QueryResult {
+                            headers: vec![
+                                "status".to_string(),
+                                "matched".to_string(),
+                                "modified".to_string(),
+                            ],
+                            rows: vec![vec![
+                                "updateMany".to_string(),
+                                res.matched_count.to_string(),
+                                res.modified_count.to_string(),
+                            ]],
+                            command_tag: Some("updateMany".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec![
+                                "string".to_string(),
+                                "int64".to_string(),
+                                "int64".to_string(),
+                            ],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo updateMany error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::DeleteOne { collection, filter } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.delete_one(filter).await {
+                        Ok(res) => QueryResult {
+                            headers: vec!["status".to_string(), "deleted".to_string()],
+                            rows: vec![vec![
+                                "deleteOne".to_string(),
+                                res.deleted_count.to_string(),
+                            ]],
+                            command_tag: Some("deleteOne".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec!["string".to_string(), "int64".to_string()],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo deleteOne error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                MongoQuery::DeleteMany { collection, filter } => {
+                    let coll = db.collection::<Document>(&collection);
+                    match coll.delete_many(filter).await {
+                        Ok(res) => QueryResult {
+                            headers: vec!["status".to_string(), "deleted".to_string()],
+                            rows: vec![vec![
+                                "deleteMany".to_string(),
+                                res.deleted_count.to_string(),
+                            ]],
+                            command_tag: Some("deleteMany".to_string()),
+                            truncated: false,
+                            elapsed: started.elapsed(),
+                            source_table: Some(collection),
+                            primary_keys: Vec::new(),
+                            col_types: vec!["string".to_string(), "int64".to_string()],
+                        },
+                        Err(e) => {
+                            let _ = tx.send(DbEvent::QueryError {
+                                error: format!("Mongo deleteMany error: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let _ = tx.send(DbEvent::MetadataLoaded {
+                primary_keys: if result.headers.iter().any(|h| h == "_id") {
+                    vec!["_id".to_string()]
+                } else {
+                    Vec::new()
+                },
+                col_types: result.col_types.clone(),
+            });
+            let _ = tx.send(DbEvent::QueryFinished {
+                result: QueryResult {
+                    source_table: Some(source_collection),
+                    ..result
+                },
+            });
+        });
+    }
+
     /// Check if we should fetch more rows for a paged query.
     /// Called after grid navigation to implement auto-fetch on scroll.
     fn maybe_fetch_more_rows(&mut self) {
@@ -6831,6 +8368,13 @@ impl App {
         let paged_loading = self.paged_query.as_ref().is_some_and(|p| p.loading);
 
         if !self.db.running && !paged_loading {
+            return;
+        }
+
+        if self.db.kind == Some(DbKind::Mongo) {
+            self.last_status = Some(
+                "Mongo cancellation is not yet supported; wait for query completion".to_string(),
+            );
             return;
         }
 
@@ -6881,7 +8425,10 @@ impl App {
                 connected_with_tls,
             } => {
                 self.db.status = DbStatus::Connected;
+                self.db.kind = Some(DbKind::Postgres);
                 self.db.client = Some(client);
+                self.db.mongo_client = None;
+                self.db.mongo_database = None;
                 self.db.cancel_token = Some(cancel_token);
                 self.db.running = false;
                 self.db.connected_with_tls = connected_with_tls;
@@ -6890,9 +8437,28 @@ impl App {
                 // Load schema for completion
                 self.load_schema();
             }
+            DbEvent::MongoConnected { client, database } => {
+                self.db.status = DbStatus::Connected;
+                self.db.kind = Some(DbKind::Mongo);
+                self.db.client = None;
+                self.db.mongo_client = Some(client);
+                self.db.mongo_database = Some(database.clone());
+                self.db.cancel_token = None;
+                self.db.running = false;
+                self.db.in_transaction = false;
+                self.db.connected_with_tls = true;
+                self.query_ui.clear();
+                self.last_status = Some(format!(
+                    "Connected to Mongo ({database}), loading schema..."
+                ));
+                self.load_schema();
+            }
             DbEvent::ConnectError { error } => {
                 self.db.status = DbStatus::Error;
+                self.db.kind = None;
                 self.db.client = None;
+                self.db.mongo_client = None;
+                self.db.mongo_database = None;
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
@@ -6901,7 +8467,10 @@ impl App {
             }
             DbEvent::ConnectionLost { error } => {
                 self.db.status = DbStatus::Error;
+                self.db.kind = None;
                 self.db.client = None;
+                self.db.mongo_client = None;
+                self.db.mongo_database = None;
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
@@ -6939,8 +8508,11 @@ impl App {
                     .with_col_types(result.col_types);
                 self.grid_state = GridState::default();
 
-                // Update command_tag to reflect actual row count
-                self.db.last_command_tag = Some(format!("{} rows", self.grid.rows.len()));
+                // Prefer engine-provided command tag, fallback to row count.
+                self.db.last_command_tag = result
+                    .command_tag
+                    .clone()
+                    .or_else(|| Some(format!("{} rows", self.grid.rows.len())));
 
                 // Update paged query state with initial load
                 if let Some(ref mut paged) = self.paged_query {
@@ -7110,7 +8682,12 @@ impl App {
         // Connection info
         let conn_segment = if self.db.status == DbStatus::Connected {
             if let Some(ref conn_str) = self.db.conn_str {
-                let info = ConnectionInfo::parse(conn_str);
+                let mut info = ConnectionInfo::parse(conn_str);
+                if self.db.kind == Some(DbKind::Mongo) {
+                    if let Some(active_db) = self.db.mongo_database.as_ref() {
+                        info.database = Some(active_db.clone());
+                    }
+                }
                 // Allow up to 30 chars for connection, will be auto-truncated if needed
                 info.format(30)
             } else {
@@ -8729,6 +10306,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mongo_use_updates_conninfo_database() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        app.db.status = DbStatus::Connected;
+        app.db.kind = Some(DbKind::Mongo);
+        app.db.conn_str = Some("mongodb://localhost:27017/tsql_smoke".to_string());
+        app.db.mongo_database = Some("tsql_smoke".to_string());
+
+        app.execute_command("use admin");
+        assert_eq!(app.db.mongo_database.as_deref(), Some("admin"));
+
+        app.execute_command("conninfo");
+        let status = app.last_status.unwrap_or_default();
+        assert!(
+            status.contains("Mongo database \"admin\""),
+            "expected conninfo to show active Mongo DB after :use; got: {status}"
+        );
+    }
+
     // ========== Connection Manager Issue Tests ==========
 
     /// Helper to type a string into the app by simulating key presses
@@ -8783,7 +10388,8 @@ mod tests {
         // Use a unique name based on test timestamp
         type_string(&mut app, "testconn_unique_12345");
 
-        // Tab to User field
+        // Tab to Type, then User field
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_string(&mut app, "postgres");
 

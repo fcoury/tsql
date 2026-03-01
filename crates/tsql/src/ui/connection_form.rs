@@ -13,14 +13,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use url::Url;
 
-use crate::config::{Action, ConnectionColor, ConnectionEntry, Keymap, SslMode};
+use crate::config::{Action, ConnectionColor, ConnectionEntry, DbKind, Keymap, SslMode};
 
 /// Which field is currently focused in the form
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FormField {
     #[default]
     Name,
+    Kind,
     Host,
     Port,
     Database,
@@ -35,10 +37,11 @@ pub enum FormField {
 
 impl FormField {
     /// Get the next field in tab order
-    /// Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+    /// Order: Name → Kind → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
     pub fn next(self) -> Self {
         match self {
-            FormField::Name => FormField::User,
+            FormField::Name => FormField::Kind,
+            FormField::Kind => FormField::User,
             FormField::User => FormField::Password,
             FormField::Password => FormField::OnePasswordRef,
             FormField::OnePasswordRef => FormField::SavePassword,
@@ -56,7 +59,8 @@ impl FormField {
     pub fn prev(self) -> Self {
         match self {
             FormField::Name => FormField::UrlPaste,
-            FormField::User => FormField::Name,
+            FormField::Kind => FormField::Name,
+            FormField::User => FormField::Kind,
             FormField::Password => FormField::User,
             FormField::OnePasswordRef => FormField::Password,
             FormField::SavePassword => FormField::OnePasswordRef,
@@ -105,6 +109,8 @@ pub enum ConnectionFormAction {
 pub struct ConnectionFormModal {
     /// Current field values
     name: String,
+    kind: DbKind,
+    mongo_uri: Option<String>,
     host: String,
     port: String,
     database: String,
@@ -160,6 +166,8 @@ pub struct ConnectionFormModal {
 #[derive(Clone)]
 struct OriginalFormValues {
     name: String,
+    kind: DbKind,
+    mongo_uri: Option<String>,
     host: String,
     port: String,
     database: String,
@@ -186,6 +194,8 @@ impl ConnectionFormModal {
     pub fn with_keymap_and_onepassword(keymap: Keymap, onepassword_enabled: bool) -> Self {
         Self {
             name: String::new(),
+            kind: DbKind::Postgres,
+            mongo_uri: None,
             host: "localhost".to_string(),
             port: "5432".to_string(),
             database: String::new(),
@@ -253,6 +263,8 @@ impl ConnectionFormModal {
 
         let original_values = OriginalFormValues {
             name: entry.name.clone(),
+            kind: entry.kind,
+            mongo_uri: entry.uri.clone(),
             host: entry.host.clone(),
             port: entry.port.to_string(),
             database: entry.database.clone(),
@@ -269,6 +281,8 @@ impl ConnectionFormModal {
 
         Self {
             name: entry.name.clone(),
+            kind: entry.kind,
+            mongo_uri: entry.uri.clone(),
             host: entry.host.clone(),
             port: entry.port.to_string(),
             database: entry.database.clone(),
@@ -311,6 +325,8 @@ impl ConnectionFormModal {
         // For new connections, check if any required field has content
         if self.original_values.is_none() {
             return !self.name.is_empty()
+                || self.kind != DbKind::Postgres
+                || self.mongo_uri.is_some()
                 || !self.user.is_empty()
                 || !self.password.is_empty()
                 || !self.op_ref.is_empty()
@@ -323,6 +339,8 @@ impl ConnectionFormModal {
         // For editing, compare with original values
         if let Some(ref orig) = self.original_values {
             return self.name != orig.name
+                || self.kind != orig.kind
+                || self.mongo_uri != orig.mongo_uri
                 || self.host != orig.host
                 || self.port != orig.port
                 || self.database != orig.database
@@ -410,6 +428,12 @@ impl ConnectionFormModal {
                 ConnectionFormAction::Continue
             }
 
+            // Enter on kind cycles
+            (KeyCode::Enter, KeyModifiers::NONE) if self.focused == FormField::Kind => {
+                self.cycle_kind(1);
+                ConnectionFormAction::Continue
+            }
+
             // Enter on color cycles to next
             (KeyCode::Enter, KeyModifiers::NONE) if self.focused == FormField::Color => {
                 self.cycle_color(1);
@@ -434,6 +458,12 @@ impl ConnectionFormModal {
                 ConnectionFormAction::Continue
             }
 
+            // Space cycles kind
+            (KeyCode::Char(' '), KeyModifiers::NONE) if self.focused == FormField::Kind => {
+                self.cycle_kind(1);
+                ConnectionFormAction::Continue
+            }
+
             // Space cycles ssl mode
             (KeyCode::Char(' '), KeyModifiers::NONE) if self.focused == FormField::SslMode => {
                 self.cycle_ssl_mode(1);
@@ -447,6 +477,16 @@ impl ConnectionFormModal {
             }
             (KeyCode::Right, KeyModifiers::NONE) if self.focused == FormField::Color => {
                 self.cycle_color(1);
+                ConnectionFormAction::Continue
+            }
+
+            // Left/Right on kind cycles
+            (KeyCode::Left, KeyModifiers::NONE) if self.focused == FormField::Kind => {
+                self.cycle_kind(-1);
+                ConnectionFormAction::Continue
+            }
+            (KeyCode::Right, KeyModifiers::NONE) if self.focused == FormField::Kind => {
+                self.cycle_kind(1);
                 ConnectionFormAction::Continue
             }
 
@@ -526,7 +566,9 @@ impl ConnectionFormModal {
             FormField::Password => Some((&mut self.password, &mut self.password_cursor)),
             FormField::OnePasswordRef => Some((&mut self.op_ref, &mut self.op_ref_cursor)),
             FormField::UrlPaste => Some((&mut self.url_paste, &mut self.url_paste_cursor)),
-            FormField::SavePassword | FormField::SslMode | FormField::Color => None,
+            FormField::Kind | FormField::SavePassword | FormField::SslMode | FormField::Color => {
+                None
+            }
         }
     }
 
@@ -603,10 +645,152 @@ impl ConnectionFormModal {
             .unwrap_or(ConnectionColor::None);
     }
 
+    fn cycle_kind(&mut self, direction: i32) {
+        const ORDER: [DbKind; 2] = [DbKind::Postgres, DbKind::Mongo];
+        let current_idx = ORDER.iter().position(|k| *k == self.kind).unwrap_or(0) as i32;
+        let next_idx = ((current_idx + direction).rem_euclid(ORDER.len() as i32)) as usize;
+        self.kind = ORDER[next_idx];
+        match self.kind {
+            DbKind::Postgres => {
+                self.mongo_uri = None;
+                if self.port.is_empty() || self.port == "27017" {
+                    self.port = "5432".to_string();
+                    self.port_cursor = self.port.len();
+                }
+            }
+            DbKind::Mongo => {
+                if self.port.is_empty() || self.port == "5432" {
+                    self.port = "27017".to_string();
+                    self.port_cursor = self.port.len();
+                }
+                self.mongo_uri = Some(self.build_mongo_uri(None));
+            }
+        }
+    }
+
     fn cycle_ssl_mode(&mut self, direction: i32) {
+        if self.kind == DbKind::Mongo {
+            return;
+        }
         let len = SslMode::COUNT as i32;
         self.ssl_mode_index = ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
         self.ssl_mode = SslMode::from_index(self.ssl_mode_index);
+    }
+
+    fn mongo_scheme(&self) -> &'static str {
+        if self
+            .mongo_uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("mongodb+srv://"))
+        {
+            "mongodb+srv"
+        } else {
+            "mongodb"
+        }
+    }
+
+    fn build_mongo_uri(&self, password: Option<&str>) -> String {
+        let base = self.mongo_uri.as_deref().unwrap_or("mongodb://localhost");
+        let mut url = Url::parse(base)
+            .ok()
+            .or_else(|| Url::parse("mongodb://localhost").ok())
+            .expect("static Mongo URL should parse");
+
+        let host = if self.host.trim().is_empty() {
+            "localhost"
+        } else {
+            self.host.trim()
+        };
+        let _ = url.set_host(Some(host));
+
+        let scheme = self.mongo_scheme();
+        if scheme == "mongodb+srv" {
+            let _ = url.set_port(None);
+        } else {
+            let parsed_port = self.port.parse::<u16>().ok();
+            let port = parsed_port.or(url.port()).unwrap_or(27017);
+            let _ = url.set_port(Some(port));
+        }
+
+        let user = self.user.trim();
+        if user.is_empty() {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+        } else {
+            let _ = url.set_username(user);
+            let _ = url.set_password(password);
+        }
+
+        if self.database.trim().is_empty() {
+            url.set_path("/");
+        } else {
+            url.set_path(&format!("/{}", self.database.trim()));
+        }
+
+        let mut built = url.to_string();
+        if scheme == "mongodb+srv" && built.starts_with("mongodb://") {
+            built = built.replacen("mongodb://", "mongodb+srv://", 1);
+        }
+        built
+    }
+
+    fn build_entry(&self, name: String, password_for_uri: Option<&str>) -> ConnectionEntry {
+        let op_ref = self.op_ref.trim();
+        let has_op_ref = !op_ref.is_empty();
+        let no_password_required = self.password.is_empty() && !self.save_password && !has_op_ref;
+
+        match self.kind {
+            DbKind::Postgres => {
+                let port = self.port.parse::<u16>().unwrap_or(5432);
+                ConnectionEntry {
+                    kind: DbKind::Postgres,
+                    name,
+                    uri: None,
+                    host: self.host.clone(),
+                    port,
+                    database: self.database.clone(),
+                    user: self.user.clone(),
+                    password_in_keychain: self.save_password && !self.password.is_empty(),
+                    password_env: None,
+                    password_onepassword: if has_op_ref {
+                        Some(op_ref.to_string())
+                    } else {
+                        None
+                    },
+                    no_password_required,
+                    color: self.color,
+                    favorite: None,
+                    ssl_mode: match self.ssl_mode {
+                        SslMode::Disable => None,
+                        other => Some(other),
+                    },
+                }
+            }
+            DbKind::Mongo => ConnectionEntry {
+                kind: DbKind::Mongo,
+                name,
+                uri: Some(self.build_mongo_uri(password_for_uri)),
+                host: if self.host.trim().is_empty() {
+                    "localhost".to_string()
+                } else {
+                    self.host.trim().to_string()
+                },
+                port: self.port.parse::<u16>().unwrap_or(27017),
+                database: self.database.clone(),
+                user: self.user.clone(),
+                password_in_keychain: self.save_password && !self.password.is_empty(),
+                password_env: None,
+                password_onepassword: if has_op_ref {
+                    Some(op_ref.to_string())
+                } else {
+                    None
+                },
+                no_password_required,
+                color: self.color,
+                favorite: None,
+                ssl_mode: None,
+            },
+        }
     }
 
     fn process_url_paste(&mut self) -> ConnectionFormAction {
@@ -618,6 +802,8 @@ impl ConnectionFormModal {
         match ConnectionEntry::from_url("temp", &self.url_paste) {
             Ok((entry, password)) => {
                 // Populate fields from parsed URL
+                self.kind = entry.kind;
+                self.mongo_uri = entry.uri.clone();
                 self.host = entry.host;
                 self.port = entry.port.to_string();
                 self.database = entry.database;
@@ -669,51 +855,29 @@ impl ConnectionFormModal {
             self.focused = FormField::Host;
             return ConnectionFormAction::StatusMessage("Host is required".to_string());
         }
-        if self.database.is_empty() {
-            self.focused = FormField::Database;
-            return ConnectionFormAction::StatusMessage("Database is required".to_string());
-        }
-        if self.user.is_empty() {
-            self.focused = FormField::User;
-            return ConnectionFormAction::StatusMessage("User is required".to_string());
-        }
-
-        let port: u16 = match self.port.parse() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                self.focused = FormField::Port;
-                return ConnectionFormAction::StatusMessage("Invalid port number".to_string());
+        if self.kind == DbKind::Postgres {
+            if self.database.is_empty() {
+                self.focused = FormField::Database;
+                return ConnectionFormAction::StatusMessage("Database is required".to_string());
             }
-        };
+            if self.user.is_empty() {
+                self.focused = FormField::User;
+                return ConnectionFormAction::StatusMessage("User is required".to_string());
+            }
+        }
 
-        // Auto-detect if no password is required:
-        // If password is empty and user didn't choose to save to keychain,
-        // assume the connection doesn't require a password
-        let op_ref = self.op_ref.trim();
-        let has_op_ref = !op_ref.is_empty();
-        let no_password_required = self.password.is_empty() && !self.save_password && !has_op_ref;
+        let needs_port = self.kind == DbKind::Postgres || self.mongo_scheme() != "mongodb+srv";
+        if needs_port {
+            match self.port.parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    self.focused = FormField::Port;
+                    return ConnectionFormAction::StatusMessage("Invalid port number".to_string());
+                }
+            };
+        }
 
-        let entry = ConnectionEntry {
-            name: self.name.clone(),
-            host: self.host.clone(),
-            port,
-            database: self.database.clone(),
-            user: self.user.clone(),
-            password_in_keychain: self.save_password && !self.password.is_empty(),
-            password_env: None,
-            password_onepassword: if has_op_ref {
-                Some(op_ref.to_string())
-            } else {
-                None
-            },
-            no_password_required,
-            color: self.color,
-            favorite: None, // Preserve from original if editing
-            ssl_mode: match self.ssl_mode {
-                SslMode::Disable => None,
-                other => Some(other),
-            },
-        };
+        let entry = self.build_entry(self.name.clone(), None);
 
         let password = if self.password.is_empty() {
             None
@@ -734,62 +898,54 @@ impl ConnectionFormModal {
         if self.host.is_empty() {
             return ConnectionFormAction::StatusMessage("Host is required for test".to_string());
         }
-        if self.database.is_empty() {
-            return ConnectionFormAction::StatusMessage(
-                "Database is required for test".to_string(),
-            );
-        }
-        if self.user.is_empty() {
-            return ConnectionFormAction::StatusMessage("User is required for test".to_string());
-        }
-
-        let port: u16 = match self.port.parse() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                return ConnectionFormAction::StatusMessage("Invalid port number".to_string());
+        if self.kind == DbKind::Postgres {
+            if self.database.is_empty() {
+                return ConnectionFormAction::StatusMessage(
+                    "Database is required for test".to_string(),
+                );
             }
-        };
+            if self.user.is_empty() {
+                return ConnectionFormAction::StatusMessage(
+                    "User is required for test".to_string(),
+                );
+            }
+        }
 
-        let op_ref = self.op_ref.trim();
-        let has_op_ref = !op_ref.is_empty();
-        let no_password_required = self.password.is_empty() && !self.save_password && !has_op_ref;
+        let needs_port = self.kind == DbKind::Postgres || self.mongo_scheme() != "mongodb+srv";
+        if needs_port {
+            match self.port.parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    return ConnectionFormAction::StatusMessage("Invalid port number".to_string());
+                }
+            };
+        }
 
-        let entry = ConnectionEntry {
-            name: "test".to_string(),
-            host: self.host.clone(),
-            port,
-            database: self.database.clone(),
-            user: self.user.clone(),
-            password_in_keychain: false,
-            password_env: None,
-            password_onepassword: if has_op_ref {
-                Some(op_ref.to_string())
-            } else {
-                None
-            },
-            no_password_required,
-            color: ConnectionColor::None,
-            favorite: None,
-            ssl_mode: match self.ssl_mode {
-                SslMode::Disable => None,
-                other => Some(other),
-            },
-        };
-
-        let password = if self.password.is_empty() {
+        let test_password = if self.password.is_empty() {
             None
         } else {
             Some(self.password.clone())
         };
-
-        ConnectionFormAction::TestConnection { entry, password }
+        let entry = self.build_entry("test".to_string(), test_password.as_deref());
+        let mut entry = ConnectionEntry {
+            password_in_keychain: false,
+            color: ConnectionColor::None,
+            ..entry
+        };
+        if entry.kind == DbKind::Mongo {
+            entry.ssl_mode = None;
+        }
+        ConnectionFormAction::TestConnection {
+            entry,
+            password: test_password,
+        }
     }
 
     /// Render the connection form modal.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         // Calculate modal size
         let modal_width = 60u16.min(area.width - 4);
-        let modal_height = 20u16.min(area.height - 2);
+        let modal_height = 21u16.min(area.height - 2);
         let modal_x = (area.width - modal_width) / 2;
         let modal_y = (area.height - modal_height) / 2;
 
@@ -817,9 +973,10 @@ impl ConnectionFormModal {
         frame.render_widget(block, modal_area);
 
         // Layout the form fields.
-        // Order: Name → User → Password → [OnePasswordRef] → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+        // Order: Name → Kind → User → Password → [OnePasswordRef] → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
         let mut constraints = vec![
             Constraint::Length(1), // Name
+            Constraint::Length(1), // Kind
             Constraint::Length(1), // Separator
             Constraint::Length(1), // User
             Constraint::Length(1), // Password
@@ -851,6 +1008,8 @@ impl ConnectionFormModal {
             self.name_cursor,
             FormField::Name,
         );
+        i += 1;
+        self.render_kind_field(frame, chunks[i]);
         i += 1;
         self.render_separator(frame, chunks[i]);
         i += 1;
@@ -1030,6 +1189,43 @@ impl ConnectionFormModal {
         frame.render_widget(widget, chunks[1]);
     }
 
+    fn render_kind_field(&self, frame: &mut Frame, area: Rect) {
+        let is_focused = self.focused == FormField::Kind;
+        let label_width = 10;
+
+        let chunks =
+            Layout::horizontal([Constraint::Length(label_width), Constraint::Min(1)]).split(area);
+
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let label_widget = Paragraph::new("Type:").style(label_style);
+        frame.render_widget(label_widget, chunks[0]);
+
+        let kind_name = match self.kind {
+            DbKind::Postgres => "Postgres",
+            DbKind::Mongo => "MongoDB",
+        };
+        let mut spans = vec![];
+        if is_focused {
+            spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!("{:<11}", kind_name),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if is_focused {
+            spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+        }
+
+        let widget = Paragraph::new(Line::from(spans));
+        frame.render_widget(widget, chunks[1]);
+    }
+
     fn render_color_field(&self, frame: &mut Frame, area: Rect) {
         let is_focused = self.focused == FormField::Color;
         let label_width = 10;
@@ -1082,18 +1278,30 @@ impl ConnectionFormModal {
         let label_widget = Paragraph::new("SSL:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
 
-        let mode_name = self.ssl_mode.as_str();
+        let mode_name = if self.kind == DbKind::Mongo {
+            "n/a"
+        } else {
+            self.ssl_mode.as_str()
+        };
         let mut spans = vec![];
-        if is_focused {
+        if is_focused && self.kind == DbKind::Postgres {
             spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
         }
         spans.push(Span::styled(
             format!("{:<11}", mode_name), // 11 chars to fit "verify-full"
             Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+                .fg(if self.kind == DbKind::Mongo {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                })
+                .add_modifier(if self.kind == DbKind::Mongo {
+                    Modifier::empty()
+                } else {
+                    Modifier::BOLD
+                }),
         ));
-        if is_focused {
+        if is_focused && self.kind == DbKind::Postgres {
             spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
         }
 
@@ -1120,7 +1328,7 @@ impl ConnectionFormModal {
         // Value with cursor or placeholder
         let (value_spans, style) = if self.url_paste.is_empty() && !is_focused {
             (
-                vec![Span::raw("postgres://user:pass@host/db")],
+                vec![Span::raw("postgres://... or mongodb://...")],
                 Style::default().fg(Color::DarkGray),
             )
         } else if is_focused {
@@ -1193,8 +1401,9 @@ mod tests {
 
     #[test]
     fn test_form_field_navigation() {
-        // Order: Name → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
-        assert_eq!(FormField::Name.next(), FormField::User);
+        // Order: Name → Kind → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+        assert_eq!(FormField::Name.next(), FormField::Kind);
+        assert_eq!(FormField::Kind.next(), FormField::User);
         assert_eq!(FormField::User.next(), FormField::Password);
         assert_eq!(FormField::Password.next(), FormField::OnePasswordRef);
         assert_eq!(FormField::OnePasswordRef.next(), FormField::SavePassword);
@@ -1202,7 +1411,8 @@ mod tests {
         assert_eq!(FormField::SslMode.next(), FormField::Host);
         assert_eq!(FormField::UrlPaste.next(), FormField::Name);
         assert_eq!(FormField::Name.prev(), FormField::UrlPaste);
-        assert_eq!(FormField::User.prev(), FormField::Name);
+        assert_eq!(FormField::Kind.prev(), FormField::Name);
+        assert_eq!(FormField::User.prev(), FormField::Kind);
         assert_eq!(FormField::Password.prev(), FormField::User);
         assert_eq!(FormField::OnePasswordRef.prev(), FormField::Password);
         assert_eq!(FormField::SavePassword.prev(), FormField::OnePasswordRef);
@@ -1212,6 +1422,7 @@ mod tests {
     #[test]
     fn test_new_form_defaults() {
         let form = ConnectionFormModal::new();
+        assert_eq!(form.kind, DbKind::Postgres);
         assert_eq!(form.host, "localhost");
         assert_eq!(form.port, "5432");
         assert!(!form.editing);
@@ -1246,7 +1457,7 @@ mod tests {
         assert_eq!(form.focused, FormField::Name);
 
         form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(form.focused, FormField::User); // New order: Name → User
+        assert_eq!(form.focused, FormField::Kind); // New order: Name → Kind
 
         form.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(form.focused, FormField::Name);
@@ -1259,6 +1470,9 @@ mod tests {
             false,
         );
         assert_eq!(form.focused, FormField::Name);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Kind);
 
         form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(form.focused, FormField::User);
@@ -1284,6 +1498,9 @@ mod tests {
             true,
         );
         assert_eq!(form.focused, FormField::Name);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Kind);
 
         form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(form.focused, FormField::User);
@@ -1445,7 +1662,76 @@ mod tests {
         assert_eq!(form.database, "production");
         assert_eq!(form.user, "admin");
         assert_eq!(form.password, "secret");
+        assert_eq!(form.kind, DbKind::Postgres);
         assert!(form.url_paste.is_empty());
+    }
+
+    #[test]
+    fn test_url_paste_mongodb_sets_kind_and_uri() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::UrlPaste;
+        form.url_paste =
+            "mongodb://admin:secret@mongo.example.com:27018/sample?authSource=admin".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, ConnectionFormAction::StatusMessage(_)));
+        assert_eq!(form.kind, DbKind::Mongo);
+        assert_eq!(form.host, "mongo.example.com");
+        assert_eq!(form.port, "27018");
+        assert_eq!(form.database, "sample");
+        assert_eq!(form.user, "admin");
+        assert_eq!(form.password, "secret");
+        let uri = form.mongo_uri.as_deref().unwrap_or("");
+        assert!(uri.starts_with("mongodb://admin@mongo.example.com:27018/sample"));
+        assert!(!uri.contains("secret"));
+    }
+
+    #[test]
+    fn test_save_mongodb_preserves_uri() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "mongo1".to_string();
+        form.kind = DbKind::Mongo;
+        form.host = "mongo.example.com".to_string();
+        form.port = "27018".to_string();
+        form.database = "sample".to_string();
+        form.user = "admin".to_string();
+        form.mongo_uri =
+            Some("mongodb://admin@mongo.example.com:27018/sample?authSource=admin".to_string());
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.kind, DbKind::Mongo);
+                assert!(entry.uri.is_some());
+                let uri = entry.uri.as_deref().unwrap_or("");
+                assert!(uri.contains("authSource=admin"));
+                assert!(!uri.contains(":secret@"));
+            }
+            other => panic!("Expected Save action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_test_connection_mongodb_includes_password_in_runtime_url() {
+        let mut form = ConnectionFormModal::new();
+        form.kind = DbKind::Mongo;
+        form.host = "mongo.example.com".to_string();
+        form.port = "27018".to_string();
+        form.database = "sample".to_string();
+        form.user = "admin".to_string();
+        form.password = "secret".to_string();
+        form.mongo_uri = Some("mongodb://admin@mongo.example.com:27018/sample".to_string());
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::TestConnection { entry, password } => {
+                assert_eq!(entry.kind, DbKind::Mongo);
+                assert_eq!(password.as_deref(), Some("secret"));
+                let url = entry.to_url(password.as_deref());
+                assert!(url.contains("mongodb://admin:secret@mongo.example.com:27018/sample"));
+            }
+            other => panic!("Expected TestConnection action, got {:?}", other),
+        }
     }
 
     #[test]

@@ -14,6 +14,15 @@ use url::Url;
 /// Service name for keyring storage
 const KEYRING_SERVICE: &str = "tsql";
 
+/// Database engine kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DbKind {
+    #[default]
+    Postgres,
+    Mongo,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SslMode {
@@ -164,8 +173,14 @@ impl std::fmt::Display for ConnectionColor {
 /// A saved database connection entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionEntry {
+    /// Database engine kind (defaults to Postgres for backward compatibility).
+    #[serde(default)]
+    pub kind: DbKind,
     /// Unique name for this connection
     pub name: String,
+    /// Full connection URI (used primarily for MongoDB).
+    #[serde(default)]
+    pub uri: Option<String>,
     /// Database host
     pub host: String,
     /// Database port (default: 5432)
@@ -205,7 +220,9 @@ fn default_port() -> u16 {
 impl Default for ConnectionEntry {
     fn default() -> Self {
         Self {
+            kind: DbKind::Postgres,
             name: String::new(),
+            uri: None,
             host: "localhost".to_string(),
             port: 5432,
             database: String::new(),
@@ -230,11 +247,27 @@ impl ConnectionEntry {
         }
     }
 
-    /// Build a PostgreSQL connection URL from the entry fields
+    /// Build a connection URL from the entry fields.
     ///
     /// If `password` is provided, it will be included in the URL.
     /// Otherwise, the URL will not contain authentication.
     pub fn to_url(&self, password: Option<&str>) -> String {
+        if self.kind == DbKind::Mongo {
+            if let Some(uri) = self.uri.as_ref() {
+                if let Some(pwd) = password {
+                    if let Ok(mut parsed) = Url::parse(uri) {
+                        // Best effort: set password only when username exists.
+                        if !parsed.username().is_empty() {
+                            let _ = parsed.set_password(Some(pwd));
+                            return parsed.to_string();
+                        }
+                    }
+                }
+                return uri.clone();
+            }
+            return "mongodb://localhost".to_string();
+        }
+
         let mut url = "postgres://".to_string();
 
         // Add user
@@ -266,22 +299,30 @@ impl ConnectionEntry {
         url
     }
 
-    /// Parse a PostgreSQL URL and create a ConnectionEntry
+    /// Parse a URL and create a ConnectionEntry.
     ///
     /// Returns the entry and the password if one was found in the URL.
     pub fn from_url(name: &str, url_str: &str) -> Result<(Self, Option<String>)> {
         let url = Url::parse(url_str).context("Invalid URL format")?;
-
-        if url.scheme() != "postgres" && url.scheme() != "postgresql" {
-            return Err(anyhow!("URL must use postgres:// or postgresql:// scheme"));
-        }
+        let kind = match url.scheme() {
+            "postgres" | "postgresql" => DbKind::Postgres,
+            "mongodb" | "mongodb+srv" => DbKind::Mongo,
+            _ => {
+                return Err(anyhow!(
+                    "URL must use postgres://, postgresql://, mongodb://, or mongodb+srv:// scheme"
+                ))
+            }
+        };
 
         let host = url
             .host_str()
             .ok_or_else(|| anyhow!("URL must contain a host"))?
             .to_string();
 
-        let port = url.port().unwrap_or(5432);
+        let port = match kind {
+            DbKind::Postgres => url.port().unwrap_or(5432),
+            DbKind::Mongo => url.port().unwrap_or(27017),
+        };
 
         let database = url.path().trim_start_matches('/').to_string();
         if database.is_empty() {
@@ -290,9 +331,13 @@ impl ConnectionEntry {
 
         let user = if url.username().is_empty() {
             // Try to get from environment or use a default
+            let fallback = match kind {
+                DbKind::Postgres => "postgres",
+                DbKind::Mongo => "mongo",
+            };
             std::env::var("USER")
                 .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "postgres".to_string())
+                .unwrap_or_else(|_| fallback.to_string())
         } else {
             url.username().to_string()
         };
@@ -306,16 +351,30 @@ impl ConnectionEntry {
         // If password is in URL, we have a password; if not, assume no password required
         let no_password_required = password.is_none();
 
-        let ssl_mode = url.query_pairs().find_map(|(k, v)| {
-            if k.eq_ignore_ascii_case("sslmode") {
-                SslMode::parse(&v)
-            } else {
-                None
-            }
-        });
+        let ssl_mode = if kind == DbKind::Postgres {
+            url.query_pairs().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("sslmode") {
+                    SslMode::parse(&v)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let sanitized_uri = if kind == DbKind::Mongo {
+            let mut clean = url.clone();
+            let _ = clean.set_password(None);
+            Some(clean.to_string())
+        } else {
+            None
+        };
 
         let entry = ConnectionEntry {
+            kind,
             name: name.to_string(),
+            uri: sanitized_uri,
             host,
             port,
             database,
@@ -549,6 +608,12 @@ impl ConnectionEntry {
 
     /// Format connection for display (without password)
     pub fn display_string(&self) -> String {
+        if self.kind == DbKind::Mongo {
+            return self
+                .uri
+                .clone()
+                .unwrap_or_else(|| "mongodb://localhost".to_string());
+        }
         format!(
             "{}@{}:{}/{}",
             self.user, self.host, self.port, self.database
@@ -557,6 +622,22 @@ impl ConnectionEntry {
 
     /// Short display format for status line
     pub fn short_display(&self) -> String {
+        if self.kind == DbKind::Mongo {
+            let uri = self
+                .uri
+                .as_deref()
+                .unwrap_or("mongodb://localhost")
+                .to_string();
+            if let Ok(parsed) = Url::parse(&uri) {
+                let host = parsed.host_str().unwrap_or("localhost");
+                let db = parsed.path().trim_start_matches('/');
+                if db.is_empty() {
+                    return format!("mongodb://{}", host);
+                }
+                return format!("mongodb://{}/{}", host, db);
+            }
+            return uri;
+        }
         if self.port == 5432 {
             format!("{}@{}/{}", self.user, self.host, self.database)
         } else {
@@ -575,17 +656,32 @@ impl ConnectionEntry {
         if self.name.contains(char::is_whitespace) {
             return Err(anyhow!("Connection name cannot contain whitespace"));
         }
-        if self.host.is_empty() {
-            return Err(anyhow!("Host cannot be empty"));
-        }
-        if self.database.is_empty() {
-            return Err(anyhow!("Database name cannot be empty"));
-        }
-        if self.user.is_empty() {
-            return Err(anyhow!("Username cannot be empty"));
-        }
-        if self.port == 0 {
-            return Err(anyhow!("Port cannot be 0"));
+        match self.kind {
+            DbKind::Postgres => {
+                if self.host.is_empty() {
+                    return Err(anyhow!("Host cannot be empty"));
+                }
+                if self.database.is_empty() {
+                    return Err(anyhow!("Database name cannot be empty"));
+                }
+                if self.user.is_empty() {
+                    return Err(anyhow!("Username cannot be empty"));
+                }
+                if self.port == 0 {
+                    return Err(anyhow!("Port cannot be 0"));
+                }
+            }
+            DbKind::Mongo => {
+                let Some(uri) = self.uri.as_deref() else {
+                    return Err(anyhow!("Mongo connections require a URI"));
+                };
+                let parsed = Url::parse(uri).context("Invalid Mongo URI format")?;
+                if parsed.scheme() != "mongodb" && parsed.scheme() != "mongodb+srv" {
+                    return Err(anyhow!(
+                        "Mongo URI must use mongodb:// or mongodb+srv:// scheme"
+                    ));
+                }
+            }
         }
         if let Some(fav) = self.favorite {
             if fav == 0 || fav > 9 {
@@ -841,6 +937,7 @@ mod tests {
     #[test]
     fn test_connection_entry_default() {
         let entry = ConnectionEntry::default();
+        assert_eq!(entry.kind, DbKind::Postgres);
         assert_eq!(entry.host, "localhost");
         assert_eq!(entry.port, 5432);
         assert_eq!(entry.color, ConnectionColor::None);
@@ -1038,6 +1135,56 @@ mod tests {
     fn test_connection_from_url_no_database() {
         let result = ConnectionEntry::from_url("test", "postgres://user@localhost/");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connection_from_url_mongodb_parses_kind_and_sanitizes_uri() {
+        let (entry, password) = ConnectionEntry::from_url(
+            "mongo",
+            "mongodb://admin:secret@mongo.example.com:27018/sample?authSource=admin",
+        )
+        .unwrap();
+        assert_eq!(entry.kind, DbKind::Mongo);
+        assert_eq!(entry.host, "mongo.example.com");
+        assert_eq!(entry.port, 27018);
+        assert_eq!(entry.database, "sample");
+        assert_eq!(entry.user, "admin");
+        assert_eq!(password.as_deref(), Some("secret"));
+        assert!(entry.uri.is_some());
+        let uri = entry.uri.as_deref().unwrap_or("");
+        assert!(!uri.contains("secret"));
+        assert!(uri.contains("authSource=admin"));
+    }
+
+    #[test]
+    fn test_connection_to_url_mongodb_includes_password_for_runtime_connection() {
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "mongo".to_string(),
+            uri: Some("mongodb://admin@mongo.example.com:27018/sample".to_string()),
+            host: "mongo.example.com".to_string(),
+            port: 27018,
+            database: "sample".to_string(),
+            user: "admin".to_string(),
+            ..Default::default()
+        };
+        let url = entry.to_url(Some("secret"));
+        assert_eq!(url, "mongodb://admin:secret@mongo.example.com:27018/sample");
+    }
+
+    #[test]
+    fn test_connection_validate_mongodb_requires_uri() {
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "mongo".to_string(),
+            uri: None,
+            host: "mongo.example.com".to_string(),
+            port: 27017,
+            database: "sample".to_string(),
+            user: "admin".to_string(),
+            ..Default::default()
+        };
+        assert!(entry.validate().is_err());
     }
 
     #[test]
