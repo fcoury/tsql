@@ -124,21 +124,15 @@ fn select_archive_asset<'a>(
     assets: &'a [GitHubAsset],
     target_triple: Option<&str>,
 ) -> Option<&'a GitHubAsset> {
-    let matches_archive = |asset: &&GitHubAsset| {
-        asset.name.ends_with(".tar.gz")
-            || asset.name.ends_with(".tgz")
-            || asset.name.ends_with(".zip")
-            || asset.name.ends_with(".tar.xz")
-    };
+    let matches_archive =
+        |asset: &GitHubAsset| asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz");
 
     if let Some(target) = target_triple {
         assets
             .iter()
-            .filter(matches_archive)
-            .find(|asset| asset.name.contains(target))
-            .or_else(|| assets.iter().filter(matches_archive).next())
+            .find(|asset| matches_archive(asset) && asset.name.contains(target))
     } else {
-        assets.iter().filter(matches_archive).next()
+        assets.iter().find(|asset| matches_archive(asset))
     }
 }
 
@@ -210,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_archive_asset_falls_back_to_first_archive() {
+    fn test_select_archive_asset_returns_none_when_target_is_missing() {
         let assets = vec![
             GitHubAsset {
                 name: "README.txt".to_string(),
@@ -222,8 +216,24 @@ mod tests {
             },
         ];
 
-        let selected = select_archive_asset(&assets, Some("no-such-target"))
-            .expect("first archive should be selected");
+        let selected = select_archive_asset(&assets, Some("no-such-target"));
+        assert!(selected.is_none(), "no target match should not fall back");
+    }
+
+    #[test]
+    fn test_select_archive_asset_without_target_uses_first_supported_archive() {
+        let assets = vec![
+            GitHubAsset {
+                name: "README.txt".to_string(),
+                browser_download_url: "readme".to_string(),
+            },
+            GitHubAsset {
+                name: "tsql-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                browser_download_url: "linux".to_string(),
+            },
+        ];
+
+        let selected = select_archive_asset(&assets, None).expect("archive should be selected");
         assert_eq!(selected.browser_download_url, "linux");
     }
 }

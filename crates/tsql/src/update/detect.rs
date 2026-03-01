@@ -91,6 +91,23 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_install_method_standalone_binary() {
+        let path = if cfg!(windows) {
+            Path::new("C:\\tools\\tsql.exe")
+        } else {
+            Path::new("/opt/mytools/tsql")
+        };
+        let method = detect_install_method(path);
+        assert_eq!(method, InstallMethod::StandaloneBinary);
+    }
+
+    #[test]
+    fn test_detect_install_method_relative_path_is_unknown() {
+        let method = detect_install_method(Path::new("bin/tsql"));
+        assert_eq!(method, InstallMethod::Unknown);
+    }
+
+    #[test]
     fn test_upgrade_hint_for_homebrew() {
         assert_eq!(
             upgrade_hint(InstallMethod::Homebrew),
@@ -100,9 +117,15 @@ mod tests {
 
     #[test]
     fn test_current_target_triple_is_known() {
+        let expected_known_target = cfg!(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "windows", target_arch = "x86_64")
+        ));
         assert!(
-            current_target_triple().is_some(),
-            "unsupported target for update apply"
+            current_target_triple().is_some() == expected_known_target,
+            "target triple support matrix mismatch"
         );
     }
 }

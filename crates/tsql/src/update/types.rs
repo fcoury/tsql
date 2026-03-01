@@ -13,7 +13,6 @@ pub enum InstallMethod {
 pub enum UpdatePolicy {
     Off,
     NotifyOnly,
-    ApplyAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

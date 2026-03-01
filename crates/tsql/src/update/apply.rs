@@ -196,7 +196,14 @@ fn replace_executable_at_path(current: &Path, new_binary: &Path) -> Result<PathB
             current.display()
         )
     }) {
-        let _ = fs::rename(&backup_path, current);
+        if let Err(rollback_error) = rollback_to_backup(current, &backup_path) {
+            return Err(error.context(format!(
+                "Additionally, rollback failed while restoring {} from {}: {}",
+                current.display(),
+                backup_path.display(),
+                rollback_error
+            )));
+        }
         return Err(error);
     }
 
@@ -207,11 +214,43 @@ fn replace_executable_at_path(current: &Path, new_binary: &Path) -> Result<PathB
             .with_context(|| format!("Failed to stat {}", current.display()))?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(current, perms)
-            .with_context(|| format!("Failed to set permissions on {}", current.display()))?;
+        if let Err(error) = fs::set_permissions(current, perms)
+            .with_context(|| format!("Failed to set permissions on {}", current.display()))
+        {
+            if let Err(rollback_error) = rollback_to_backup(current, &backup_path) {
+                return Err(error.context(format!(
+                    "Additionally, rollback after permission failure failed while restoring {} from {}: {}",
+                    current.display(),
+                    backup_path.display(),
+                    rollback_error
+                )));
+            }
+            return Err(error);
+        }
     }
 
     Ok(backup_path)
+}
+
+fn rollback_to_backup(current: &Path, backup_path: &Path) -> Result<()> {
+    if current.exists() {
+        fs::remove_file(current).with_context(|| {
+            format!(
+                "Failed to remove partially installed binary {}",
+                current.display()
+            )
+        })?;
+    }
+
+    fs::rename(backup_path, current).with_context(|| {
+        format!(
+            "Failed to restore backup from {} to {}",
+            backup_path.display(),
+            current.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 fn checksum_for_asset(checksums: &str, filename: &str) -> Option<String> {

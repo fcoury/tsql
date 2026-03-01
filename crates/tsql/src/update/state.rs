@@ -29,10 +29,7 @@ impl UpdateState {
             return UpdatePolicy::Off;
         }
 
-        match config.mode {
-            UpdateMode::Off => UpdatePolicy::Off,
-            UpdateMode::Auto | UpdateMode::NotifyOnly => UpdatePolicy::NotifyOnly,
-        }
+        UpdatePolicy::NotifyOnly
     }
 
     pub fn should_check_on_startup(&self, config: &UpdatesConfig) -> bool {

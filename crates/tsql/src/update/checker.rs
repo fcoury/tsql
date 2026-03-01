@@ -23,7 +23,7 @@ pub fn check_for_update(
         Ok(Some(_)) | Ok(None) => UpdateCheckOutcome::UpToDate {
             current: current.clone(),
         },
-        Err(error) => UpdateCheckOutcome::Error(format!("Update check failed: {}", error)),
+        Err(error) => UpdateCheckOutcome::Error(error.to_string()),
     }
 }
 
@@ -38,9 +38,17 @@ mod tests {
         latest: Option<ReleaseCandidate>,
     }
 
+    struct FailingProvider;
+
     impl ReleaseProvider for StubProvider {
         fn latest(&self, _channel: UpdateChannel) -> Result<Option<ReleaseCandidate>> {
             Ok(self.latest.clone())
+        }
+    }
+
+    impl ReleaseProvider for FailingProvider {
+        fn latest(&self, _channel: UpdateChannel) -> Result<Option<ReleaseCandidate>> {
+            anyhow::bail!("Network error")
         }
     }
 
@@ -72,5 +80,12 @@ mod tests {
 
         let outcome = check_for_update(&provider, &Version::new(0, 4, 2), UpdateChannel::Stable);
         assert!(matches!(outcome, UpdateCheckOutcome::UpToDate { .. }));
+    }
+
+    #[test]
+    fn test_check_for_update_reports_error_on_provider_failure() {
+        let provider = FailingProvider;
+        let outcome = check_for_update(&provider, &Version::new(0, 4, 2), UpdateChannel::Stable);
+        assert!(matches!(outcome, UpdateCheckOutcome::Error(_)));
     }
 }

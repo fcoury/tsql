@@ -26,7 +26,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Query history** - Persistent history with fuzzy search, pinning, and deletion
 - **External editor** - Open the current query in `$VISUAL` / `$EDITOR` with `vv`
 - **1Password integration** - Store an `op://` secret reference per connection instead of a plain password
-- **Update checks** - Notify-only update checks with install-method specific upgrade hints
+- **Update checks** - Notify of new versions with install-method specific upgrade hints, plus optional in-app apply for standalone installs when `updates.mode = "auto"`
 - **Configurable** - Customize keybindings and appearance via config file
 
 ## Installation
@@ -179,7 +179,7 @@ tsql --debug-keys --mouse
 | `:\l`                           | List databases      |
 | `:\du`                          | List roles          |
 
-`:\update apply` is only available in `updates.mode = "auto"` and only for
+`:update apply` is only available in `updates.mode = "auto"` and only for
 standalone binary installs.
 
 ## Configuration

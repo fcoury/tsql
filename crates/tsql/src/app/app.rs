@@ -51,8 +51,9 @@ use crate::ui::{
     YankFormat,
 };
 use crate::update::{
-    apply_update, check_for_update, detect_current_install_method, upgrade_hint, ApplyResult,
-    GitHubReleasesProvider, InstallMethod, UpdateCheckOutcome, UpdateInfo, UpdateState,
+    apply_update, check_for_update, current_target_triple, detect_current_install_method,
+    upgrade_hint, ApplyResult, GitHubReleasesProvider, InstallMethod, UpdateCheckOutcome,
+    UpdateInfo, UpdateState,
 };
 use crate::util::format_pg_error;
 use crate::util::{is_json_column_type, should_use_multiline_editor};
@@ -4132,6 +4133,18 @@ impl App {
     }
 
     fn request_update_apply(&mut self) {
+        if cfg!(windows) {
+            self.last_status = Some("In-app apply is not supported on Windows yet".to_string());
+            return;
+        }
+
+        let Some(target_triple) = current_target_triple() else {
+            self.last_status = Some(
+                "In-app apply is unavailable on this platform (unknown target triple)".to_string(),
+            );
+            return;
+        };
+
         if self.update_apply_in_flight {
             self.last_status = Some("Update apply already running".to_string());
             return;
@@ -4165,6 +4178,11 @@ impl App {
             }
         };
 
+        if let Err(message) = self.validate_apply_candidate(&info, target_triple) {
+            self.last_status = Some(message);
+            return;
+        }
+
         self.confirm_prompt = Some(ConfirmPrompt::new(
             format!(
                 "Apply update now? {} -> {}. This will replace the current tsql binary.",
@@ -4196,6 +4214,52 @@ impl App {
 
             let _ = tx.send(DbEvent::UpdateApplyFinished { result });
         });
+    }
+
+    fn validate_apply_candidate(
+        &self,
+        info: &UpdateInfo,
+        target_triple: &str,
+    ) -> std::result::Result<(), String> {
+        let asset_url = info.asset_url.as_deref().ok_or_else(|| {
+            format!(
+                "No compatible release asset found for target {}. In-app apply is unavailable",
+                target_triple
+            )
+        })?;
+
+        let asset_path = url::Url::parse(asset_url)
+            .ok()
+            .map(|url| url.path().to_string())
+            .unwrap_or_else(|| asset_url.to_string());
+        let asset_name = std::path::Path::new(&asset_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or(asset_path);
+        let asset_name_lc = asset_name.to_ascii_lowercase();
+        let target_lc = target_triple.to_ascii_lowercase();
+
+        if !asset_name_lc.contains(&target_lc) {
+            return Err(format!(
+                "Selected update asset '{}' is not compatible with {}",
+                asset_name, target_triple
+            ));
+        }
+
+        if !(asset_name_lc.ends_with(".tar.gz") || asset_name_lc.ends_with(".tgz")) {
+            return Err(format!(
+                "Unsupported update archive format '{}' (expected .tar.gz or .tgz)",
+                asset_name
+            ));
+        }
+
+        if info.checksum_url.is_none() {
+            return Err(
+                "No checksum file found for this release; in-app apply is unavailable".to_string(),
+            );
+        }
+
+        Ok(())
     }
 
     fn apply_not_allowed_message(&self, method: InstallMethod) -> String {
@@ -7001,6 +7065,7 @@ impl App {
                 self.update_apply_in_flight = false;
                 match result {
                     Ok(applied) => {
+                        self.last_error = None;
                         self.update_state.last_outcome = Some(UpdateCheckOutcome::UpToDate {
                             current: applied.to.clone(),
                         });
@@ -7691,11 +7756,25 @@ mod tests {
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
         app.execute_command("update apply");
-        assert_eq!(
-            app.last_status.as_deref(),
-            Some("No update info available. Run :update check first")
-        );
-        assert!(app.confirm_prompt.is_none());
+        if cfg!(windows) {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is not supported on Windows yet")
+            );
+            assert!(app.confirm_prompt.is_none());
+        } else if crate::update::current_target_triple().is_none() {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is unavailable on this platform (unknown target triple)")
+            );
+            assert!(app.confirm_prompt.is_none());
+        } else {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("No update info available. Run :update check first")
+            );
+            assert!(app.confirm_prompt.is_none());
+        }
     }
 
     #[test]
@@ -7710,11 +7789,25 @@ mod tests {
         app.config.updates.mode = UpdateMode::NotifyOnly;
         app.execute_command("update apply");
 
-        assert_eq!(
-            app.last_status.as_deref(),
-            Some("In-app apply is disabled in notify-only mode")
-        );
-        assert!(app.confirm_prompt.is_none());
+        if cfg!(windows) {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is not supported on Windows yet")
+            );
+            assert!(app.confirm_prompt.is_none());
+        } else if crate::update::current_target_triple().is_none() {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is unavailable on this platform (unknown target triple)")
+            );
+            assert!(app.confirm_prompt.is_none());
+        } else {
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is disabled in notify-only mode")
+            );
+            assert!(app.confirm_prompt.is_none());
+        }
     }
 
     #[test]
@@ -7726,16 +7819,32 @@ mod tests {
             .unwrap();
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
 
+        let target = crate::update::current_target_triple().unwrap_or("x86_64-unknown-linux-gnu");
+
         app.update_state.last_outcome = Some(UpdateCheckOutcome::UpdateAvailable(UpdateInfo {
             current: Version::new(0, 4, 2),
             latest: Version::new(0, 4, 3),
             notes_url: Some("https://example.com/release".to_string()),
-            asset_url: Some("https://example.com/tsql-x86_64-unknown-linux-gnu.tar.gz".to_string()),
+            asset_url: Some(format!("https://example.com/tsql-{}.tar.gz", target)),
             checksum_url: Some("https://example.com/SHA256SUMS.txt".to_string()),
         }));
 
         app.execute_command("update apply");
-        assert!(app.confirm_prompt.is_some());
+        if cfg!(windows) {
+            assert!(app.confirm_prompt.is_none());
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is not supported on Windows yet")
+            );
+        } else if crate::update::current_target_triple().is_none() {
+            assert!(app.confirm_prompt.is_none());
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("In-app apply is unavailable on this platform (unknown target triple)")
+            );
+        } else {
+            assert!(app.confirm_prompt.is_some());
+        }
     }
 
     // ========== CellEditor Tests ==========
