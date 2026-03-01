@@ -1332,7 +1332,7 @@ fn mongo_result_from_documents(
             command_tag: Some("0 rows".to_string()),
             truncated,
             elapsed,
-            source_table,
+            source_table: None,
             primary_keys: Vec::new(),
             col_types: vec!["string".to_string()],
         };
@@ -5772,8 +5772,16 @@ impl App {
             let generated = commands
                 .into_iter()
                 .map(|c| serde_json::to_string_pretty(&c).unwrap_or_else(|_| c.to_string()))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+                .collect::<Vec<_>>();
+
+            if generated.len() != 1 {
+                self.last_error = Some(
+                    "Mongo :gen currently produces one executable command at a time. Select a single row."
+                        .to_string(),
+                );
+                return;
+            }
+            let generated = generated.into_iter().next().unwrap_or_default();
 
             self.editor.textarea.select_all();
             self.editor.textarea.cut();
@@ -6484,6 +6492,10 @@ impl App {
                         }
                         Action::ToggleSidebar => {
                             self.toggle_sidebar();
+                            return;
+                        }
+                        Action::ToggleQueryHeight => {
+                            self.toggle_query_height_mode();
                             return;
                         }
                         _ => {}

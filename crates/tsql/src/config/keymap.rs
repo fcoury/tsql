@@ -835,6 +835,10 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             Action::ExecuteQuery,
         );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            Action::ToggleQueryHeight,
+        );
 
         // Standard editing shortcuts
         km.bind(
@@ -1003,6 +1007,14 @@ mod tests {
         assert_eq!(km.get(&slash), Some(&Action::StartSearch));
 
         // Query height toggle
+        let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+    }
+
+    #[test]
+    fn test_default_editor_insert_keymap() {
+        let km = Keymap::default_editor_insert_keymap();
+
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
     }
