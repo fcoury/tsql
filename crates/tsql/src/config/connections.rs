@@ -371,20 +371,41 @@ impl ConnectionEntry {
     /// Invoke the 1Password CLI to read a secret reference.
     ///
     /// Uses `/bin/sh -c` to inherit the user's `PATH` and active `op` session token.
-    /// Returns `Some(password)` on success, `None` if the CLI is unavailable or fails.
+    /// Returns `Ok(Some(password))` on success.
+    /// Returns `Ok(None)` when the reference is empty.
+    /// Returns `Err(...)` when the CLI cannot be executed or returns a failure status.
     ///
     /// Note: this method is Unix-only (`/bin/sh`).
-    fn read_from_onepassword(op_ref: &str) -> Option<String> {
+    fn read_from_onepassword(op_ref: &str) -> Result<Option<String>> {
+        let op_ref = op_ref.trim();
+        if op_ref.is_empty() {
+            return Ok(None);
+        }
+
         let cmd = format!("op read '{}'", op_ref.replace('\'', "'\\''"));
         let out = std::process::Command::new("/bin/sh")
             .args(["-c", &cmd])
             .stdin(std::process::Stdio::null())
             .output()
-            .ok()?;
+            .context("Failed to execute 1Password CLI")?;
         if out.status.success() {
-            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            ))
         } else {
-            None
+            let code = out
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string());
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Err(anyhow!(
+                "1Password CLI failed (status {}): stderr='{}', stdout='{}'",
+                code,
+                stderr,
+                stdout
+            ))
         }
     }
 
@@ -403,7 +424,7 @@ impl ConnectionEntry {
 
         // Try 1Password CLI if configured
         if let Some(ref op_ref) = self.password_onepassword {
-            if let Some(pwd) = Self::read_from_onepassword(op_ref) {
+            if let Some(pwd) = Self::read_from_onepassword(op_ref)? {
                 return Ok(Some(pwd));
             }
         }
@@ -457,7 +478,7 @@ impl ConnectionEntry {
             let result = (|| -> Result<Option<String>> {
                 // Try 1Password CLI first if configured
                 if let Some(ref op_ref) = op_ref {
-                    if let Some(pwd) = Self::read_from_onepassword(op_ref) {
+                    if let Some(pwd) = Self::read_from_onepassword(op_ref)? {
                         return Ok(Some(pwd));
                     }
                 }

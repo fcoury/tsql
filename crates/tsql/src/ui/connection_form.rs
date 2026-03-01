@@ -654,7 +654,9 @@ impl ConnectionFormModal {
         // Auto-detect if no password is required:
         // If password is empty and user didn't choose to save to keychain,
         // assume the connection doesn't require a password
-        let no_password_required = self.password.is_empty() && !self.save_password;
+        let op_ref = self.op_ref.trim();
+        let has_op_ref = !op_ref.is_empty();
+        let no_password_required = self.password.is_empty() && !self.save_password && !has_op_ref;
 
         let entry = ConnectionEntry {
             name: self.name.clone(),
@@ -664,10 +666,10 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: self.save_password && !self.password.is_empty(),
             password_env: None,
-            password_onepassword: if self.op_ref.is_empty() {
-                None
+            password_onepassword: if has_op_ref {
+                Some(op_ref.to_string())
             } else {
-                Some(self.op_ref.clone())
+                None
             },
             no_password_required,
             color: self.color,
@@ -713,6 +715,10 @@ impl ConnectionFormModal {
             }
         };
 
+        let op_ref = self.op_ref.trim();
+        let has_op_ref = !op_ref.is_empty();
+        let no_password_required = self.password.is_empty() && !self.save_password && !has_op_ref;
+
         let entry = ConnectionEntry {
             name: "test".to_string(),
             host: self.host.clone(),
@@ -721,8 +727,12 @@ impl ConnectionFormModal {
             user: self.user.clone(),
             password_in_keychain: false,
             password_env: None,
-            password_onepassword: None,
-            no_password_required: false,
+            password_onepassword: if has_op_ref {
+                Some(op_ref.to_string())
+            } else {
+                None
+            },
+            no_password_required,
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: match self.ssl_mode {
@@ -1384,6 +1394,51 @@ mod tests {
                 assert_eq!(password, Some("secret".to_string()));
             }
             _ => panic!("Expected TestConnection action"),
+        }
+    }
+
+    #[test]
+    fn test_test_connection_preserves_trimmed_onepassword_ref() {
+        let mut form = ConnectionFormModal::new();
+        form.host = "localhost".to_string();
+        form.database = "mydb".to_string();
+        form.user = "postgres".to_string();
+        form.op_ref = "  op://vault/item/password  ".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::TestConnection { entry, .. } => {
+                assert_eq!(
+                    entry.password_onepassword.as_deref(),
+                    Some("op://vault/item/password")
+                );
+                assert!(!entry.no_password_required);
+            }
+            _ => panic!("Expected TestConnection action"),
+        }
+    }
+
+    #[test]
+    fn test_save_with_onepassword_ref_is_not_marked_no_password_required() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "testconn".to_string();
+        form.host = "localhost".to_string();
+        form.database = "mydb".to_string();
+        form.user = "postgres".to_string();
+        form.op_ref = " op://vault/item/password ".to_string();
+        form.password.clear();
+        form.save_password = false;
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(
+                    entry.password_onepassword.as_deref(),
+                    Some("op://vault/item/password")
+                );
+                assert!(!entry.no_password_required);
+            }
+            _ => panic!("Expected Save action"),
         }
     }
 

@@ -5952,12 +5952,15 @@ impl App {
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| "vi".to_string());
 
-        // Split to support editors with arguments (e.g. "code -w")
-        let mut editor_parts = editor_str.split_whitespace();
-        let editor_bin = editor_parts.next().unwrap_or("vi");
-        let editor_args: Vec<&str> = editor_parts.collect();
+        // Parse with shell rules so quoted paths/args are handled correctly.
+        let mut editor_parts = shlex::split(&editor_str).unwrap_or_default();
+        if editor_parts.is_empty() {
+            editor_parts.push("vi".to_string());
+        }
+        let editor_bin = editor_parts.remove(0);
+        let editor_args = editor_parts;
 
-        let spawn_result = std::process::Command::new(editor_bin)
+        let spawn_result = std::process::Command::new(&editor_bin)
             .args(&editor_args)
             .arg(&path)
             .status();
@@ -6895,6 +6898,24 @@ impl App {
         self.history_picker = Some(picker);
     }
 
+    fn reopen_history_picker_with_state(
+        &mut self,
+        saved_query: Option<String>,
+        saved_selected: Option<usize>,
+    ) {
+        self.open_history_picker();
+        if let Some(picker) = self.history_picker.as_mut() {
+            if let Some(q) = saved_query {
+                if !q.is_empty() {
+                    picker.set_query(q);
+                }
+            }
+            if let Some(sel) = saved_selected {
+                picker.set_selected(sel);
+            }
+        }
+    }
+
     /// Handle key events when history picker is open.
     fn handle_history_picker_key(&mut self, key: KeyEvent) -> bool {
         // Intercept Ctrl-t to toggle between full history and pinned-only view.
@@ -6902,17 +6923,7 @@ impl App {
             let saved_query = self.history_picker.as_ref().map(|p| p.query().to_string());
             let saved_selected = self.history_picker.as_ref().map(|p| p.selected());
             self.history_picker_pinned_only = !self.history_picker_pinned_only;
-            self.open_history_picker();
-            if let Some(picker) = self.history_picker.as_mut() {
-                if let Some(q) = saved_query {
-                    if !q.is_empty() {
-                        picker.set_query(q);
-                    }
-                }
-                if let Some(sel) = saved_selected {
-                    picker.set_selected(sel);
-                }
-            }
+            self.reopen_history_picker_with_state(saved_query, saved_selected);
             return false;
         }
 
@@ -6926,17 +6937,7 @@ impl App {
                 .and_then(|p| p.selected_original_index());
             if let Some(idx) = original_idx {
                 self.history.toggle_pin(idx);
-                self.open_history_picker();
-                if let Some(picker) = self.history_picker.as_mut() {
-                    if let Some(q) = saved_query {
-                        if !q.is_empty() {
-                            picker.set_query(q);
-                        }
-                    }
-                    if let Some(sel) = saved_selected {
-                        picker.set_selected(sel);
-                    }
-                }
+                self.reopen_history_picker_with_state(saved_query, saved_selected);
             }
             return false;
         }
@@ -6956,17 +6957,7 @@ impl App {
                     self.history_picker_pinned_only = false;
                     self.last_status = Some("History cleared".to_string());
                 } else {
-                    self.open_history_picker();
-                    if let Some(picker) = self.history_picker.as_mut() {
-                        if let Some(q) = saved_query {
-                            if !q.is_empty() {
-                                picker.set_query(q);
-                            }
-                        }
-                        if let Some(sel) = saved_selected {
-                            picker.set_selected(sel);
-                        }
-                    }
+                    self.reopen_history_picker_with_state(saved_query, saved_selected);
                 }
             }
             return false;

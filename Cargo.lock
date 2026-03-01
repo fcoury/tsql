@@ -2287,6 +2287,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "shlex",
  "tempfile",
  "throbber-widgets-tui",
  "tokio",
