@@ -375,7 +375,8 @@ impl ConnectionEntry {
     /// Returns `Ok(None)` when the reference is empty.
     /// Returns `Err(...)` when the CLI cannot be executed or returns a failure status.
     ///
-    /// Note: this method is Unix-only (`/bin/sh`).
+    /// Note: this method is available on Unix-like systems (Linux/macOS).
+    #[cfg(unix)]
     fn read_from_onepassword(op_ref: &str) -> Result<Option<String>> {
         let op_ref = op_ref.trim();
         if op_ref.is_empty() {
@@ -409,10 +410,24 @@ impl ConnectionEntry {
         }
     }
 
+    #[cfg(not(unix))]
+    fn read_from_onepassword(_op_ref: &str) -> Result<Option<String>> {
+        Err(anyhow!(
+            "1Password integration is only supported on Unix-like systems (Linux/macOS)"
+        ))
+    }
+
     /// Get the password using the configured method.
     ///
     /// Precedence: environment variable → 1Password CLI → OS keychain.
     pub fn get_password(&self) -> Result<Option<String>> {
+        self.get_password_with_options(true)
+    }
+
+    /// Get the password using the configured method, optionally disabling 1Password.
+    ///
+    /// Precedence: environment variable → 1Password CLI (if enabled) → OS keychain.
+    pub fn get_password_with_options(&self, onepassword_enabled: bool) -> Result<Option<String>> {
         // Try environment variable first (non-blocking)
         if let Some(ref env_var) = self.password_env {
             // Handle both "$VAR" and "VAR" formats
@@ -422,10 +437,12 @@ impl ConnectionEntry {
             }
         }
 
-        // Try 1Password CLI if configured
-        if let Some(ref op_ref) = self.password_onepassword {
-            if let Some(pwd) = Self::read_from_onepassword(op_ref)? {
-                return Ok(Some(pwd));
+        // Try 1Password CLI if configured and enabled
+        if onepassword_enabled {
+            if let Some(ref op_ref) = self.password_onepassword {
+                if let Some(pwd) = Self::read_from_onepassword(op_ref)? {
+                    return Ok(Some(pwd));
+                }
             }
         }
 
@@ -450,6 +467,15 @@ impl ConnectionEntry {
     /// - Ok(None) if no password available or timeout occurred
     /// - Err if there was an error (other than timeout/no entry)
     pub fn get_password_with_timeout(&self, timeout_ms: u64) -> Result<Option<String>> {
+        self.get_password_with_timeout_and_options(timeout_ms, true)
+    }
+
+    /// Get the password with timeout, optionally disabling 1Password.
+    pub fn get_password_with_timeout_and_options(
+        &self,
+        timeout_ms: u64,
+        onepassword_enabled: bool,
+    ) -> Result<Option<String>> {
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
@@ -462,13 +488,17 @@ impl ConnectionEntry {
             }
         }
 
-        // If neither keychain nor 1Password is configured, return None
-        if !self.password_in_keychain && self.password_onepassword.is_none() {
+        let use_keychain = self.password_in_keychain;
+        let op_ref = if onepassword_enabled {
+            self.password_onepassword.clone()
+        } else {
+            None
+        };
+
+        // If neither keychain nor enabled 1Password is configured, return None
+        if !use_keychain && op_ref.is_none() {
             return Ok(None);
         }
-
-        let use_keychain = self.password_in_keychain;
-        let op_ref = self.password_onepassword.clone();
 
         // Spawn blocking retrieval in a separate thread with timeout
         let name = self.name.clone();
@@ -476,7 +506,7 @@ impl ConnectionEntry {
 
         thread::spawn(move || {
             let result = (|| -> Result<Option<String>> {
-                // Try 1Password CLI first if configured
+                // Try 1Password CLI first if configured and enabled
                 if let Some(ref op_ref) = op_ref {
                     if let Some(pwd) = Self::read_from_onepassword(op_ref)? {
                         return Ok(Some(pwd));
@@ -503,8 +533,8 @@ impl ConnectionEntry {
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Keychain access is blocked (probably showing system dialog)
-                // Return None to trigger password prompt
+                // Password retrieval is blocked (1Password CLI or keychain may be prompting).
+                // Return None to trigger password prompt.
                 Ok(None)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

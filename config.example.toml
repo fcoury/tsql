@@ -88,6 +88,10 @@ max_rows = 0
 # Auto-reconnect on connection loss
 auto_reconnect = true
 
+# Enable 1Password CLI integration for `password_onepassword` refs in
+# connections. When enabled, `op` must be installed and available on PATH.
+enable_onepassword = false
+
 # Clipboard settings
 [clipboard]
 # Clipboard backend:

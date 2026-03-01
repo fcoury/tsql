@@ -185,6 +185,8 @@ tsql looks for configuration at `~/.config/tsql/config.toml`.
 [connection]
 # Default connection URL (can be overridden by CLI arg or DATABASE_URL)
 default_url = "postgres://localhost/mydb"
+# Enable 1Password CLI support for `password_onepassword` refs
+enable_onepassword = false
 
 [keybindings]
 # Custom keybindings (see config.example.toml for options)
@@ -194,7 +196,16 @@ See [config.example.toml](config.example.toml) for all available options.
 
 ### 1Password integration
 
-Connection entries support an optional **1Password ref** field (`op://vault/item/field`). When set, `tsql` calls `op read` at connect time to resolve the password, inheriting your shell's `PATH` and active `op` session token. Configure it via the connection manager (`Ctrl+Shift+C` or `gm`).
+1Password support is currently gated behind `connection.enable_onepassword = true`
+in your config.
+
+Connection entries support an optional **1Password ref** field
+(`op://vault/item/field`). When enabled, `tsql` calls `op read` at connect time
+to resolve the password, inheriting your shell's `PATH` and active `op` session
+token. Configure it via the connection manager (`Ctrl+Shift+C` or `gm`).
+
+Requires the 1Password CLI (`op`) to be installed and an active authenticated
+session (for example via `op signin`).
 
 ## Requirements
 

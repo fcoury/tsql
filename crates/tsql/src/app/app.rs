@@ -2461,14 +2461,6 @@ impl App {
                     self.open_connection_manager();
                     return false;
                 }
-                // Fallback for terminals that collapse Ctrl+Shift+C into Ctrl+C.
-                // Limit this to Query focus to avoid stealing Ctrl+C in Grid.
-                (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                    if matches!(self.focus, Focus::Query) && !self.db.running =>
-                {
-                    self.open_connection_manager();
-                    return false;
-                }
                 // Ctrl+O: Open connection picker
                 (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                     self.open_connection_picker();
@@ -5228,19 +5220,21 @@ impl App {
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
         // Try to get the password from keychain / env var / 1Password.
         // Give 1Password more time since it shells out to `op`.
-        let timeout_ms = if entry.password_onepassword.is_some() {
+        let onepassword_enabled = self.config.connection.enable_onepassword;
+        let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
             5000
         } else {
             500
         };
-        let password = match entry.get_password_with_timeout(timeout_ms) {
-            Ok(Some(pwd)) => Some(pwd),
-            Ok(None) => None,
-            Err(e) => {
-                self.last_error = Some(format!("Failed to get password: {}", e));
-                None
-            }
-        };
+        let password =
+            match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
+                Ok(Some(pwd)) => Some(pwd),
+                Ok(None) => None,
+                Err(e) => {
+                    self.last_error = Some(format!("Failed to get password: {}", e));
+                    None
+                }
+            };
 
         // Determine if we need to prompt for password:
         // - If we have a password from keychain/env, use it
@@ -5283,7 +5277,7 @@ impl App {
             self.connections.sorted().into_iter().cloned().collect();
 
         let picker =
-            FuzzyPicker::with_display(entries, "Connect (gm or Ctrl+C: manage)", |entry| {
+            FuzzyPicker::with_display(entries, "Connect (gm or Ctrl+Shift+C: manage)", |entry| {
                 // Display: "[fav] name - user@host/db"
                 let fav = entry
                     .favorite
@@ -5310,10 +5304,14 @@ impl App {
             return false;
         }
 
-        // Check for Ctrl+Shift+C (or Ctrl+C fallback) to open connection manager
-        if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        // Check for Ctrl+Shift+C to open connection manager.
+        if matches!(
+            (key.code, key.modifiers),
+            (code @ (KeyCode::Char('c') | KeyCode::Char('C')), modifiers)
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && (modifiers.contains(KeyModifiers::SHIFT)
+                        || matches!(code, KeyCode::Char('C')))
+        ) {
             self.connection_picker = None;
             self.open_connection_manager();
             return false;
@@ -5567,7 +5565,10 @@ impl App {
             }
             ConnectionManagerAction::Edit { entry } => {
                 // Try to get existing password for editing
-                let password = entry.get_password().ok().flatten();
+                let password = entry
+                    .get_password_with_options(self.config.connection.enable_onepassword)
+                    .ok()
+                    .flatten();
                 self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
                     &entry,
                     password,
@@ -5647,7 +5648,10 @@ impl App {
                     .into_iter()
                     .find(|e| e.name == name)
                 {
-                    let password = entry.get_password().ok().flatten();
+                    let password = entry
+                        .get_password_with_options(self.config.connection.enable_onepassword)
+                        .ok()
+                        .flatten();
                     self.connection_form = Some(ConnectionFormModal::edit_with_keymap(
                         entry,
                         password,
@@ -9049,7 +9053,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ctrl_c_fallback_opens_connection_manager_from_query_when_idle() {
+    fn test_ctrl_c_does_not_open_connection_manager_from_query() {
         let _guard = ConfigDirGuard::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -9075,8 +9079,8 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert!(
-            app.connection_manager.is_some(),
-            "Ctrl+C fallback should open connection manager from Query when idle"
+            app.connection_manager.is_none(),
+            "Ctrl+C should not open connection manager from Query"
         );
     }
 

@@ -176,6 +176,27 @@ fn print_usage() {
     eprintln!("  tsql --debug-keys --mouse");
 }
 
+fn onepassword_cli_available() -> bool {
+    std::process::Command::new("op")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn onepassword_startup_warning(onepassword_enabled: bool) -> Option<String> {
+    if onepassword_enabled && !onepassword_cli_available() {
+        return Some(
+            "1Password support is enabled, but `op` was not found on PATH. Install/sign in via \
+             1Password CLI or disable `connection.enable_onepassword`."
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn main() -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -209,6 +230,7 @@ fn main() -> Result<()> {
         eprintln!("Warning: Failed to load config: {}", e);
         config::Config::default()
     });
+    let onepassword_enabled = cfg.connection.enable_onepassword;
 
     // Load session state if persistence is enabled
     let session = if cfg.editor.persist_session {
@@ -248,9 +270,15 @@ fn main() -> Result<()> {
         cfg,
     );
 
-    // Display any warning from libpq env var parsing
-    if libpq_warning.is_some() {
-        app.last_status = libpq_warning;
+    // Display startup warnings.
+    if let Some(warning) = libpq_warning {
+        app.last_status = Some(warning);
+    }
+    if let Some(warning) = onepassword_startup_warning(onepassword_enabled) {
+        app.last_status = Some(match app.last_status.take() {
+            Some(existing) => format!("{} | {}", existing, warning),
+            None => warning,
+        });
     }
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
@@ -264,7 +292,7 @@ fn main() -> Result<()> {
             let connections = load_connections().unwrap_or_default();
             if let Some(entry) = connections.find_by_name(&conn_name) {
                 // Check if password is available (not requiring prompt)
-                match entry.get_password() {
+                match entry.get_password_with_options(onepassword_enabled) {
                     Ok(Some(_)) | Ok(None) => {
                         // Password available or not needed - auto-connect
                         app.connect_to_entry(entry.clone());

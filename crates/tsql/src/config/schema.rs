@@ -115,6 +115,8 @@ pub struct ConnectionConfig {
     pub max_rows: usize,
     /// Auto-reconnect on connection loss
     pub auto_reconnect: bool,
+    /// Enable 1Password CLI (`op`) support for `password_onepassword` refs.
+    pub enable_onepassword: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -125,6 +127,7 @@ impl Default for ConnectionConfig {
             query_timeout_secs: 0,
             max_rows: 0,
             auto_reconnect: true,
+            enable_onepassword: false,
         }
     }
 }

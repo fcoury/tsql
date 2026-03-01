@@ -421,7 +421,10 @@ impl HelpPopup {
             }
 
             // Close help
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            KeyCode::Char('q') | KeyCode::Char('?') => HelpAction::Close,
+
+            // Esc clears active filter first; otherwise closes help.
+            KeyCode::Esc => {
                 if !self.filter.is_empty() {
                     // First Esc clears filter without closing
                     self.filter.clear();
@@ -707,11 +710,30 @@ impl HelpPopup {
     ) -> Line<'static> {
         let keys = format!("{:20}", binding.keys);
         let desc = binding.description.to_string();
+        let filter_lower = filter.to_lowercase();
 
-        let highlighted =
-            !filter.is_empty() && desc.to_lowercase().contains(&filter.to_lowercase());
+        let keys_highlighted =
+            !filter.is_empty() && binding.keys.to_lowercase().contains(&filter_lower);
+        let desc_highlighted = !filter.is_empty() && desc.to_lowercase().contains(&filter_lower);
 
-        let desc_span = if highlighted {
+        let key_span = if keys_highlighted {
+            Span::styled(
+                keys,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                keys,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+
+        let desc_span = if desc_highlighted {
             Span::styled(
                 desc,
                 Style::default()
@@ -723,16 +745,7 @@ impl HelpPopup {
             Span::styled(desc, Style::default().fg(Color::White))
         };
 
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                keys,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            desc_span,
-        ])
+        Line::from(vec![Span::raw("  "), key_span, desc_span])
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -833,5 +846,51 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         y,
         width: width.min(area.width),
         height: height.min(area.height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn question_mark_closes_even_with_active_filter() {
+        let mut popup = HelpPopup::new();
+        popup.filter = "ctrl".to_string();
+
+        let action = popup.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert_eq!(action, HelpAction::Close);
+        assert_eq!(
+            popup.filter, "ctrl",
+            "closing should not clear filter first"
+        );
+    }
+
+    #[test]
+    fn esc_clears_filter_before_close() {
+        let mut popup = HelpPopup::new();
+        popup.filter = "ctrl".to_string();
+
+        let first = popup.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let second = popup.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(first, HelpAction::Continue);
+        assert!(popup.filter.is_empty());
+        assert_eq!(second, HelpAction::Close);
+    }
+
+    #[test]
+    fn key_span_is_highlighted_when_filter_matches_keys() {
+        let popup = HelpPopup::new();
+        let binding = KeyBinding::new("Ctrl+o", "Open connection picker");
+
+        let line = popup.render_keybinding(&binding, "ctrl", 80);
+        let key_span = &line.spans[1];
+
+        assert_eq!(key_span.style.fg, Some(Color::Black));
+        assert_eq!(key_span.style.bg, Some(Color::Yellow));
+        assert!(key_span.style.add_modifier.contains(Modifier::BOLD));
     }
 }
