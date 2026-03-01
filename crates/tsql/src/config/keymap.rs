@@ -98,6 +98,7 @@ pub enum Action {
 
     // Sidebar
     ToggleSidebar,
+    ToggleQueryHeight,
 
     // Goto sequences (triggered by g + key)
     GotoFirst,
@@ -175,6 +176,7 @@ impl Action {
             Action::TestConnection => "Test connection",
             Action::ClearField => "Clear current field",
             Action::ToggleSidebar => "Toggle sidebar",
+            Action::ToggleQueryHeight => "Toggle query pane height (min/max)",
             Action::GotoFirst => "Go to first row/document start",
             Action::GotoEditor => "Go to query editor",
             Action::GotoConnections => "Go to connections sidebar",
@@ -281,6 +283,7 @@ impl FromStr for Action {
 
             // Sidebar
             "toggle_sidebar" => Ok(Action::ToggleSidebar),
+            "toggle_query_height" => Ok(Action::ToggleQueryHeight),
 
             // Goto sequences
             "goto_first" => Ok(Action::GotoFirst),
@@ -607,6 +610,10 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('i'), KeyModifiers::NONE),
             Action::FocusQuery,
         );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            Action::ToggleQueryHeight,
+        );
 
         // Display
         km.bind(
@@ -770,6 +777,10 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
             Action::ToggleFocus,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            Action::ToggleQueryHeight,
         );
 
         // Show history picker
@@ -990,6 +1001,10 @@ mod tests {
         // Check search
         let slash = KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE);
         assert_eq!(km.get(&slash), Some(&Action::StartSearch));
+
+        // Query height toggle
+        let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
     }
 
     #[test]
@@ -1027,6 +1042,10 @@ mod tests {
         assert_eq!(
             "goto_results".parse::<Action>().unwrap(),
             Action::GotoResults
+        );
+        assert_eq!(
+            "toggle_query_height".parse::<Action>().unwrap(),
+            Action::ToggleQueryHeight
         );
     }
 

@@ -261,6 +261,11 @@ fn calculate_scroll_offset(
         if cursor_row < scroll_row {
             scroll_row = cursor_row;
         }
+        // If viewport got taller, reveal as many lines above the cursor as possible.
+        let max_top_for_cursor = cursor_row.saturating_sub(viewport_height - 1);
+        if scroll_row > max_top_for_cursor {
+            scroll_row = max_top_for_cursor;
+        }
         // If cursor is below the viewport, scroll down
         let viewport_bottom = scroll_row + viewport_height;
         if cursor_row >= viewport_bottom {
@@ -714,5 +719,11 @@ mod tests {
             pos.x < area.x + area.width,
             "Cursor x should be within viewport"
         );
+    }
+
+    #[test]
+    fn test_calculate_scroll_offset_reveals_more_above_cursor_when_viewport_expands() {
+        let (scroll_row, _scroll_col) = calculate_scroll_offset(10, 0, (8, 0), 6, 80);
+        assert_eq!(scroll_row, 5);
     }
 }

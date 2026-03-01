@@ -76,6 +76,7 @@ const GLOBAL: HelpSection = HelpSection::new(
     "Global",
     &[
         KeyBinding::new("Tab", "Switch focus (Query/Grid)"),
+        KeyBinding::new("Alt+M", "Toggle query pane height (min/max)"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),

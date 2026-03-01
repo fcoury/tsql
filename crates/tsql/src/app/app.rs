@@ -576,6 +576,11 @@ impl PagedQueryState {
 
 /// Default page size for cursor-based queries.
 const DEFAULT_PAGE_SIZE: usize = 500;
+const REGULAR_QUERY_HEIGHT: u16 = 7;
+const STATUS_HEIGHT: u16 = 1;
+const MIN_GRID_HEIGHT: u16 = 3;
+const QUERY_BORDER_ROWS: u16 = 2;
+const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
 /// Check if a query is suitable for cursor-based paging.
 ///
@@ -594,6 +599,46 @@ fn is_pageable_query(query: &str) -> bool {
         return false; // Multiple statements
     }
     extract_table_from_query(query).is_some()
+}
+
+fn compute_query_panel_height(
+    main_height: u16,
+    mode: Mode,
+    non_insert_mode: QueryHeightMode,
+    editor_line_count: usize,
+) -> u16 {
+    let available_for_query = main_height.saturating_sub(STATUS_HEIGHT);
+    if available_for_query == 0 {
+        return 0;
+    }
+
+    // Preserve space for the status line and (when possible) a minimal grid.
+    let layout_safe_max = {
+        let max_with_min_grid = main_height.saturating_sub(STATUS_HEIGHT + MIN_GRID_HEIGHT);
+        if max_with_min_grid > 0 {
+            max_with_min_grid
+        } else {
+            available_for_query
+        }
+    };
+
+    let regular_height = REGULAR_QUERY_HEIGHT.min(layout_safe_max);
+
+    let ratio_cap = (main_height / QUERY_EXPANDED_MAX_RATIO_DENOM)
+        .max(1)
+        .min(layout_safe_max);
+    let maximized_height = ratio_cap.max(regular_height);
+
+    if mode == Mode::Insert {
+        let desired_content_height = (editor_line_count as u16).saturating_add(QUERY_BORDER_ROWS);
+        let desired_height = desired_content_height.max(regular_height);
+        return desired_height.min(maximized_height);
+    }
+
+    match non_insert_mode {
+        QueryHeightMode::Minimized => regular_height,
+        QueryHeightMode::Maximized => maximized_height,
+    }
 }
 
 /// Extract the table name from a simple SELECT query.
@@ -1748,6 +1793,8 @@ pub struct App {
     update_state: UpdateState,
     /// True while an update apply flow is running in the background.
     update_apply_in_flight: bool,
+    /// Query pane size mode used outside Insert mode.
+    query_height_mode: QueryHeightMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1762,6 +1809,12 @@ struct GridCellClick {
 enum CachedCursorStyle {
     BlinkingBar,
     SteadyBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryHeightMode {
+    Minimized,
+    Maximized,
 }
 
 /// Groups spinner and timing state for query execution UI.
@@ -1906,6 +1959,7 @@ impl App {
             query_ui: QueryRunUi::default(),
             update_state: UpdateState::default(),
             update_apply_in_flight: false,
+            query_height_mode: QueryHeightMode::Minimized,
         };
 
         // Load saved connections
@@ -2140,12 +2194,19 @@ impl App {
                     self.render_sidebar_area = None;
                 }
 
+                let query_height = compute_query_panel_height(
+                    main_area.height,
+                    self.mode,
+                    self.query_height_mode,
+                    self.editor.textarea.lines().len(),
+                );
+
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(7),
-                        Constraint::Min(3),
-                        Constraint::Length(1),
+                        Constraint::Length(query_height),
+                        Constraint::Min(MIN_GRID_HEIGHT),
+                        Constraint::Length(STATUS_HEIGHT),
                     ])
                     .split(main_area);
 
@@ -2962,6 +3023,17 @@ impl App {
         if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
             self.execute_query();
             return false;
+        }
+
+        // Query pane height toggle (non-insert modes, independent of focus).
+        if self.mode != Mode::Insert {
+            let toggle_key = self.editor_normal_keymap.get_action(&key)
+                == Some(Action::ToggleQueryHeight)
+                || self.grid_keymap.get_action(&key) == Some(Action::ToggleQueryHeight);
+            if toggle_key {
+                self.toggle_query_height_mode();
+                return false;
+            }
         }
 
         if self.search.active {
@@ -3826,6 +3898,18 @@ impl App {
         } else {
             self.focus_schema();
         }
+    }
+
+    fn toggle_query_height_mode(&mut self) {
+        self.query_height_mode = match self.query_height_mode {
+            QueryHeightMode::Minimized => QueryHeightMode::Maximized,
+            QueryHeightMode::Maximized => QueryHeightMode::Minimized,
+        };
+        let label = match self.query_height_mode {
+            QueryHeightMode::Minimized => "minimized",
+            QueryHeightMode::Maximized => "maximized",
+        };
+        self.last_status = Some(format!("Query pane {label}"));
     }
 
     /// Focus on the Schema section of the sidebar, ensuring first item is selected
@@ -5410,7 +5494,7 @@ impl App {
                         command_tag: Some(format!("describe {}", collection_name)),
                         truncated: false,
                         elapsed: started.elapsed(),
-                        source_table: Some(collection_name),
+                        source_table: None,
                         primary_keys: Vec::new(),
                         col_types: vec!["string".to_string(), "string".to_string()],
                     };
@@ -5598,6 +5682,7 @@ impl App {
 
         if self.db.kind == Some(DbKind::Mongo) {
             let mut commands = Vec::new();
+            let mut skipped_empty_updates = 0usize;
             for row_idx in &row_indices {
                 let Some(row_values) = self.grid.rows.get(*row_idx) else {
                     continue;
@@ -5646,12 +5731,22 @@ impl App {
                                 set_obj.insert(k.clone(), v.clone());
                             }
                         }
-                        serde_json::json!({
-                            "op": "updateOne",
-                            "collection": table.clone(),
-                            "filter": serde_json::Value::Object(filter.clone()),
-                            "update": { "$set": serde_json::Value::Object(set_obj) }
-                        })
+                        if set_obj.is_empty() {
+                            skipped_empty_updates += 1;
+                            serde_json::json!({
+                                "_comment": format!(
+                                    "Skipped row {}: no non-key fields left for $set (all fields are key columns).",
+                                    row_idx + 1
+                                )
+                            })
+                        } else {
+                            serde_json::json!({
+                                "op": "updateOne",
+                                "collection": table.clone(),
+                                "filter": serde_json::Value::Object(filter.clone()),
+                                "update": { "$set": serde_json::Value::Object(set_obj) }
+                            })
+                        }
                     }
                     "delete" | "d" => serde_json::json!({
                         "op": "deleteOne",
@@ -5686,9 +5781,18 @@ impl App {
             self.focus = Focus::Query;
             self.mode = Mode::Normal;
             self.last_status = Some(format!(
-                "Generated {} Mongo command statement{}",
+                "Generated {} Mongo command statement{}{}",
                 row_indices.len(),
-                if row_indices.len() == 1 { "" } else { "s" }
+                if row_indices.len() == 1 { "" } else { "s" },
+                if skipped_empty_updates > 0 {
+                    format!(
+                        " ({} skipped update row{} with no non-key fields)",
+                        skipped_empty_updates,
+                        if skipped_empty_updates == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
             ));
             return;
         }
@@ -9207,6 +9311,11 @@ fn calculate_editor_scroll(
         if cursor_row < scroll_row {
             scroll_row = cursor_row;
         }
+        // If viewport got taller, reveal as many lines above the cursor as possible.
+        let max_top_for_cursor = cursor_row.saturating_sub(viewport_height - 1);
+        if scroll_row > max_top_for_cursor {
+            scroll_row = max_top_for_cursor;
+        }
         // If cursor is below the viewport, scroll down
         let viewport_bottom = scroll_row + viewport_height;
         if cursor_row >= viewport_bottom {
@@ -9571,6 +9680,85 @@ mod tests {
         assert!(!app.update_state.check_in_flight);
         assert!(app.update_state.startup_check_started);
         assert!(app.update_state.last_checked_at.is_some());
+    }
+
+    #[test]
+    fn test_compute_query_panel_height_non_insert_mode_respects_min_and_max() {
+        let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Minimized, 100);
+        assert_eq!(height, REGULAR_QUERY_HEIGHT);
+
+        let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Maximized, 100);
+        assert_eq!(height, 20);
+    }
+
+    #[test]
+    fn test_compute_query_panel_height_expands_by_content_in_insert_mode() {
+        // Low content keeps regular height.
+        let low_content =
+            compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 2);
+        assert_eq!(low_content, REGULAR_QUERY_HEIGHT);
+
+        // High content expands, capped at 50% of main area.
+        let high_content =
+            compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 50);
+        assert_eq!(high_content, 20);
+    }
+
+    #[test]
+    fn test_compute_query_panel_height_respects_layout_safety_cap() {
+        // main_height=6 leaves 5 rows after status line.
+        // With min grid reservation (3), query max should be 2.
+        let height = compute_query_panel_height(6, Mode::Insert, QueryHeightMode::Minimized, 50);
+        assert_eq!(height, 2);
+    }
+
+    #[test]
+    fn test_calculate_editor_scroll_reveals_more_above_cursor_when_viewport_expands() {
+        // Cursor remained visible in the old viewport with scroll_row=8.
+        // With a taller viewport (height=6), we should scroll up to show more
+        // lines above the cursor while keeping it visible.
+        let scroll = calculate_editor_scroll(10, 0, (8, 0), 6, 80);
+        assert_eq!(scroll.0, 5);
+    }
+
+    #[test]
+    fn test_alt_m_toggles_query_height_mode_outside_insert_independent_of_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.mode = Mode::Normal;
+        app.query_height_mode = QueryHeightMode::Minimized;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert_eq!(app.query_height_mode, QueryHeightMode::Maximized);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert_eq!(app.query_height_mode, QueryHeightMode::Minimized);
+    }
+
+    #[test]
+    fn test_alt_m_does_not_toggle_in_insert_mode() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.mode = Mode::Insert;
+        app.query_height_mode = QueryHeightMode::Minimized;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert_eq!(app.query_height_mode, QueryHeightMode::Minimized);
     }
 
     // ========== CellEditor Tests ==========
