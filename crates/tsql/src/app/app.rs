@@ -5733,20 +5733,14 @@ impl App {
                         }
                         if set_obj.is_empty() {
                             skipped_empty_updates += 1;
-                            serde_json::json!({
-                                "_comment": format!(
-                                    "Skipped row {}: no non-key fields left for $set (all fields are key columns).",
-                                    row_idx + 1
-                                )
-                            })
-                        } else {
-                            serde_json::json!({
-                                "op": "updateOne",
-                                "collection": table.clone(),
-                                "filter": serde_json::Value::Object(filter.clone()),
-                                "update": { "$set": serde_json::Value::Object(set_obj) }
-                            })
+                            continue;
                         }
+                        serde_json::json!({
+                            "op": "updateOne",
+                            "collection": table.clone(),
+                            "filter": serde_json::Value::Object(filter.clone()),
+                            "update": { "$set": serde_json::Value::Object(set_obj) }
+                        })
                     }
                     "delete" | "d" => serde_json::json!({
                         "op": "deleteOne",
@@ -5767,6 +5761,14 @@ impl App {
                     }
                 };
                 commands.push(command);
+            }
+
+            if commands.is_empty() {
+                self.last_error = Some(
+                    "No executable commands generated: all selected rows have only key fields."
+                        .to_string(),
+                );
+                return;
             }
 
             let generated = commands
@@ -9756,7 +9758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alt_m_does_not_toggle_in_insert_mode() {
+    fn test_alt_m_toggles_in_insert_mode() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9770,7 +9772,7 @@ mod tests {
         app.query_height_mode = QueryHeightMode::Minimized;
 
         app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
-        assert_eq!(app.query_height_mode, QueryHeightMode::Minimized);
+        assert_eq!(app.query_height_mode, QueryHeightMode::Maximized);
     }
 
     // ========== CellEditor Tests ==========
