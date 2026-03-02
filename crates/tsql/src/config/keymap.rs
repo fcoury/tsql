@@ -1020,6 +1020,14 @@ mod tests {
     }
 
     #[test]
+    fn test_default_editor_normal_keymap() {
+        let km = Keymap::default_editor_normal_keymap();
+
+        let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+    }
+
+    #[test]
     fn test_action_from_str() {
         assert_eq!("move_up".parse::<Action>().unwrap(), Action::MoveUp);
         assert_eq!("move_down".parse::<Action>().unwrap(), Action::MoveDown);
