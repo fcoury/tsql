@@ -6532,6 +6532,64 @@ impl App {
                         ('r', KeyCode::Esc, KeyModifiers::NONE) => {
                             return;
                         }
+                        // d{i,a}{w,W} text objects
+                        ('d', KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            self.pending_key = Some('1');
+                            return;
+                        }
+                        ('d', KeyCode::Char('a'), KeyModifiers::NONE) => {
+                            self.pending_key = Some('2');
+                            return;
+                        }
+                        ('1', KeyCode::Char('w'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(false, false);
+                            return;
+                        }
+                        ('1', KeyCode::Char('W'), KeyModifiers::SHIFT)
+                        | ('1', KeyCode::Char('W'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(false, true);
+                            return;
+                        }
+                        ('2', KeyCode::Char('w'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(true, false);
+                            return;
+                        }
+                        ('2', KeyCode::Char('W'), KeyModifiers::SHIFT)
+                        | ('2', KeyCode::Char('W'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(true, true);
+                            return;
+                        }
+                        // c{i,a}{w,W} text objects
+                        ('c', KeyCode::Char('i'), KeyModifiers::NONE) => {
+                            self.pending_key = Some('3');
+                            return;
+                        }
+                        ('c', KeyCode::Char('a'), KeyModifiers::NONE) => {
+                            self.pending_key = Some('4');
+                            return;
+                        }
+                        ('3', KeyCode::Char('w'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(false, false);
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        ('3', KeyCode::Char('W'), KeyModifiers::SHIFT)
+                        | ('3', KeyCode::Char('W'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(false, true);
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        ('4', KeyCode::Char('w'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(true, false);
+                            self.mode = Mode::Insert;
+                            return;
+                        }
+                        ('4', KeyCode::Char('W'), KeyModifiers::SHIFT)
+                        | ('4', KeyCode::Char('W'), KeyModifiers::NONE) => {
+                            self.editor.delete_text_object(true, true);
+                            self.mode = Mode::Insert;
+                            return;
+                        }
                         // gg - go to top
                         ('g', KeyCode::Char('g'), KeyModifiers::NONE) => {
                             self.editor.textarea.move_cursor(CursorMove::Top);
@@ -6736,13 +6794,28 @@ impl App {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::WordForward);
                     }
+                    (KeyCode::Char('W'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('W'), KeyModifiers::NONE) => {
+                        self.pending_key = None;
+                        self.editor.move_big_word_forward();
+                    }
                     (KeyCode::Char('b'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::WordBack);
                     }
+                    (KeyCode::Char('B'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('B'), KeyModifiers::NONE) => {
+                        self.pending_key = None;
+                        self.editor.move_big_word_back();
+                    }
                     (KeyCode::Char('e'), KeyModifiers::NONE) => {
                         self.pending_key = None;
                         self.editor.textarea.move_cursor(CursorMove::WordEnd);
+                    }
+                    (KeyCode::Char('E'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('E'), KeyModifiers::NONE) => {
+                        self.pending_key = None;
+                        self.editor.move_big_word_end();
                     }
 
                     (KeyCode::Char('/'), KeyModifiers::NONE) => {
@@ -7030,6 +7103,23 @@ impl App {
                     self.pending_key = None;
                 }
 
+                // Visual text objects: v{i,a}{w,W}
+                if self.pending_key == Some('i') || self.pending_key == Some('a') {
+                    let around = self.pending_key == Some('a');
+                    self.pending_key = None;
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('w'), KeyModifiers::NONE) => {
+                            self.editor.select_text_object(around, false);
+                        }
+                        (KeyCode::Char('W'), KeyModifiers::SHIFT)
+                        | (KeyCode::Char('W'), KeyModifiers::NONE) => {
+                            self.editor.select_text_object(around, true);
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // In visual mode, movement extends selection, y/d/c act on selection.
                 match (key.code, key.modifiers) {
                     // Exit visual mode.
@@ -7079,11 +7169,29 @@ impl App {
                     (KeyCode::Char('w'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::WordForward);
                     }
+                    (KeyCode::Char('W'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('W'), KeyModifiers::NONE) => {
+                        self.editor.move_big_word_forward();
+                    }
                     (KeyCode::Char('b'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::WordBack);
                     }
+                    (KeyCode::Char('B'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('B'), KeyModifiers::NONE) => {
+                        self.editor.move_big_word_back();
+                    }
                     (KeyCode::Char('e'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::WordEnd);
+                    }
+                    (KeyCode::Char('E'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('E'), KeyModifiers::NONE) => {
+                        self.editor.move_big_word_end();
+                    }
+                    (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        self.pending_key = Some('i');
+                    }
+                    (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                        self.pending_key = Some('a');
                     }
                     (KeyCode::Char('0'), KeyModifiers::NONE) => {
                         self.editor.textarea.move_cursor(CursorMove::Head);
@@ -11186,6 +11294,82 @@ mod tests {
 
         assert_eq!(app.editor.text(), "hello");
         assert_eq!(app.last_status.as_deref(), Some("No character to replace"));
+    }
+
+    #[test]
+    fn test_diw_deletes_word_under_cursor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.editor.set_text("hello world".to_string());
+        app.editor.textarea.move_cursor(CursorMove::Head);
+        app.editor.textarea.move_cursor(CursorMove::Forward);
+        app.editor.textarea.move_cursor(CursorMove::Forward);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+
+        assert_eq!(app.editor.text(), " world");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_da_w_deletes_whitespace_delimited_word_with_space() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.editor.set_text("schema.table next".to_string());
+        app.editor.textarea.move_cursor(CursorMove::Head);
+        app.editor.textarea.move_cursor(CursorMove::Forward);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.editor.text(), "next");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_va_w_selects_and_deletes_word_object_in_visual_mode() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.editor.set_text("schema.table next".to_string());
+        app.editor.textarea.move_cursor(CursorMove::Head);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.editor.text(), "next");
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

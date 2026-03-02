@@ -244,6 +244,202 @@ impl QueryEditor {
         }
     }
 
+    fn move_cursor_to(&mut self, row: usize, col: usize) {
+        self.textarea.move_cursor(CursorMove::Top);
+        for _ in 0..row {
+            self.textarea.move_cursor(CursorMove::Down);
+        }
+        self.textarea.move_cursor(CursorMove::Head);
+        for _ in 0..col {
+            self.textarea.move_cursor(CursorMove::Forward);
+        }
+    }
+
+    fn classify_word_char(c: char, big_word: bool) -> u8 {
+        if c.is_whitespace() {
+            0
+        } else if big_word {
+            1
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Resolve current text object bounds on the cursor line.
+    /// Returns `(row, start_col, end_col_exclusive)`.
+    pub fn current_text_object_bounds(
+        &self,
+        around: bool,
+        big_word: bool,
+    ) -> Option<(usize, usize, usize)> {
+        let (row, col) = self.textarea.cursor();
+        let lines = self.textarea.lines();
+        if row >= lines.len() {
+            return None;
+        }
+
+        let chars: Vec<char> = lines[row].chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let len = chars.len();
+        let mut idx = col.min(len.saturating_sub(1));
+        if Self::classify_word_char(chars[idx], big_word) == 0 {
+            let mut right = idx;
+            while right < len && Self::classify_word_char(chars[right], big_word) == 0 {
+                right += 1;
+            }
+            if right < len {
+                idx = right;
+            } else {
+                let mut left = idx;
+                while left > 0 && Self::classify_word_char(chars[left - 1], big_word) == 0 {
+                    left -= 1;
+                }
+                if left == 0 && Self::classify_word_char(chars[0], big_word) == 0 {
+                    return None;
+                }
+                idx = left.saturating_sub(1);
+            }
+        }
+
+        let class = Self::classify_word_char(chars[idx], big_word);
+        if class == 0 {
+            return None;
+        }
+
+        let mut start = idx;
+        while start > 0 && Self::classify_word_char(chars[start - 1], big_word) == class {
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < len && Self::classify_word_char(chars[end], big_word) == class {
+            end += 1;
+        }
+
+        if around {
+            let mut astart = start;
+            let mut aend = end;
+            while aend < len && chars[aend].is_whitespace() {
+                aend += 1;
+            }
+            if aend == end {
+                while astart > 0 && chars[astart - 1].is_whitespace() {
+                    astart -= 1;
+                }
+            }
+            start = astart;
+            end = aend;
+        }
+
+        if start >= end {
+            None
+        } else {
+            Some((row, start, end))
+        }
+    }
+
+    pub fn delete_text_object(&mut self, around: bool, big_word: bool) -> bool {
+        let Some((row, start, end)) = self.current_text_object_bounds(around, big_word) else {
+            return false;
+        };
+
+        self.move_cursor_to(row, start);
+        for _ in start..end {
+            self.textarea.delete_next_char();
+        }
+        true
+    }
+
+    pub fn select_text_object(&mut self, around: bool, big_word: bool) -> bool {
+        let Some((row, start, end)) = self.current_text_object_bounds(around, big_word) else {
+            return false;
+        };
+
+        self.textarea.cancel_selection();
+        self.move_cursor_to(row, start);
+        self.textarea.start_selection();
+        self.move_cursor_to(row, end);
+        true
+    }
+
+    pub fn move_big_word_forward(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let lines = self.textarea.lines();
+        if row >= lines.len() {
+            return;
+        }
+        let chars: Vec<char> = lines[row].chars().collect();
+        let len = chars.len();
+        if len == 0 {
+            return;
+        }
+
+        let mut i = col.min(len);
+        if i < len && !chars[i].is_whitespace() {
+            while i < len && !chars[i].is_whitespace() {
+                i += 1;
+            }
+        }
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.move_cursor_to(row, i.min(len));
+    }
+
+    pub fn move_big_word_back(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let lines = self.textarea.lines();
+        if row >= lines.len() {
+            return;
+        }
+        let chars: Vec<char> = lines[row].chars().collect();
+        let len = chars.len();
+        if len == 0 || col == 0 {
+            return;
+        }
+
+        let mut i = col.min(len).saturating_sub(1);
+        while i > 0 && chars[i].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.move_cursor_to(row, i);
+    }
+
+    pub fn move_big_word_end(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let lines = self.textarea.lines();
+        if row >= lines.len() {
+            return;
+        }
+        let chars: Vec<char> = lines[row].chars().collect();
+        let len = chars.len();
+        if len == 0 {
+            return;
+        }
+
+        let mut i = col.min(len.saturating_sub(1));
+        if chars[i].is_whitespace() {
+            while i < len && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i >= len {
+                self.move_cursor_to(row, len);
+                return;
+            }
+        }
+        while i + 1 < len && !chars[i + 1].is_whitespace() {
+            i += 1;
+        }
+        self.move_cursor_to(row, i);
+    }
+
     /// Replace the character under the cursor (vim `r<char>` behavior).
     /// Returns false when there is no character under the cursor.
     pub fn replace_char_under_cursor(&mut self, c: char) -> bool {
@@ -370,6 +566,58 @@ mod tests {
         assert!(replaced);
         assert_eq!(editor.text(), "høllo");
         assert_eq!(editor.textarea.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn test_word_bounds_lower_vs_big_word() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("schema.table next".to_string());
+        editor.textarea.move_cursor(CursorMove::Head);
+        editor.textarea.move_cursor(CursorMove::WordForward); // on '.'
+
+        let lower = editor.current_text_object_bounds(false, false).unwrap();
+        let big = editor.current_text_object_bounds(false, true).unwrap();
+
+        assert_eq!(lower, (0, 6, 7)); // "."
+        assert_eq!(big, (0, 0, 12)); // "schema.table"
+    }
+
+    #[test]
+    fn test_delete_text_object_inside_word() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("hello world".to_string());
+        editor.textarea.move_cursor(CursorMove::Head);
+        editor.textarea.move_cursor(CursorMove::Forward);
+        editor.textarea.move_cursor(CursorMove::Forward); // inside "hello"
+
+        let deleted = editor.delete_text_object(false, false);
+
+        assert!(deleted);
+        assert_eq!(editor.text(), " world");
+    }
+
+    #[test]
+    fn test_delete_text_object_around_big_word_consumes_space() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("schema.table next".to_string());
+        editor.textarea.move_cursor(CursorMove::Head);
+        editor.textarea.move_cursor(CursorMove::Forward); // inside first WORD
+
+        let deleted = editor.delete_text_object(true, true);
+
+        assert!(deleted);
+        assert_eq!(editor.text(), "next");
+    }
+
+    #[test]
+    fn test_move_big_word_forward_uses_whitespace_boundaries() {
+        let mut editor = QueryEditor::new();
+        editor.set_text("schema.table next".to_string());
+        editor.textarea.move_cursor(CursorMove::Head);
+
+        editor.move_big_word_forward();
+
+        assert_eq!(editor.textarea.cursor(), (0, 13)); // start of "next"
     }
 
     // ========== Change Tracking Tests ==========
