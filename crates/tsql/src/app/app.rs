@@ -1005,8 +1005,44 @@ enum MongoQuery {
     },
 }
 
+fn json_value_to_bson(value: &serde_json::Value) -> std::result::Result<Bson, String> {
+    match value {
+        serde_json::Value::Null => Ok(Bson::Null),
+        serde_json::Value::Bool(v) => Ok(Bson::Boolean(*v)),
+        serde_json::Value::Number(_) => {
+            bson::to_bson(value).map_err(|e| format!("Invalid BSON value: {e}"))
+        }
+        serde_json::Value::String(v) => Ok(Bson::String(v.clone())),
+        serde_json::Value::Array(items) => {
+            let mut arr = Vec::with_capacity(items.len());
+            for item in items {
+                arr.push(json_value_to_bson(item)?);
+            }
+            Ok(Bson::Array(arr))
+        }
+        serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(oid_value) = map.get("$oid") {
+                    let oid_hex = oid_value
+                        .as_str()
+                        .ok_or_else(|| "$oid value must be a string".to_string())?;
+                    let oid = ObjectId::parse_str(oid_hex)
+                        .map_err(|_| format!("Invalid ObjectId hex: {oid_hex}"))?;
+                    return Ok(Bson::ObjectId(oid));
+                }
+            }
+
+            let mut doc = Document::new();
+            for (k, v) in map {
+                doc.insert(k, json_value_to_bson(v)?);
+            }
+            Ok(Bson::Document(doc))
+        }
+    }
+}
+
 fn json_value_to_document(value: &serde_json::Value) -> std::result::Result<Document, String> {
-    let bson = bson::to_bson(value).map_err(|e| format!("Invalid BSON value: {e}"))?;
+    let bson = json_value_to_bson(value)?;
     if let Bson::Document(doc) = bson {
         Ok(doc)
     } else {
@@ -1023,17 +1059,283 @@ fn json_value_to_documents(
     arr.iter().map(json_value_to_document).collect()
 }
 
+fn parse_js_string_literal(
+    chars: &[char],
+    start: usize,
+) -> std::result::Result<(String, usize), String> {
+    let quote = *chars
+        .get(start)
+        .ok_or_else(|| "Missing string quote".to_string())?;
+    if quote != '"' && quote != '\'' {
+        return Err("Expected string literal".to_string());
+    }
+
+    let mut out = String::new();
+    let mut i = start + 1;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == quote {
+            return Ok((out, i + 1));
+        }
+        if ch == '\\' {
+            i += 1;
+            if i >= chars.len() {
+                return Err("Unterminated escape sequence in string literal".to_string());
+            }
+            match chars[i] {
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    if i + 4 >= chars.len() {
+                        return Err("Invalid unicode escape in string literal".to_string());
+                    }
+                    let mut code = 0u32;
+                    for j in 1..=4 {
+                        let hex = chars[i + j].to_digit(16).ok_or_else(|| {
+                            "Invalid unicode escape in string literal".to_string()
+                        })?;
+                        code = (code << 4) | hex;
+                    }
+                    let decoded = char::from_u32(code).ok_or_else(|| {
+                        "Invalid unicode code point in string literal".to_string()
+                    })?;
+                    out.push(decoded);
+                    i += 4;
+                }
+                other => out.push(other),
+            }
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+
+    Err("Unterminated string literal".to_string())
+}
+
+fn is_js_identifier_start(ch: char) -> bool {
+    ch == '$' || ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_js_identifier_continue(ch: char) -> bool {
+    is_js_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+fn starts_with_token(chars: &[char], start: usize, token: &str) -> bool {
+    let token_chars: Vec<char> = token.chars().collect();
+    if start + token_chars.len() > chars.len() {
+        return false;
+    }
+    chars[start..start + token_chars.len()] == token_chars
+}
+
+fn rewrite_object_id_constructors(input: &str) -> std::result::Result<String, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '"' || ch == '\'' {
+            let (_, end) = parse_js_string_literal(&chars, i)?;
+            for c in &chars[i..end] {
+                out.push(*c);
+            }
+            i = end;
+            continue;
+        }
+
+        if starts_with_token(&chars, i, "ObjectId")
+            && (i == 0 || !is_js_identifier_continue(chars[i - 1]))
+            && (i + "ObjectId".len() == chars.len()
+                || !is_js_identifier_continue(chars[i + "ObjectId".len()]))
+        {
+            let mut j = i + "ObjectId".len();
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j >= chars.len() || chars[j] != '(' {
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            j += 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j >= chars.len() || (chars[j] != '"' && chars[j] != '\'') {
+                return Err("ObjectId(...) requires a quoted hex string".to_string());
+            }
+            let (hex, end_of_string) = parse_js_string_literal(&chars, j)?;
+            let mut k = end_of_string;
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            if k >= chars.len() || chars[k] != ')' {
+                return Err("ObjectId(...) is missing closing ')'".to_string());
+            }
+
+            ObjectId::parse_str(&hex).map_err(|_| format!("Invalid ObjectId hex: {hex}"))?;
+            out.push_str("{\"$oid\":");
+            out.push_str(
+                &serde_json::to_string(&hex).expect("string serialization should not fail"),
+            );
+            out.push('}');
+            i = k + 1;
+            continue;
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum JsonContext {
+    Object { expect_key: bool },
+    Array,
+}
+
+fn normalize_js_like_json(input: &str) -> std::result::Result<String, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut stack: Vec<JsonContext> = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if ch == '"' || ch == '\'' {
+            let (decoded, end) = parse_js_string_literal(&chars, i)?;
+            out.push_str(
+                &serde_json::to_string(&decoded).expect("string serialization should not fail"),
+            );
+            i = end;
+            continue;
+        }
+
+        match ch {
+            '{' => {
+                out.push(ch);
+                stack.push(JsonContext::Object { expect_key: true });
+                i += 1;
+            }
+            '}' => {
+                out.push(ch);
+                if !matches!(stack.pop(), Some(JsonContext::Object { .. })) {
+                    return Err("Mismatched '}' in JSON argument".to_string());
+                }
+                i += 1;
+            }
+            '[' => {
+                out.push(ch);
+                stack.push(JsonContext::Array);
+                i += 1;
+            }
+            ']' => {
+                out.push(ch);
+                if !matches!(stack.pop(), Some(JsonContext::Array)) {
+                    return Err("Mismatched ']' in JSON argument".to_string());
+                }
+                i += 1;
+            }
+            ':' => {
+                out.push(ch);
+                if let Some(JsonContext::Object { expect_key }) = stack.last_mut() {
+                    *expect_key = false;
+                }
+                i += 1;
+            }
+            ',' => {
+                out.push(ch);
+                if let Some(JsonContext::Object { expect_key }) = stack.last_mut() {
+                    *expect_key = true;
+                }
+                i += 1;
+            }
+            _ if ch.is_whitespace() => {
+                out.push(ch);
+                i += 1;
+            }
+            _ => {
+                if matches!(stack.last(), Some(JsonContext::Object { expect_key: true }))
+                    && is_js_identifier_start(ch)
+                {
+                    let start = i;
+                    i += 1;
+                    while i < chars.len() && is_js_identifier_continue(chars[i]) {
+                        i += 1;
+                    }
+                    let key: String = chars[start..i].iter().collect();
+                    let mut lookahead = i;
+                    while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                        lookahead += 1;
+                    }
+                    if lookahead < chars.len() && chars[lookahead] == ':' {
+                        out.push_str(
+                            &serde_json::to_string(&key)
+                                .expect("string serialization should not fail"),
+                        );
+                        continue;
+                    }
+                }
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err("Unbalanced JSON argument".to_string());
+    }
+
+    Ok(out)
+}
+
+fn normalize_mongo_relaxed_json(input: &str) -> std::result::Result<String, String> {
+    let with_object_ids = rewrite_object_id_constructors(input)?;
+    normalize_js_like_json(&with_object_ids)
+}
+
+fn parse_mongo_arg(arg: &str, idx: usize) -> std::result::Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str(arg) {
+        return Ok(value);
+    }
+
+    let normalized = normalize_mongo_relaxed_json(arg).map_err(|e| {
+        format!(
+            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and ObjectId(\"507f1f77bcf86cd799439011\")"
+        )
+    })?;
+
+    serde_json::from_str(&normalized).map_err(|e| {
+        format!(
+            "Invalid Mongo argument {idx}: {e}. Hint: use quoted keys and ObjectId(\"507f1f77bcf86cd799439011\")"
+        )
+    })
+}
+
 fn split_top_level_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth_brace: usize = 0;
     let mut depth_bracket: usize = 0;
     let mut depth_paren: usize = 0;
-    let mut in_string = false;
+    let mut string_quote: Option<char> = None;
     let mut escape = false;
 
     for ch in input.chars() {
-        if in_string {
+        if let Some(quote) = string_quote {
             current.push(ch);
             if escape {
                 escape = false;
@@ -1043,15 +1345,15 @@ fn split_top_level_args(input: &str) -> Vec<String> {
                 escape = true;
                 continue;
             }
-            if ch == '"' {
-                in_string = false;
+            if ch == quote {
+                string_quote = None;
             }
             continue;
         }
 
         match ch {
-            '"' => {
-                in_string = true;
+            '"' | '\'' => {
+                string_quote = Some(ch);
                 current.push(ch);
             }
             '{' => {
@@ -1235,7 +1537,7 @@ fn parse_mongo_query(query: &str) -> std::result::Result<MongoQuery, String> {
 
     let parse_arg = |idx: usize| -> std::result::Result<serde_json::Value, String> {
         if let Some(arg) = args.get(idx) {
-            serde_json::from_str(arg).map_err(|e| format!("Invalid JSON argument {idx}: {e}"))
+            parse_mongo_arg(arg, idx)
         } else {
             Ok(empty.clone())
         }
@@ -1271,8 +1573,7 @@ fn parse_mongo_query(query: &str) -> std::result::Result<MongoQuery, String> {
         }
         "aggregate" => {
             let pipeline = if let Some(arg0) = args.first() {
-                let value: serde_json::Value = serde_json::from_str(arg0)
-                    .map_err(|e| format!("Invalid pipeline JSON: {e}"))?;
+                let value = parse_mongo_arg(arg0, 0)?;
                 json_value_to_documents(&value)?
             } else {
                 Vec::new()
@@ -10747,6 +11048,51 @@ mod tests {
             }
             _ => panic!("expected MongoQuery::Find"),
         }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_object_id_constructor() {
+        let parsed = parse_mongo_query(
+            r#"db.team_memberships.find({ user_id: ObjectId("507f1f77bcf86cd799439011") })"#,
+        )
+        .unwrap();
+
+        match parsed {
+            MongoQuery::Find {
+                collection, filter, ..
+            } => {
+                assert_eq!(collection, "team_memberships");
+                let expected_oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+                assert_eq!(filter.get("user_id"), Some(&Bson::ObjectId(expected_oid)));
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_supports_extended_json_object_id() {
+        let parsed = parse_mongo_query(
+            r#"db.team_memberships.find({"user_id": {"$oid": "507f1f77bcf86cd799439011"}})"#,
+        )
+        .unwrap();
+
+        match parsed {
+            MongoQuery::Find { filter, .. } => {
+                let expected_oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+                assert_eq!(filter.get("user_id"), Some(&Bson::ObjectId(expected_oid)));
+            }
+            _ => panic!("expected MongoQuery::Find"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mongo_query_rejects_invalid_object_id_constructor() {
+        let err = parse_mongo_query(r#"db.t.find({ _id: ObjectId("not-a-valid-oid") })"#)
+            .expect_err("invalid ObjectId should fail");
+        assert!(
+            err.contains("ObjectId"),
+            "error should mention ObjectId: {err}"
+        );
     }
 
     // ========== Connection Manager Issue Tests ==========
