@@ -25,6 +25,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Postgres + MongoDB** - Connect with `postgres://...` or `mongodb://...` URLs
 - **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`)
 - **Query history** - Persistent history with fuzzy search, pinning, and deletion
+- **AI query assistant** - Draft DB-aware queries with follow-ups and one-key accept (`:ai` / `Ctrl+G`)
 - **External editor** - Open the current query in `$VISUAL` / `$EDITOR` with `vv`
 - **1Password integration** - Store an `op://` secret reference per connection instead of a plain password
 - **Update checks** - Notify of new versions with install-method specific upgrade hints, plus optional in-app apply for standalone installs when `updates.mode = "auto"`
@@ -100,6 +101,7 @@ Once connected:
 | `vv`      | Open query in `$VISUAL` / `$EDITOR`, reload on exit |
 | `/`       | Search                                              |
 | `Ctrl-r`  | Fuzzy history search                                |
+| `Ctrl-g`  | Open AI query assistant                             |
 | `Enter`   | Execute query                                       |
 | `:`       | Command mode                                        |
 
@@ -170,6 +172,7 @@ tsql --debug-keys --mouse
 | ------------------------------- | ------------------- |
 | `:connect <url>`                | Connect to database |
 | `:disconnect`                   | Disconnect          |
+| `:ai [prompt]`                  | Open AI query assistant |
 | `:export csv\|json\|tsv <path>` | Export results      |
 | `:update [check\|status\|apply]` | Check/apply updates |
 | `:sbt` / `:sidebar-toggle`      | Toggle sidebar      |
@@ -209,6 +212,23 @@ mode = "auto"
 interval_hours = 24
 allow_apply_for_standalone = true
 github_repo = "fcoury/tsql"
+
+[ai]
+# Enable AI query assistant (`:ai`, `Ctrl+G`)
+enabled = false
+# provider:
+# - "open_ai"
+# - "open_ai_compatible"
+# - "ollama"
+# - "anthropic"
+# - "google"
+# - "openrouter"
+provider = "open_ai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "http://localhost:1234/v1"
+# provider defaults when omitted:
+# ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY
 
 [keymap]
 # Custom keymap overrides (see config.example.toml for options)

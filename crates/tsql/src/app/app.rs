@@ -36,6 +36,7 @@ use tui_textarea::{CursorMove, Input};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
+use crate::ai::{generate_query, AiProposal, AiRequestContext};
 use crate::config::{
     load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
     ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode,
@@ -44,15 +45,15 @@ use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
-    quote_identifier, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
-    ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal, ConnectionInfo,
-    ConnectionManagerAction, ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker,
-    GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
-    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
-    KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
-    PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
-    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
-    YankFormat,
+    quote_identifier, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind,
+    CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction,
+    ConnectionFormModal, ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal,
+    CursorShape, DataGrid, FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup,
+    HighlightedTextArea, JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction,
+    KeySequenceCompletion, KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt,
+    PasswordPromptResult, PendingKey, PickerAction, Priority, QueryEditor, ResizeAction,
+    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
+    StatusLineBuilder, StatusSegment, TableInfo, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -1944,6 +1945,11 @@ pub enum DbEvent {
     UpdateApplyFinished {
         result: std::result::Result<ApplyResult, String>,
     },
+    /// AI query generation reply.
+    AiReply {
+        request_id: u64,
+        result: std::result::Result<AiProposal, String>,
+    },
 }
 
 pub struct DbSession {
@@ -2259,6 +2265,12 @@ pub struct App {
     pub connection_form: Option<ConnectionFormModal>,
     /// Password prompt modal (when connecting to entry that needs password).
     pub password_prompt: Option<PasswordPrompt>,
+    /// AI query assistant modal.
+    pub ai_modal: Option<AiQueryModal>,
+    /// Monotonic sequence for async AI requests.
+    ai_request_seq: u64,
+    /// Current in-flight AI request id (if any).
+    ai_pending_request_id: Option<u64>,
 
     /// Sidebar component state.
     pub sidebar: Sidebar,
@@ -2437,6 +2449,9 @@ impl App {
             connection_manager: None,
             connection_form: None,
             password_prompt: None,
+            ai_modal: None,
+            ai_request_seq: 0,
+            ai_pending_request_id: None,
 
             sidebar: Sidebar::new(),
             sidebar_visible: false,
@@ -3250,6 +3265,11 @@ impl App {
                     prompt.render(frame, size);
                 }
 
+                // Render AI assistant modal.
+                if let Some(ref mut modal) = self.ai_modal {
+                    modal.render(frame, size);
+                }
+
                 // Error popup (modal).
                 if let Some(ref err) = self.last_error {
                     let has_other_modal = self.help_popup.is_some()
@@ -3257,6 +3277,7 @@ impl App {
                         || self.command.active
                         || self.completion.active
                         || self.cell_editor.active
+                        || self.ai_modal.is_some()
                         || self.history_picker.is_some()
                         || self.connection_picker.is_some()
                         || self.json_editor.is_some()
@@ -3373,6 +3394,13 @@ impl App {
             }
         }
 
+        // Handle AI modal when active - it captures all input.
+        if let Some(modal) = self.ai_modal.as_mut() {
+            let action = modal.handle_key(key);
+            self.handle_ai_modal_action(action);
+            return false;
+        }
+
         // Handle password prompt when active
         if let Some(mut prompt) = self.password_prompt.take() {
             match prompt.handle_key(key) {
@@ -3404,15 +3432,15 @@ impl App {
         }
 
         // Handle connection form when active - it captures all input
-        if self.connection_form.is_some() {
-            let action = self.connection_form.as_mut().unwrap().handle_key(key);
+        if let Some(connection_form) = self.connection_form.as_mut() {
+            let action = connection_form.handle_key(key);
             self.handle_connection_form_action(action);
             return false;
         }
 
         // Handle connection manager when active - it captures all input
-        if self.connection_manager.is_some() {
-            let action = self.connection_manager.as_mut().unwrap().handle_key(key);
+        if let Some(connection_manager) = self.connection_manager.as_mut() {
+            let action = connection_manager.handle_key(key);
             self.handle_connection_manager_action(action);
             return false;
         }
@@ -3439,6 +3467,7 @@ impl App {
                 || self.command.active
                 || self.completion.active
                 || self.cell_editor.active
+                || self.ai_modal.is_some()
                 || self.history_picker.is_some()
                 || self.connection_picker.is_some()
                 || self.pending_key.is_some()
@@ -3455,6 +3484,8 @@ impl App {
                 self.command.close();
                 self.completion.close();
                 self.cell_editor.close();
+                self.ai_modal = None;
+                self.ai_pending_request_id = None;
                 self.history_picker = None;
                 self.history_picker_pinned_only = false;
                 self.connection_picker = None;
@@ -4116,6 +4147,11 @@ impl App {
             }
         }
 
+        // AI modal is keyboard-only and captures interaction when open.
+        if self.ai_modal.is_some() {
+            return false;
+        }
+
         // Error popup is modal: any click dismisses it.
         if self.last_error.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -4664,6 +4700,10 @@ impl App {
                 self.start_update_apply(info);
                 false
             }
+            ConfirmContext::OpenAiAssistant { prefill } => {
+                self.open_ai_modal(prefill);
+                false
+            }
         }
     }
 
@@ -4696,6 +4736,9 @@ impl App {
             }
             ConfirmContext::ApplyUpdate { .. } => {
                 self.last_status = Some("Update apply cancelled".to_string());
+            }
+            ConfirmContext::OpenAiAssistant { .. } => {
+                self.last_status = Some("AI assistant open cancelled".to_string());
             }
         }
     }
@@ -5404,14 +5447,12 @@ impl App {
                     } else {
                         self.execute_mongo_describe_collection(args);
                     }
+                } else if args.is_empty() {
+                    // \d without args is same as \dt
+                    self.execute_meta_query(META_QUERY_TABLES, None);
                 } else {
-                    if args.is_empty() {
-                        // \d without args is same as \dt
-                        self.execute_meta_query(META_QUERY_TABLES, None);
-                    } else {
-                        // \d <table> - describe table
-                        self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
-                    }
+                    // \d <table> - describe table
+                    self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
                 }
             }
             "\\di" | "di" => {
@@ -5463,6 +5504,14 @@ impl App {
             "history" => {
                 self.open_history_picker();
             }
+            "ai" => {
+                let prefill = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+                self.request_open_ai_modal(prefill);
+            }
             "connections" | "conn" => {
                 self.open_connection_manager();
             }
@@ -5478,6 +5527,142 @@ impl App {
         }
 
         false
+    }
+
+    fn query_editor_has_content(&self) -> bool {
+        !self.editor.text().trim().is_empty()
+    }
+
+    fn active_database_name(&self) -> Option<String> {
+        if self.db.kind == Some(DbKind::Mongo) {
+            return self.db.mongo_database.clone();
+        }
+
+        if let Some(name) = self.current_connection_name.as_deref() {
+            if let Some(entry) = self.connections.find_by_name(name) {
+                if !entry.database.trim().is_empty() {
+                    return Some(entry.database.clone());
+                }
+            }
+        }
+
+        let conn_str = self.db.conn_str.as_deref()?;
+        if !conn_str.contains("://") {
+            return None;
+        }
+        let parsed = url::Url::parse(conn_str).ok()?;
+        let db = parsed.path().trim_matches('/').trim();
+        if db.is_empty() {
+            None
+        } else {
+            Some(db.to_string())
+        }
+    }
+
+    fn request_open_ai_modal(&mut self, prefill: Option<String>) {
+        if !self.config.ai.enabled {
+            self.last_error =
+                Some("AI assistant is disabled. Enable it under [ai] in config.toml".to_string());
+            return;
+        }
+
+        if let Some(modal) = self.ai_modal.as_mut() {
+            if let Some(text) = prefill {
+                modal.set_input_text(text);
+            }
+            self.last_status = Some("AI assistant already open".to_string());
+            return;
+        }
+
+        if self.query_editor_has_content() {
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                "Query editor has content. Open AI assistant anyway?",
+                ConfirmContext::OpenAiAssistant { prefill },
+            ));
+            return;
+        }
+
+        self.open_ai_modal(prefill);
+    }
+
+    fn open_ai_modal(&mut self, prefill: Option<String>) {
+        self.ai_modal = Some(AiQueryModal::new(prefill));
+        self.focus = Focus::Query;
+        self.mode = Mode::Insert;
+        self.last_status = Some("AI assistant opened".to_string());
+    }
+
+    fn start_ai_generation(&mut self, prompt: String) {
+        if !self.config.ai.enabled {
+            self.last_error =
+                Some("AI assistant is disabled. Enable it under [ai] in config.toml".to_string());
+            return;
+        }
+
+        let config = self.config.ai.clone();
+        let db_kind = self.db.kind;
+        let database_name = self.active_database_name();
+        let schema_tables = self.schema_cache.tables.clone();
+
+        let Some(modal) = self.ai_modal.as_mut() else {
+            return;
+        };
+
+        if modal.is_pending() {
+            self.last_status = Some("AI request already running".to_string());
+            return;
+        }
+
+        modal.begin_request(prompt.clone());
+
+        self.ai_request_seq = self.ai_request_seq.saturating_add(1);
+        let request_id = self.ai_request_seq;
+        self.ai_pending_request_id = Some(request_id);
+
+        let conversation = modal.conversation();
+        let tx = self.db_events_tx.clone();
+
+        self.rt.spawn(async move {
+            let context = AiRequestContext {
+                db_kind,
+                database_name,
+                schema_tables,
+                conversation,
+                user_prompt: prompt,
+            };
+            let result = generate_query(&config, &context).await;
+            let _ = tx.send(DbEvent::AiReply { request_id, result });
+        });
+    }
+
+    fn handle_ai_modal_action(&mut self, action: AiQueryModalAction) {
+        match action {
+            AiQueryModalAction::Continue => {}
+            AiQueryModalAction::Close => {
+                self.ai_modal = None;
+                self.ai_pending_request_id = None;
+                self.last_status = Some("AI assistant closed".to_string());
+            }
+            AiQueryModalAction::Send { prompt } => {
+                self.start_ai_generation(prompt);
+            }
+            AiQueryModalAction::Accept => {
+                let Some(modal) = self.ai_modal.as_ref() else {
+                    return;
+                };
+                let Some(query) = modal.latest_query() else {
+                    self.last_status = Some("No AI proposal to accept".to_string());
+                    return;
+                };
+
+                self.editor.set_text(query.to_string());
+                self.focus = Focus::Query;
+                self.mode = Mode::Insert;
+                self.ai_modal = None;
+                self.ai_pending_request_id = None;
+                self.last_status = Some("AI proposal accepted into query editor".to_string());
+            }
+        }
     }
 
     fn handle_update_command(&mut self, args: &str) {
@@ -6479,6 +6664,9 @@ impl App {
             Action::ShowHistory => {
                 self.open_history_picker();
             }
+            Action::OpenAiAssistant => {
+                self.request_open_ai_modal(None);
+            }
             Action::ToggleSidebar => {
                 self.toggle_sidebar();
             }
@@ -7078,6 +7266,10 @@ impl App {
                         }
                         Action::ToggleQueryHeight => {
                             self.toggle_query_height_mode();
+                            return;
+                        }
+                        Action::OpenAiAssistant => {
+                            self.request_open_ai_modal(None);
                             return;
                         }
                         _ => {}
@@ -9526,6 +9718,25 @@ impl App {
                     }
                 }
             }
+            DbEvent::AiReply { request_id, result } => {
+                if self.ai_pending_request_id != Some(request_id) {
+                    return;
+                }
+                self.ai_pending_request_id = None;
+
+                let Some(modal) = self.ai_modal.as_mut() else {
+                    return;
+                };
+
+                let ok = result.is_ok();
+                modal.apply_reply(result);
+                if ok {
+                    self.last_status = Some("AI proposal updated".to_string());
+                    self.last_error = None;
+                } else {
+                    self.last_status = Some("AI request failed".to_string());
+                }
+            }
         }
     }
 
@@ -10230,6 +10441,132 @@ mod tests {
             );
             assert!(app.confirm_prompt.is_none());
         }
+    }
+
+    #[test]
+    fn test_ai_command_opens_modal_when_editor_empty() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        app.execute_command("ai");
+        assert!(app.ai_modal.is_some());
+        assert!(app.confirm_prompt.is_none());
+    }
+
+    #[test]
+    fn test_ai_command_with_existing_query_requires_confirmation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.editor.set_text("select 1".to_string());
+
+        app.execute_command("ai");
+        assert!(app.ai_modal.is_none());
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(|p| p.context()),
+            Some(ConfirmContext::OpenAiAssistant { .. })
+        ));
+    }
+
+    #[test]
+    fn test_ai_accept_replaces_query_editor_content() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        app.open_ai_modal(None);
+        let modal = app.ai_modal.as_mut().unwrap();
+        modal.begin_request("list users".to_string());
+        modal.apply_reply(Ok(AiProposal {
+            query: "select * from users;".to_string(),
+            explanation: Some("basic listing".to_string()),
+            raw_response: "{\"query\":\"select * from users;\"}".to_string(),
+        }));
+
+        app.handle_ai_modal_action(AiQueryModalAction::Accept);
+
+        assert_eq!(app.editor.text(), "select * from users;");
+        assert!(app.ai_modal.is_none());
+    }
+
+    #[test]
+    fn test_stale_ai_reply_is_ignored() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        app.open_ai_modal(None);
+        app.ai_pending_request_id = Some(2);
+
+        app.apply_db_event(DbEvent::AiReply {
+            request_id: 1,
+            result: Ok(AiProposal {
+                query: "select 1;".to_string(),
+                explanation: None,
+                raw_response: "{\"query\":\"select 1;\"}".to_string(),
+            }),
+        });
+
+        assert_eq!(app.ai_pending_request_id, Some(2));
+        assert!(app.ai_modal.is_some());
+        assert!(app.ai_modal.as_ref().unwrap().latest_query().is_none());
     }
 
     #[test]

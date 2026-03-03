@@ -121,6 +121,57 @@ allow_apply_for_standalone = true
 # GitHub repository used for release checks
 github_repo = "fcoury/tsql"
 
+# AI assistant settings
+[ai]
+# Enable `:ai` command and `Ctrl+G` shortcut in query editor
+enabled = false
+
+# Provider backend:
+# - "open_ai"            (OpenAI API)
+# - "open_ai_compatible" (OpenAI-compatible endpoints)
+# - "ollama"             (local Ollama)
+# - "anthropic"          (Anthropic Claude API)
+# - "google"             (Google Gemini API)
+# - "openrouter"         (OpenRouter API)
+provider = "open_ai"
+
+# Model name for selected provider
+model = "gpt-4o-mini"
+
+# Sampling temperature and max output tokens
+temperature = 0.1
+max_tokens = 1024
+
+# Request timeout in seconds
+request_timeout_secs = 30
+
+# Optional provider base URL override
+# - OpenAI-compatible example: "http://localhost:1234/v1"
+# - Ollama example: "http://localhost:11434"
+# - Anthropic example: "https://api.anthropic.com"
+# - Google Gemini example: "https://generativelanguage.googleapis.com"
+# - OpenRouter example: "https://openrouter.ai/api/v1"
+# base_url = "http://localhost:1234/v1"
+
+# API key environment variable name (ignored by ollama)
+# Common values:
+# - OPENAI_API_KEY      (open_ai / open_ai_compatible)
+# - ANTHROPIC_API_KEY   (anthropic)
+# - GEMINI_API_KEY      (google)
+# - OPENROUTER_API_KEY  (openrouter)
+# If left as OPENAI_API_KEY while using another provider, tsql
+# will automatically try that provider's default env var first.
+api_key_env = "OPENAI_API_KEY"
+
+# Prompt context controls
+include_schema_context = true
+max_schema_tables = 25
+max_columns_per_table = 20
+
+# Optional custom system prompts per engine
+# system_prompt_postgres = "Return only PostgreSQL SQL."
+# system_prompt_mongo = "Return only db.collection.op(...) or JSON command syntax."
+
 # Clipboard settings
 [clipboard]
 # Clipboard backend:
@@ -152,6 +203,12 @@ vim_mode = true
 # key = "ctrl+s"
 # action = "execute_query"
 # description = "Execute the current query"
+
+# Default: Ctrl+G opens AI query assistant
+# [[keymap.normal]]
+# key = "ctrl+g"
+# action = "open_ai_assistant"
+# description = "Open AI query assistant"
 
 # Custom keybindings for grid navigation
 # [[keymap.grid]]

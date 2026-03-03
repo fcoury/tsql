@@ -50,6 +50,8 @@ pub enum ConfirmContext {
     SwitchConnection { entry: ConnectionEntry },
     /// Applying an in-app binary update.
     ApplyUpdate { info: UpdateInfo },
+    /// Opening the AI assistant when current query editor has content.
+    OpenAiAssistant { prefill: Option<String> },
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -117,7 +119,8 @@ impl ConfirmPrompt {
             | ConfirmContext::CloseCellEditor { .. }
             | ConfirmContext::QuitApp
             | ConfirmContext::CloseConnectionForm
-            | ConfirmContext::SwitchConnection { .. } => " Unsaved Changes ",
+            | ConfirmContext::SwitchConnection { .. }
+            | ConfirmContext::OpenAiAssistant { .. } => " Unsaved Changes ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
             ConfirmContext::ApplyUpdate { .. } => " Apply Update ",

@@ -21,6 +21,8 @@ pub struct Config {
     pub keymap: KeymapConfig,
     /// Update checking settings
     pub updates: UpdatesConfig,
+    /// AI assistant settings
+    pub ai: AiConfig,
 }
 
 /// Display-related settings
@@ -264,6 +266,73 @@ pub enum UpdateMode {
     Off,
 }
 
+/// AI provider selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProvider {
+    OpenAi,
+    OpenAiCompatible,
+    Ollama,
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    #[serde(rename = "google", alias = "gemini")]
+    Google,
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter,
+}
+
+/// AI assistant settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    /// Enable AI assistant features.
+    pub enabled: bool,
+    /// Provider backend used for query generation.
+    pub provider: AiProvider,
+    /// Model identifier for the selected provider.
+    pub model: String,
+    /// Sampling temperature.
+    pub temperature: f64,
+    /// Maximum output tokens.
+    pub max_tokens: u64,
+    /// Request timeout in seconds.
+    pub request_timeout_secs: u64,
+    /// Optional provider base URL override.
+    pub base_url: Option<String>,
+    /// Environment variable name containing API key/token.
+    pub api_key_env: String,
+    /// Include schema context in AI prompt.
+    pub include_schema_context: bool,
+    /// Maximum number of tables/collections to include in prompt context.
+    pub max_schema_tables: usize,
+    /// Maximum number of columns/fields per table/collection in prompt context.
+    pub max_columns_per_table: usize,
+    /// Optional custom system prompt for PostgreSQL generation.
+    pub system_prompt_postgres: Option<String>,
+    /// Optional custom system prompt for Mongo generation.
+    pub system_prompt_mongo: Option<String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: AiProvider::OpenAi,
+            model: "gpt-4o-mini".to_string(),
+            temperature: 0.1,
+            max_tokens: 1024,
+            request_timeout_secs: 30,
+            base_url: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            include_schema_context: true,
+            max_schema_tables: 25,
+            max_columns_per_table: 20,
+            system_prompt_postgres: None,
+            system_prompt_mongo: None,
+        }
+    }
+}
+
 /// SQL generation / templating settings
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -344,6 +413,21 @@ interval_hours = 12
 allow_apply_for_standalone = true
 github_repo = "fcoury/tsql"
 
+[ai]
+enabled = true
+provider = "open_ai"
+model = "gpt-4o-mini"
+temperature = 0.2
+max_tokens = 512
+request_timeout_secs = 20
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+include_schema_context = true
+max_schema_tables = 10
+max_columns_per_table = 12
+system_prompt_postgres = "Only output PostgreSQL."
+system_prompt_mongo = "Only output Mongo syntax."
+
 [[keymap.normal]]
 key = "ctrl+s"
 action = "save_query"
@@ -398,6 +482,30 @@ description = "Export results as CSV"
         assert_eq!(config.updates.interval_hours, 12);
         assert!(config.updates.allow_apply_for_standalone);
         assert_eq!(config.updates.github_repo, "fcoury/tsql");
+
+        // AI
+        assert!(config.ai.enabled);
+        assert_eq!(config.ai.provider, AiProvider::OpenAi);
+        assert_eq!(config.ai.model, "gpt-4o-mini");
+        assert_eq!(config.ai.temperature, 0.2);
+        assert_eq!(config.ai.max_tokens, 512);
+        assert_eq!(config.ai.request_timeout_secs, 20);
+        assert_eq!(
+            config.ai.base_url,
+            Some("https://api.openai.com/v1".to_string())
+        );
+        assert_eq!(config.ai.api_key_env, "OPENAI_API_KEY");
+        assert!(config.ai.include_schema_context);
+        assert_eq!(config.ai.max_schema_tables, 10);
+        assert_eq!(config.ai.max_columns_per_table, 12);
+        assert_eq!(
+            config.ai.system_prompt_postgres,
+            Some("Only output PostgreSQL.".to_string())
+        );
+        assert_eq!(
+            config.ai.system_prompt_mongo,
+            Some("Only output Mongo syntax.".to_string())
+        );
     }
 
     #[test]
@@ -408,5 +516,6 @@ description = "Export results as CSV"
         assert!(toml_str.contains("[editor]"));
         assert!(toml_str.contains("[connection]"));
         assert!(toml_str.contains("[updates]"));
+        assert!(toml_str.contains("[ai]"));
     }
 }

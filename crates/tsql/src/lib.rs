@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod app;
 mod clipboard;
 pub mod config;

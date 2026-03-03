@@ -84,6 +84,7 @@ pub enum Action {
     ForceQuit,
     Help,
     ShowHistory,
+    OpenAiAssistant,
     Refresh,
 
     // Connection
@@ -168,6 +169,7 @@ impl Action {
             Action::ForceQuit => "Force quit without saving",
             Action::Help => "Show help",
             Action::ShowHistory => "Show query history",
+            Action::OpenAiAssistant => "Open AI query assistant",
             Action::Refresh => "Refresh/re-run query",
             Action::Connect => "Connect to database",
             Action::Disconnect => "Disconnect from database",
@@ -269,6 +271,7 @@ impl FromStr for Action {
             "force_quit" => Ok(Action::ForceQuit),
             "help" => Ok(Action::Help),
             "show_history" => Ok(Action::ShowHistory),
+            "open_ai_assistant" => Ok(Action::OpenAiAssistant),
             "refresh" => Ok(Action::Refresh),
 
             // Connection
@@ -788,6 +791,11 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             Action::ShowHistory,
         );
+        // Open AI assistant
+        km.bind(
+            KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            Action::OpenAiAssistant,
+        );
 
         // Sidebar
         km.bind(
@@ -870,6 +878,11 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             Action::ShowHistory,
+        );
+        // Open AI assistant
+        km.bind(
+            KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            Action::OpenAiAssistant,
         );
 
         // Sidebar
@@ -1017,6 +1030,9 @@ mod tests {
 
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+
+        let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
     }
 
     #[test]
@@ -1025,6 +1041,9 @@ mod tests {
 
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+
+        let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
     }
 
     #[test]
@@ -1066,6 +1085,10 @@ mod tests {
         assert_eq!(
             "toggle_query_height".parse::<Action>().unwrap(),
             Action::ToggleQueryHeight
+        );
+        assert_eq!(
+            "open_ai_assistant".parse::<Action>().unwrap(),
+            Action::OpenAiAssistant
         );
     }
 

@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+rig.workspace = true
 arboard.workspace = true
 crossterm.workspace = true
 dirs.workspace = true

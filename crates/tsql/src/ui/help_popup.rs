@@ -82,6 +82,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
         KeyBinding::new("Ctrl+o", "Open connection picker"),
         KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
+        KeyBinding::new("Ctrl+g", "Open AI query assistant"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
     ],
 );
@@ -253,6 +254,7 @@ const COMMANDS: HelpSection = HelpSection::new(
         KeyBinding::new(":export <fmt> <path>", "Export results (csv/json/tsv)"),
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
+        KeyBinding::new(":ai [prompt]", "Open AI query assistant"),
         KeyBinding::new(":update [check|status|apply]", "Check/apply updates"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
         KeyBinding::new(":q / :quit", "Quit application"),
