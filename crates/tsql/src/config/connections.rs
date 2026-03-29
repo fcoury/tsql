@@ -275,8 +275,12 @@ impl ConnectionEntry {
 
         let mut url = "postgres://".to_string();
 
-        // Add user
-        url.push_str(&self.user);
+        // Add user (percent-encoded to handle special characters like @)
+        // First decode to handle legacy stored usernames, then encode
+        let decoded_user = urlencoding::decode(&self.user)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| self.user.clone());
+        url.push_str(&urlencoding::encode(&decoded_user));
 
         // Add password if provided
         if let Some(pwd) = password {
@@ -342,7 +346,10 @@ impl ConnectionEntry {
                 DbKind::Mongo => String::new(),
             }
         } else {
-            url.username().to_string()
+            // Decode percent-encoded username (e.g., user%40domain.com -> user@domain.com)
+            urlencoding::decode(url.username())
+                .map(|s| s.into_owned())
+                .unwrap_or_else(|_| url.username().to_string())
         };
 
         let password = url.password().map(|p| {
@@ -1007,6 +1014,76 @@ mod tests {
 
         let url = entry.to_url(Some("p@ss:word/123"));
         assert!(url.contains("p%40ss%3Aword%2F123"));
+    }
+
+    /// Issue #33: Username with @ character should be percent-encoded
+    /// https://github.com/fcoury/tsql/issues/33
+    #[test]
+    fn test_connection_to_url_with_at_in_username() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "user@domain.com".to_string(), // Username with @
+            ..Default::default()
+        };
+
+        let url = entry.to_url(None);
+        // The @ in username should be encoded as %40
+        assert!(
+            url.contains("user%40domain.com"),
+            "Username with @ should be percent-encoded. URL: {}",
+            url
+        );
+        // Make sure the URL is valid and doesn't contain unencoded @ before host
+        assert!(
+            !url.contains("user@domain.com@localhost"),
+            "URL should not contain raw @ in username. URL: {}",
+            url
+        );
+    }
+
+    /// Issue #33: Round-trip test for username with special characters
+    #[test]
+    fn test_connection_url_round_trip_with_special_username() {
+        let original = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "user@domain.com".to_string(), // Username with @
+            ..Default::default()
+        };
+
+        // Convert to URL
+        let url = original.to_url(Some("secret"));
+
+        // Verify URL contains encoded username
+        assert!(
+            url.contains("user%40domain.com"),
+            "URL should contain encoded username. Got: {}",
+            url
+        );
+
+        // Parse back from URL
+        let result = ConnectionEntry::from_url("test", &url);
+        assert!(
+            result.is_ok(),
+            "from_url should succeed. URL: {}. Error: {:?}",
+            url,
+            result.err()
+        );
+
+        let (parsed, password) = result.unwrap();
+
+        // User should be decoded correctly
+        assert_eq!(
+            parsed.user, "user@domain.com",
+            "Username should round-trip correctly. URL: {}",
+            url
+        );
+        assert_eq!(password, Some("secret".to_string()));
     }
 
     #[test]
