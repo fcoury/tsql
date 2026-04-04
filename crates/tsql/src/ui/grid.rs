@@ -1514,7 +1514,10 @@ impl<'a> Widget for DataGrid<'a> {
             let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
-                Style::default().bg(Color::DarkGray)
+                // Use Gray foreground (not DarkGray) to ensure visibility
+                // against the DarkGray background. This prevents text from
+                // disappearing when terminal foreground equals bright black.
+                Style::default().bg(Color::DarkGray).fg(Color::Gray)
             } else {
                 Style::default()
             };
