@@ -7673,15 +7673,14 @@ impl App {
         let entries: Vec<ConnectionEntry> =
             self.connections.sorted().into_iter().cloned().collect();
 
-        let picker =
-            FuzzyPicker::with_display(entries, "Connect (gm or Ctrl+Shift+C: manage)", |entry| {
-                // Display: "[fav] name - user@host/db"
-                let fav = entry
-                    .favorite
-                    .map(|f| format!("[{}] ", f))
-                    .unwrap_or_default();
-                format!("{}{} - {}", fav, entry.name, entry.short_display())
-            });
+        let picker = FuzzyPicker::with_display(entries, "Connect (gm: manage)", |entry| {
+            // Display: "[fav] name - user@host/db"
+            let fav = entry
+                .favorite
+                .map(|f| format!("[{}] ", f))
+                .unwrap_or_default();
+            format!("{}{} - {}", fav, entry.name, entry.short_display())
+        });
 
         self.connection_picker = Some(picker);
     }
@@ -7979,6 +7978,22 @@ impl App {
         ));
     }
 
+    fn duplicate_connection_name(&self, base_name: &str) -> String {
+        let candidate = format!("{base_name}-copy");
+        if self.connections.find_by_name(&candidate).is_none() {
+            return candidate;
+        }
+
+        let mut suffix = 2;
+        loop {
+            let candidate = format!("{base_name}-copy-{suffix}");
+            if self.connections.find_by_name(&candidate).is_none() {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
     /// Handle connection manager actions.
     fn handle_connection_manager_action(&mut self, action: ConnectionManagerAction) {
         match action {
@@ -8015,6 +8030,21 @@ impl App {
                     self.connection_form_keymap.clone(),
                     self.config.connection.enable_onepassword,
                 ));
+            }
+            ConnectionManagerAction::Duplicate { entry } => {
+                let password = entry
+                    .get_password_with_options(self.config.connection.enable_onepassword)
+                    .ok()
+                    .flatten();
+                let duplicate_name = self.duplicate_connection_name(&entry.name);
+                self.connection_form =
+                    Some(ConnectionFormModal::duplicate_with_keymap_and_onepassword(
+                        &entry,
+                        password,
+                        duplicate_name,
+                        self.connection_form_keymap.clone(),
+                        self.config.connection.enable_onepassword,
+                    ));
             }
             ConnectionManagerAction::Delete { name } => {
                 // Show confirmation for delete
@@ -12154,6 +12184,61 @@ mod tests {
             app.connections.find_by_name("editme2").is_some(),
             "Connection should be renamed to 'editme2'"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_duplicate_connection_opens_prefilled_new_form_and_saves() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "editme".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry.clone()).unwrap();
+
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(
+            app.connection_form.is_some(),
+            "Connection form should open after pressing 'y'"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert!(
+            app.connection_form.is_none(),
+            "Connection form should close after saving duplicate. last_error={:?}, last_status={:?}",
+            app.last_error,
+            app.last_status
+        );
+        assert!(
+            app.connections.find_by_name("editme-copy").is_some(),
+            "Duplicated connection should be saved with a unique name"
+        );
+        let duplicate = app.connections.find_by_name("editme-copy").unwrap();
+        assert_eq!(duplicate.host, "localhost");
+        assert_eq!(duplicate.database, "testdb");
     }
 
     /// Issue 3: Esc in connection manager should close it in one press

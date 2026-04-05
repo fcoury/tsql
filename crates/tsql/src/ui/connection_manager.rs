@@ -3,7 +3,7 @@
 //! This modal provides:
 //! - List of saved connections with status indicators
 //! - Vim-like navigation (j/k, g/G, Ctrl+d/u)
-//! - Actions: connect, add, edit, delete, set favorite
+//! - Actions: connect, add, duplicate, edit, delete, set favorite
 //! - Visual indicators for connected state and favorites
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -37,6 +37,11 @@ pub enum ConnectionManagerAction {
     /// Open the edit form for the selected connection.
     Edit {
         /// The connection entry to edit
+        entry: ConnectionEntry,
+    },
+    /// Open a new form prefilled from the selected connection.
+    Duplicate {
+        /// The connection entry to duplicate
         entry: ConnectionEntry,
     },
     /// Delete the selected connection (requires confirmation).
@@ -164,6 +169,17 @@ impl ConnectionManagerModal {
             (KeyCode::Char('e'), KeyModifiers::NONE) => {
                 if let Some(entry) = self.selected_connection() {
                     ConnectionManagerAction::Edit {
+                        entry: entry.clone(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Duplicate selected connection
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::Duplicate {
                         entry: entry.clone(),
                     }
                 } else {
@@ -548,6 +564,8 @@ impl ConnectionManagerModal {
         let help_spans = vec![
             Span::styled("[a]", Style::default().fg(Color::Yellow)),
             Span::raw("dd "),
+            Span::styled("[y]", Style::default().fg(Color::Yellow)),
+            Span::raw(" duplicate "),
             Span::styled("[e]", Style::default().fg(Color::Yellow)),
             Span::raw("dit "),
             Span::styled("[d]", Style::default().fg(Color::Yellow)),
@@ -753,6 +771,21 @@ mod tests {
                 assert_eq!(entry.name, "local");
             }
             _ => panic!("Expected Edit action"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_action() {
+        let file = create_test_connections();
+        let mut manager = ConnectionManagerModal::new(&file, None);
+
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::Duplicate { entry } => {
+                assert_eq!(entry.name, "local");
+            }
+            _ => panic!("Expected Duplicate action"),
         }
     }
 
