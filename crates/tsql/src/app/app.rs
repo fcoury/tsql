@@ -2267,6 +2267,8 @@ pub struct App {
     pub password_prompt: Option<PasswordPrompt>,
     /// AI query assistant modal.
     pub ai_modal: Option<AiQueryModal>,
+    /// Editor mode active before the AI modal was opened.
+    ai_modal_previous_mode: Option<Mode>,
     /// Monotonic sequence for async AI requests.
     ai_request_seq: u64,
     /// Current in-flight AI request id (if any).
@@ -2450,6 +2452,7 @@ impl App {
             connection_form: None,
             password_prompt: None,
             ai_modal: None,
+            ai_modal_previous_mode: None,
             ai_request_seq: 0,
             ai_pending_request_id: None,
 
@@ -5586,6 +5589,7 @@ impl App {
     }
 
     fn open_ai_modal(&mut self, prefill: Option<String>) {
+        self.ai_modal_previous_mode = Some(self.mode);
         self.ai_modal = Some(AiQueryModal::new(prefill));
         self.focus = Focus::Query;
         self.mode = Mode::Insert;
@@ -5641,6 +5645,9 @@ impl App {
             AiQueryModalAction::Close => {
                 self.ai_modal = None;
                 self.ai_pending_request_id = None;
+                if let Some(mode) = self.ai_modal_previous_mode.take() {
+                    self.mode = mode;
+                }
                 self.last_status = Some("AI assistant closed".to_string());
             }
             AiQueryModalAction::Send { prompt } => {
@@ -5659,6 +5666,7 @@ impl App {
                 self.focus = Focus::Query;
                 self.mode = Mode::Insert;
                 self.ai_modal = None;
+                self.ai_modal_previous_mode = None;
                 self.ai_pending_request_id = None;
                 self.last_status = Some("AI proposal accepted into query editor".to_string());
             }
@@ -10559,6 +10567,34 @@ mod tests {
         app.handle_ai_modal_action(AiQueryModalAction::Accept);
 
         assert_eq!(app.editor.text(), "select * from users;");
+        assert!(app.ai_modal.is_none());
+    }
+
+    #[test]
+    fn test_ai_close_restores_previous_mode() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.mode = Mode::Normal;
+
+        app.open_ai_modal(None);
+        app.handle_ai_modal_action(AiQueryModalAction::Close);
+
+        assert_eq!(app.mode, Mode::Normal);
         assert!(app.ai_modal.is_none());
     }
 
