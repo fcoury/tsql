@@ -1,3 +1,16 @@
+//! Full-screen modal for the AI query assistant.
+//!
+//! Owns the prompt input, conversation history, latest proposal, and pending
+//! request state. All keyboard input is captured while the modal is open;
+//! `App` delegates to [`AiQueryModal::handle_key`] and reacts to the returned
+//! [`AiQueryModalAction`].
+//!
+//! Key bindings inside the modal:
+//! - **Ctrl+E** -- send the current prompt to the AI backend.
+//! - **Ctrl+Y** -- accept the latest proposal into the query editor.
+//! - **Ctrl+U** -- clear the prompt input.
+//! - **Esc** -- close the modal without accepting.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,19 +21,32 @@ use tui_textarea::{Input, TextArea};
 
 use crate::ai::{AiProposal, AiTurn};
 
+/// Result of handling a single key event inside the AI modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiQueryModalAction {
+    /// Key was consumed; no state change needed in `App`.
     Continue,
+    /// User wants to close the modal.
     Close,
+    /// User wants to send the given prompt to the AI backend.
     Send { prompt: String },
+    /// User wants to accept the latest proposal into the query editor.
     Accept,
 }
 
+/// Modal state for the AI query assistant.
+///
+/// The modal tracks its own conversation and the latest AI proposal. `App`
+/// calls [`begin_request`](Self::begin_request) before spawning the async
+/// task and [`apply_reply`](Self::apply_reply) when the `DbEvent::AiReply`
+/// arrives.
 pub struct AiQueryModal {
     input: TextArea<'static>,
     conversation: Vec<AiTurn>,
     latest_proposal: Option<AiProposal>,
     pending: bool,
+    /// The prompt text that was sent with the in-flight request, used to
+    /// record the conversation turn when the reply arrives.
     pending_prompt: Option<String>,
     last_error: Option<String>,
 }
@@ -58,12 +84,18 @@ impl AiQueryModal {
         self.last_error = None;
     }
 
+    /// Mark the modal as "waiting for AI response" and stash the prompt so it
+    /// can be recorded into the conversation when the reply arrives.
     pub fn begin_request(&mut self, prompt: String) {
         self.pending = true;
         self.pending_prompt = Some(prompt);
         self.last_error = None;
     }
 
+    /// Consume an AI backend response. On success the proposal is stored and a
+    /// conversation turn is recorded. On failure the error is shown in the
+    /// status area. If no `pending_prompt` is set (shouldn't happen in
+    /// practice), the call is a no-op.
     pub fn apply_reply(&mut self, result: std::result::Result<AiProposal, String>) {
         let Some(prompt) = self.pending_prompt.take() else {
             self.pending = false;
@@ -136,10 +168,8 @@ impl AiQueryModal {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let width =
-            (area.width.saturating_mul(90) / 100).clamp(70, area.width.saturating_sub(2).max(1));
-        let height =
-            (area.height.saturating_mul(80) / 100).clamp(18, area.height.saturating_sub(2).max(1));
+        let width = modal_dimension(area.width, 90, 70);
+        let height = modal_dimension(area.height, 80, 18);
 
         let popup = Rect {
             x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -270,5 +300,43 @@ impl AiQueryModal {
             ))
         };
         frame.render_widget(Paragraph::new(status), chunks[3]);
+    }
+}
+
+fn modal_dimension(total: u16, percent: u16, preferred_min: u16) -> u16 {
+    let max = total.saturating_sub(2).max(1);
+    let desired = total.saturating_mul(percent) / 100;
+    desired.max(preferred_min).min(max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn test_render_does_not_panic_on_small_terminal() {
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut modal = AiQueryModal::new(None);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    modal.render(frame, area);
+                })
+                .unwrap();
+        }));
+
+        assert!(result.is_ok(), "render should not panic on a small terminal");
+    }
+
+    #[test]
+    fn test_modal_dimension_caps_to_available_space() {
+        assert_eq!(modal_dimension(20, 90, 70), 18);
+        assert_eq!(modal_dimension(8, 80, 18), 6);
+        assert_eq!(modal_dimension(120, 90, 70), 108);
     }
 }
