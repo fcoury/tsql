@@ -330,7 +330,10 @@ mod tests {
                 .unwrap();
         }));
 
-        assert!(result.is_ok(), "render should not panic on a small terminal");
+        assert!(
+            result.is_ok(),
+            "render should not panic on a small terminal"
+        );
     }
 
     #[test]
