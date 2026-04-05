@@ -81,7 +81,10 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
         KeyBinding::new("Ctrl+o", "Open connection picker"),
-        KeyBinding::new("Ctrl+Shift+C", "Open connection manager"),
+        KeyBinding::new(
+            "Ctrl+Shift+C",
+            "Open connection manager (terminal-dependent)",
+        ),
         KeyBinding::new("Ctrl+g", "Open AI query assistant"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
     ],

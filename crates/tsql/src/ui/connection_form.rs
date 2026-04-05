@@ -316,6 +316,61 @@ impl ConnectionFormModal {
         }
     }
 
+    /// Create a new-connection form prefilled from an existing connection.
+    pub fn duplicate_with_keymap_and_onepassword(
+        entry: &ConnectionEntry,
+        existing_password: Option<String>,
+        duplicate_name: String,
+        keymap: Keymap,
+        onepassword_enabled: bool,
+    ) -> Self {
+        let password = existing_password.unwrap_or_default();
+        let op_ref = entry.password_onepassword.clone().unwrap_or_default();
+        let color_index = ConnectionColor::all_names()
+            .iter()
+            .position(|&c| c == entry.color.to_string())
+            .unwrap_or(0);
+
+        let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
+        let ssl_mode_index = ssl_mode.to_index();
+
+        Self {
+            name_cursor: duplicate_name.chars().count(),
+            host_cursor: entry.host.chars().count(),
+            port_cursor: entry.port.to_string().chars().count(),
+            database_cursor: entry.database.chars().count(),
+            user_cursor: entry.user.chars().count(),
+            password_cursor: password.chars().count(),
+            op_ref_cursor: op_ref.chars().count(),
+
+            name: duplicate_name,
+            kind: entry.kind,
+            mongo_uri: entry.uri.clone(),
+            host: entry.host.clone(),
+            port: entry.port.to_string(),
+            database: entry.database.clone(),
+            user: entry.user.clone(),
+            password,
+            op_ref,
+            save_password: entry.password_in_keychain,
+            ssl_mode,
+            color: entry.color,
+            url_paste: String::new(),
+            url_paste_cursor: 0,
+
+            focused: FormField::Name,
+            color_index,
+            ssl_mode_index,
+            editing: false,
+            original_name: None,
+            title: format!("Duplicate: {}", entry.name),
+            modified: false,
+            original_values: None,
+            keymap,
+            onepassword_enabled,
+        }
+    }
+
     /// Check if the form has unsaved changes.
     pub fn is_modified(&self) -> bool {
         if self.modified {
@@ -1484,6 +1539,36 @@ mod tests {
 
         let form = ConnectionFormModal::edit(&entry, None);
         assert_eq!(form.name_cursor, entry.name.chars().count());
+    }
+
+    #[test]
+    fn test_duplicate_form() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "db.example.com".to_string(),
+            port: 5433,
+            database: "mydb".to_string(),
+            user: "admin".to_string(),
+            color: ConnectionColor::Green,
+            favorite: Some(2),
+            ..Default::default()
+        };
+
+        let form = ConnectionFormModal::duplicate_with_keymap_and_onepassword(
+            &entry,
+            Some("secret".to_string()),
+            "test copy".to_string(),
+            Keymap::default_connection_form_keymap(),
+            true,
+        );
+
+        assert_eq!(form.name, "test copy");
+        assert_eq!(form.host, "db.example.com");
+        assert_eq!(form.port, "5433");
+        assert_eq!(form.password, "secret");
+        assert!(!form.editing);
+        assert!(form.original_name.is_none());
+        assert_eq!(form.title, "Duplicate: test");
     }
 
     #[test]
