@@ -1,3 +1,22 @@
+//! AI-assisted query generation.
+//!
+//! Translates natural-language prompts into database queries by sending
+//! schema-enriched requests to a configurable LLM provider (OpenAI, Anthropic,
+//! Google Gemini, OpenRouter, Ollama, or any OpenAI-compatible endpoint).
+//!
+//! All provider interaction goes through the [`rig`] crate. Each provider has
+//! a dedicated `run_*_request` function that builds a client, attaches a system
+//! prompt and sampling parameters, and applies a per-request timeout.
+//!
+//! Responses are expected as `{"query": "...", "explanation": "..."}` JSON.
+//! `parse_proposal_response` applies a four-layer fallback (raw JSON, fenced
+//! code block, brace extraction, plain text) so the module tolerates models
+//! that wrap output in markdown or omit the JSON envelope entirely.
+//!
+//! Multi-turn conversations are supported: the caller passes prior
+//! [`AiTurn`]s, which are formatted into the prompt so the model can refine
+//! a query across successive requests.
+
 use std::time::Duration;
 
 use rig::client::{CompletionClient, Nothing};
@@ -9,19 +28,27 @@ use tokio::time::timeout;
 use crate::config::{AiConfig, AiProvider, DbKind};
 use crate::ui::TableInfo;
 
+/// A successfully parsed AI response containing a proposed query and an
+/// optional natural-language explanation.
 #[derive(Debug, Clone)]
 pub struct AiProposal {
     pub query: String,
     pub explanation: Option<String>,
+    /// The raw text returned by the provider, kept for debugging.
     pub raw_response: String,
 }
 
+/// One user/assistant exchange in a multi-turn AI conversation.
 #[derive(Debug, Clone)]
 pub struct AiTurn {
     pub user_prompt: String,
     pub assistant_query: String,
 }
 
+/// Everything the AI module needs to build a prompt.
+///
+/// Constructed by `App::start_ai_generation` from the current application
+/// state and passed into [`generate_query`].
 #[derive(Clone)]
 pub struct AiRequestContext {
     pub db_kind: Option<DbKind>,
@@ -31,12 +58,24 @@ pub struct AiRequestContext {
     pub user_prompt: String,
 }
 
+/// Wire format expected from the LLM. Only `query` is required.
 #[derive(Debug, Deserialize)]
 struct ProposalPayload {
     query: String,
     explanation: Option<String>,
 }
 
+/// Send a natural-language prompt to the configured LLM and return a parsed
+/// query proposal.
+///
+/// Builds a system prompt (engine-aware, optionally user-overridden) and a
+/// user prompt containing schema context and conversation history, dispatches
+/// to the appropriate provider, and parses the response.
+///
+/// # Errors
+///
+/// Returns a human-readable `String` on client initialization failure,
+/// request timeout, provider HTTP error, or unparseable response.
 pub async fn generate_query(
     config: &AiConfig,
     context: &AiRequestContext,
@@ -289,6 +328,11 @@ async fn run_ollama_request(
     Ok(response)
 }
 
+/// Read the API key from the environment.
+///
+/// Tries each candidate env var in order (see [`api_key_env_candidates`]).
+/// When `allow_missing` is true (used for OpenAI-compatible endpoints that
+/// may not need auth), returns a dummy value instead of erroring.
 fn resolve_api_key(config: &AiConfig, allow_missing: bool) -> std::result::Result<String, String> {
     let candidates = api_key_env_candidates(config);
     for env_var in &candidates {
@@ -317,6 +361,12 @@ fn resolve_api_key(config: &AiConfig, allow_missing: bool) -> std::result::Resul
     ))
 }
 
+/// Determine which environment variable names to check for the API key.
+///
+/// If the user left the default `OPENAI_API_KEY` but selected a non-OpenAI
+/// provider, the provider's conventional env var is tried first so a user
+/// who only sets `ANTHROPIC_API_KEY` does not also need to override
+/// `api_key_env` in config. An explicitly customized value is used as-is.
 fn api_key_env_candidates(config: &AiConfig) -> Vec<String> {
     let configured = config.api_key_env.trim();
     let provider_default = default_api_key_env_for_provider(config.provider);
@@ -373,6 +423,9 @@ Return a single PostgreSQL query or statement block.
     override_prompt.unwrap_or(default_prompt).to_string()
 }
 
+/// Assemble the user-facing prompt from engine type, database name, schema
+/// summary, conversation history, and the current user request. Terminates
+/// with a JSON format instruction so the model returns a structured payload.
 fn build_prompt(config: &AiConfig, context: &AiRequestContext) -> String {
     let mut sections = Vec::new();
 
@@ -448,6 +501,15 @@ fn summarize_schema(tables: &[TableInfo], max_tables: usize, max_columns: usize)
     lines.join("\n")
 }
 
+/// Extract a `(query, explanation)` pair from a raw LLM response.
+///
+/// Applies four parsing strategies in order:
+/// 1. Direct JSON deserialization of the entire response.
+/// 2. Extract JSON from a markdown fenced code block (` ```json ... ``` `).
+/// 3. Extract the first `{...}` substring and try JSON deserialization.
+/// 4. Strip markdown fences and treat the remainder as a plain-text query.
+///
+/// Returns an error only if every strategy yields an empty or absent query.
 fn parse_proposal_response(raw: &str) -> std::result::Result<(String, Option<String>), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

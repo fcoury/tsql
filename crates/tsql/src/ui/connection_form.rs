@@ -317,6 +317,11 @@ impl ConnectionFormModal {
     }
 
     /// Create a new-connection form prefilled from an existing connection.
+    ///
+    /// The form opens in "new entry" mode (`original_name` is `None`), so
+    /// saving creates a fresh connection rather than overwriting the source.
+    /// `duplicate_name` should already be unique (see
+    /// `App::duplicate_connection_name`).
     pub fn duplicate_with_keymap_and_onepassword(
         entry: &ConnectionEntry,
         existing_password: Option<String>,

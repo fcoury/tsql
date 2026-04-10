@@ -266,7 +266,13 @@ pub enum UpdateMode {
     Off,
 }
 
-/// AI provider selection.
+/// LLM provider backend for the AI query assistant.
+///
+/// Each variant maps to a `run_*_request` function in [`crate::ai`] and
+/// determines the default API key environment variable via
+/// [`crate::ai`]'s `default_api_key_env_for_provider`. Serialized as
+/// `snake_case` with explicit aliases where the TOML name differs from the
+/// Rust variant name (e.g. `"google"` / `"gemini"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
@@ -281,7 +287,12 @@ pub enum AiProvider {
     OpenRouter,
 }
 
-/// AI assistant settings.
+/// Configuration for the `[ai]` section of `config.toml`.
+///
+/// Defaults are chosen for zero-config failure: `enabled` is `false`, so the
+/// feature is inert unless the user opts in. When enabled, the default
+/// provider is OpenAI with `gpt-4o-mini`, a conservative temperature of 0.1,
+/// and a 30-second timeout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
