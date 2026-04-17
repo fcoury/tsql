@@ -3719,6 +3719,15 @@ impl App {
                     return false;
                 }
                 PasswordPromptResult::Cancelled => {
+                    // Clear the pending target. `connect_to_entry` sets
+                    // `current_connection_name` before opening this
+                    // prompt (so the staleness guard for resolve
+                    // callbacks works); without clearing it here, a
+                    // cancel would leave the "active" connection name
+                    // pointing at an entry we never connected to — and
+                    // session-save would happily persist it and
+                    // auto-reconnect next launch.
+                    self.current_connection_name = None;
                     self.last_status = Some("Connection cancelled".to_string());
                     return false;
                 }
@@ -5665,7 +5674,18 @@ impl App {
                     // feedback rather than waiting for the background task
                     // to fail with a cryptic tokio error.
                     match validate_connection_url(args) {
-                        Ok(()) => self.start_connect(args.to_string()),
+                        Ok(()) => {
+                            // Raw URL connect isn't tied to any saved
+                            // entry, so wipe the pending target. Without
+                            // this, a still-in-flight `PasswordResolved`
+                            // callback for a previously-picked entry
+                            // would pass the staleness guard (which
+                            // compares against `current_connection_name`)
+                            // and silently hijack the user's explicit
+                            // URL connect.
+                            self.current_connection_name = None;
+                            self.start_connect(args.to_string());
+                        }
                         Err(hint) => {
                             self.last_error = Some(hint);
                         }
@@ -10884,6 +10904,42 @@ mod tests {
         let data = "x".repeat(2000);
         let hint = yank_size_hint(&data);
         assert!(hint.contains("KB"));
+    }
+
+    #[test]
+    fn test_connect_url_cancel_clears_current_connection_name() {
+        // Regression: cancelling the password prompt must clear
+        // `current_connection_name` so the staleness guard in
+        // `PasswordResolved` + session-save don't persist an
+        // unconnected entry as "active".
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = crate::config::ConnectionEntry {
+            name: "prompt-target".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        // Open the prompt exactly as `connect_to_entry` does for an
+        // entry with no backend-stored password.
+        app.current_connection_name = Some(entry.name.clone());
+        app.password_prompt = Some(PasswordPrompt::new(entry));
+
+        // Cancel the prompt.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.current_connection_name.is_none(),
+            "cancelled password prompt must clear the active target",
+        );
     }
 
     #[test]
