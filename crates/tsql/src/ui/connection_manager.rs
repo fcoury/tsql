@@ -450,27 +450,33 @@ impl ConnectionManagerModal {
 
             // Reorder up / down (Ctrl-K / Ctrl-J)
             (KeyCode::Char('K'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                if let Some(entry) = self.selected_connection() {
-                    return ConnectionManagerAction::Reorder {
-                        name: entry.name.clone(),
-                        delta: -1,
-                    };
-                }
-                ConnectionManagerAction::Continue
-            }
+            | (KeyCode::Char('k'), KeyModifiers::CONTROL) => self.try_reorder(-1),
             (KeyCode::Char('J'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                if let Some(entry) = self.selected_connection() {
-                    return ConnectionManagerAction::Reorder {
-                        name: entry.name.clone(),
-                        delta: 1,
-                    };
-                }
-                ConnectionManagerAction::Continue
-            }
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => self.try_reorder(1),
 
             _ => ConnectionManagerAction::Continue,
+        }
+    }
+
+    /// Emit a `Reorder` action only when the current sort mode actually
+    /// tracks the `order` field. In derived modes (Recent, MostUsed,
+    /// Alpha, Folder) bumping `order` would mutate hidden state without
+    /// moving the visible adjacent row, which is what the user sees —
+    /// so we block it and tell them to cycle sort instead.
+    fn try_reorder(&mut self, delta: i32) -> ConnectionManagerAction {
+        if self.sort_mode != SortMode::FavoritesAlpha {
+            self.toast = Some(format!(
+                "Reorder works in 'favorites' sort only (press 's' — currently: {})",
+                self.sort_mode.label()
+            ));
+            return ConnectionManagerAction::Continue;
+        }
+        match self.selected_connection() {
+            Some(entry) => ConnectionManagerAction::Reorder {
+                name: entry.name.clone(),
+                delta,
+            },
+            None => ConnectionManagerAction::Continue,
         }
     }
 
@@ -1013,6 +1019,35 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::ConnectionColor;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn test_reorder_blocked_outside_favorites_sort() {
+        // Regression: Ctrl-J/K used to emit a Reorder action regardless
+        // of the current sort mode, mutating `order` invisibly when the
+        // manager was sorted by Recent / MostUsed / Alpha / Folder.
+        let file = create_test_connections();
+        let mut m = ConnectionManagerModal::new(&file, None);
+        m.sort_mode = SortMode::Recent;
+
+        let action = m.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL));
+        assert_eq!(action, ConnectionManagerAction::Continue);
+        assert!(
+            m.toast
+                .as_deref()
+                .map(|t| t.contains("favorites"))
+                .unwrap_or(false),
+            "manager should toast a hint instead of silently mutating order"
+        );
+
+        // Switching back to FavoritesAlpha re-enables reorder.
+        m.sort_mode = SortMode::FavoritesAlpha;
+        let action = m.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            action,
+            ConnectionManagerAction::Reorder { delta: 1, .. }
+        ));
+    }
 
     fn create_test_connections() -> ConnectionsFile {
         let mut file = ConnectionsFile::new();

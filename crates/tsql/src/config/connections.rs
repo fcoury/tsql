@@ -365,14 +365,17 @@ impl ConnectionEntry {
                 // No password supplied — the stored URI may still carry
                 // one (imported files or manual edits can embed
                 // `mongodb://user:password@host/…`). Strip it so yank /
-                // copy-as-CLI never leaks credentials to the clipboard.
+                // copy-as-CLI never leaks credentials to the clipboard,
+                // even when the URI doesn't round-trip through the url
+                // crate (the fallback handles that).
                 if let Ok(mut parsed) = Url::parse(uri) {
                     if parsed.password().is_some() {
                         let _ = parsed.set_password(None);
                         return parsed.to_string();
                     }
+                    return uri.clone();
                 }
-                return uri.clone();
+                return sanitize_mongo_uri_fallback(uri);
             }
             return "mongodb://localhost".to_string();
         }
@@ -1549,6 +1552,29 @@ user = "me"
             "mongodb://host/db?ssl=true"
         );
         assert_eq!(sanitize_mongo_uri_fallback("not a url"), "not a url");
+    }
+
+    #[test]
+    fn test_mongo_to_url_none_strips_password_even_when_uri_not_parseable() {
+        // Regression: `Url::parse` could reject a hand-edited URI
+        // while still carrying credentials; the previous fallback
+        // returned it verbatim, so yank/copy-as-CLI leaked the
+        // password for those inputs.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            // Intentionally crafted to look malformed to url crate
+            // (the space in the host breaks parsing) yet still embed
+            // credentials in the `userinfo@` prefix.
+            uri: Some("mongodb://user:topsecret@bad host/db".to_string()),
+            host: "bad host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(!url.contains("topsecret"), "leaked: {url}");
     }
 
     #[test]
