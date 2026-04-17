@@ -333,11 +333,18 @@ fn reorder_in_file(
 /// `(Some(path), Ok(strategy))` on success. Returns `(None, _)` when the
 /// input is empty, and `(_, Err(flag))` when an unknown flag is trailing.
 ///
-/// Strategy for unquoted inputs: the last whitespace-delimited token
-/// that starts with `--` is treated as the flag; everything before it
-/// (joined back with single spaces) is the path. This matches shell
-/// intuition ("`tsql /Users/me/My Connections.toml --rename`") without
-/// forcing users to quote paths.
+/// Parsing rules:
+/// - If the input contains a `'` or `"` quote, assume the user wants
+///   shell-style quoting and let `shlex::split` do the work.
+/// - Otherwise use a pure whitespace-based split. This is the only
+///   path on Windows, where paths commonly contain `\` — if we sent
+///   those through `shlex::split` we'd silently strip the backslashes
+///   and turn `C:\Users\me\connections.toml` into
+///   `C:Usersmeconnections.toml`, which then fails to open.
+/// - In the whitespace branch, if the last token begins with `--`
+///   it's treated as the flag; everything before it (re-joined with
+///   single spaces) is the path, so unquoted spaced paths work too:
+///   `:import-connections /Users/me/My Connections.toml --rename`.
 fn parse_import_args(
     args: &str,
 ) -> (
@@ -349,22 +356,28 @@ fn parse_import_args(
         return (None, Ok(crate::config::ImportConflict::Rename));
     }
 
-    // First try shell-aware parsing so `"/path/with spaces.toml" --flag`
-    // is respected verbatim.
-    if let Some(tokens) = shlex::split(trimmed) {
-        match tokens.as_slice() {
-            [p] => return (Some(p.clone()), Ok(crate::config::ImportConflict::Rename)),
-            [p, flag] if flag.starts_with("--") => {
-                return (Some(p.clone()), parse_import_flag(flag));
-            }
-            _ => {
-                // Fall through to unquoted-path handling.
+    // Only invoke shell-aware parsing when the user actually used
+    // quotes — otherwise POSIX `shlex` would eat Windows backslashes.
+    let has_quotes = trimmed.contains('\'') || trimmed.contains('"');
+    if has_quotes {
+        if let Some(tokens) = shlex::split(trimmed) {
+            match tokens.as_slice() {
+                [p] => return (Some(p.clone()), Ok(crate::config::ImportConflict::Rename)),
+                [p, flag] if flag.starts_with("--") => {
+                    return (Some(p.clone()), parse_import_flag(flag));
+                }
+                _ => {
+                    // Too many tokens even with quoting — fall through
+                    // to the whitespace path, which at least handles
+                    // "path --flag" correctly.
+                }
             }
         }
     }
 
-    // Unquoted path with embedded whitespace: only the final `--flag`
-    // token (if any) is special; everything else is part of the path.
+    // No quoting — treat the input as `path [--flag]` where only the
+    // trailing `--…` token (if any) is a flag. Preserves backslashes,
+    // colons, and every other character inside the path verbatim.
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let last = *tokens.last().unwrap_or(&"");
     if last.starts_with("--") && tokens.len() >= 2 {
@@ -7783,6 +7796,13 @@ impl App {
         let env_configured = entry.password_env.is_some();
         if !entry.password_in_keychain && !op_configured && !env_configured {
             self.last_error = None;
+            // Update the active target BEFORE opening the prompt so any
+            // still-in-flight `PasswordResolved` callback for a prior
+            // entry is recognised as stale by the guard in
+            // `DbEvent::PasswordResolved`. Otherwise picking a
+            // no-backend entry while a previous resolve is in flight
+            // would let that old callback hijack the reconnect.
+            self.current_connection_name = Some(entry.name.clone());
             self.password_prompt = Some(PasswordPrompt::new(entry));
             return;
         }
@@ -10942,6 +10962,26 @@ mod tests {
     fn test_parse_import_args_empty() {
         let (path, _) = parse_import_args("   ");
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_parse_import_args_windows_backslash_path_survives() {
+        // Regression: POSIX-style `shlex::split` eats backslashes, so
+        // `C:\Users\me\connections.toml --rename` would decode to
+        // `C:Usersmeconnections.toml` and then fail to open. We should
+        // only invoke shlex when the user actually quoted something.
+        let (path, strategy) = parse_import_args(r"C:\Users\me\connections.toml --overwrite");
+        assert_eq!(
+            path.as_deref(),
+            Some(r"C:\Users\me\connections.toml"),
+            "backslashes must survive unquoted parsing"
+        );
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Overwrite);
+
+        // Without a flag either.
+        let (path, strategy) = parse_import_args(r"D:\data\imports\out.toml");
+        assert_eq!(path.as_deref(), Some(r"D:\data\imports\out.toml"));
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Rename);
     }
 
     fn make_reorder_fixture() -> crate::config::ConnectionsFile {
