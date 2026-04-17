@@ -252,9 +252,13 @@ fn main() -> Result<()> {
     };
 
     // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
-    let (conn_str, libpq_warning) = if args.len() > 1 && !args[1].starts_with('-') {
-        // First argument is the connection string
-        (Some(args[1].clone()), None)
+    // Pick the first positional argument (one that doesn't start with
+    // `-`) as the connection string, regardless of where in the argv
+    // it sits. Previously we only looked at `args[1]`, which broke
+    // option-first invocations like `tsql --safe-mode postgres://…`.
+    let positional_url = args.iter().skip(1).find(|a| !a.starts_with('-'));
+    let (conn_str, libpq_warning) = if let Some(url) = positional_url {
+        (Some(url.clone()), None)
     } else if let Ok(url) = env::var("DATABASE_URL") {
         // Fall back to DATABASE_URL environment variable
         (Some(url), None)

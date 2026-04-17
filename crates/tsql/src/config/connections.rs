@@ -372,9 +372,33 @@ impl ConnectionEntry {
         url.push('/');
         url.push_str(&self.database);
 
+        // Collect query parameters the user configured at entry level.
+        // Without threading these through, the values the UI captures
+        // would be inert and silently ignored at connect time.
+        let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(mode) = self.ssl_mode {
-            url.push_str("?sslmode=");
-            url.push_str(mode.as_str());
+            query.push(("sslmode", mode.as_str().to_string()));
+        }
+        if let Some(secs) = self.connect_timeout_secs {
+            // libpq / tokio-postgres accept `connect_timeout` in seconds.
+            query.push(("connect_timeout", secs.to_string()));
+        }
+        if let Some(app) = self.application_name.as_deref() {
+            let trimmed = app.trim();
+            if !trimmed.is_empty() {
+                query.push(("application_name", trimmed.to_string()));
+            }
+        }
+        if !query.is_empty() {
+            url.push('?');
+            for (i, (k, v)) in query.iter().enumerate() {
+                if i > 0 {
+                    url.push('&');
+                }
+                url.push_str(k);
+                url.push('=');
+                url.push_str(&urlencoding::encode(v));
+            }
         }
 
         url
@@ -1682,6 +1706,28 @@ user = "me"
 
         let url = entry.to_url(None);
         assert_eq!(url, "postgres://postgres@localhost/mydb?sslmode=require");
+    }
+
+    #[test]
+    fn test_connection_to_url_threads_timeout_and_app_name() {
+        // Regression: per-entry `connect_timeout_secs` and
+        // `application_name` must end up as query params, otherwise
+        // setting them in the UI is silently inert.
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            connect_timeout_secs: Some(5),
+            application_name: Some("tsql-prod".to_string()),
+            ssl_mode: Some(SslMode::Require),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(url.contains("sslmode=require"), "url: {url}");
+        assert!(url.contains("connect_timeout=5"), "url: {url}");
+        assert!(url.contains("application_name=tsql-prod"), "url: {url}");
     }
 
     #[test]
