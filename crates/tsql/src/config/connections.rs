@@ -1030,6 +1030,26 @@ impl ConnectionsFile {
             }
         }
 
+        let mut entry = entry;
+        // Once the user has manually reordered any non-favorite entry,
+        // some `order` values become > 0. A freshly added / imported
+        // entry defaults to `order = 0` and would otherwise jump to
+        // the top of the manual list — surprising behaviour after
+        // every `:import-connections` or "add" click. Append to the
+        // bottom instead when anyone else has been reordered.
+        if entry.favorite.is_none() && entry.order == 0 {
+            let max_order = self
+                .connections
+                .iter()
+                .filter(|c| c.favorite.is_none())
+                .map(|c| c.order)
+                .max()
+                .unwrap_or(0);
+            if max_order > 0 {
+                entry.order = max_order.saturating_add(1);
+            }
+        }
+
         self.connections.push(entry);
         Ok(())
     }
@@ -1552,6 +1572,77 @@ user = "me"
             "mongodb://host/db?ssl=true"
         );
         assert_eq!(sanitize_mongo_uri_fallback("not a url"), "not a url");
+    }
+
+    #[test]
+    fn test_add_appends_new_entry_below_manually_ordered_list() {
+        // Regression: after the user reorders manually (bumping some
+        // `order` values > 0), adding a new entry with default
+        // `order = 0` would put it at the top of the visible list.
+        // `add()` must now append to the bottom in that case.
+        let mut file = ConnectionsFile::new();
+        for name in ["a", "b", "c"] {
+            file.add(ConnectionEntry {
+                name: name.to_string(),
+                host: "h".to_string(),
+                database: "d".to_string(),
+                user: "u".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        // Simulate user reordering: b bumped to 1, c bumped to 2.
+        // Everyone was at 0, so now the list has mixed orders.
+        file.find_by_name_mut("b").unwrap().order = 1;
+        file.find_by_name_mut("c").unwrap().order = 2;
+
+        // Add a new entry. Default order = 0 would have sorted first
+        // (`a:0, d:0, b:1, c:2` — actually alphabetically among zeros,
+        // so `a, d, b, c`). We want append-to-bottom semantics.
+        file.add(ConnectionEntry {
+            name: "d".to_string(),
+            host: "h".to_string(),
+            database: "x".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let sorted: Vec<&str> = file
+            .sorted_by(SortMode::FavoritesAlpha)
+            .into_iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            sorted.last().copied(),
+            Some("d"),
+            "new entry must land at the bottom after the user has manually reordered; got {sorted:?}"
+        );
+    }
+
+    #[test]
+    fn test_add_leaves_order_zero_when_nobody_has_reordered() {
+        // Fresh file with no manual ordering — new entries stay at
+        // the default 0 so the alphabetical tiebreak keeps working.
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "alpha".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        file.add(ConnectionEntry {
+            name: "bravo".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(file.find_by_name("alpha").unwrap().order, 0);
+        assert_eq!(file.find_by_name("bravo").unwrap().order, 0);
     }
 
     #[test]
