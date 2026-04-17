@@ -2858,8 +2858,19 @@ impl App {
         // still-pending password resolve or prompt, we'd save a
         // target the user never actually connected to and then
         // auto-reconnect to it on the next launch.
+        //
+        // Also gate on `db.status == Connected`: `start_connect`
+        // drops the live client immediately but leaves
+        // `active_connection_name` alone until the next Connected /
+        // Error event arrives, so a quit during the handshake
+        // window could otherwise persist a stale name.
+        let connection_name = if self.db.status == DbStatus::Connected {
+            self.active_connection_name.clone()
+        } else {
+            None
+        };
         SessionState {
-            connection_name: self.active_connection_name.clone(),
+            connection_name,
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
             sidebar_visible: self.sidebar_visible,
@@ -8802,11 +8813,15 @@ impl App {
                     if let Some(existing) = self.connections.find_by_name(orig) {
                         merge_edit_preserving_non_form_fields(&mut entry, existing);
                     }
-                } else if let Some(donor) = self.pending_duplicate_donor.take() {
+                } else if let Some(donor) = self.pending_duplicate_donor.as_deref() {
                     // Duplicate: form has add-semantics (original_name=None)
                     // but we still want to carry over non-form fields
-                    // (notably SSL cert paths) from the donor.
-                    merge_edit_preserving_non_form_fields(&mut entry, &donor);
+                    // (notably SSL cert paths) from the donor. Borrow
+                    // here; only *consume* the donor after `add()`
+                    // succeeds — if the user edits the auto-generated
+                    // name into a collision and retries, we need the
+                    // donor to be there for the next attempt.
+                    merge_edit_preserving_non_form_fields(&mut entry, donor);
                     // Reset ephemeral donor-specific metadata so the
                     // duplicate doesn't inherit use_count / favorite /
                     // order from the source.
@@ -8825,6 +8840,13 @@ impl App {
 
                 match result {
                     Ok(()) => {
+                        // Successful save: clear the donor stash so a
+                        // subsequent unrelated add/edit doesn't
+                        // silently inherit its non-form fields.
+                        if original_name.is_none() {
+                            self.pending_duplicate_donor = None;
+                        }
+
                         // Save password to keychain if requested
                         if save_password {
                             if let Some(ref pwd) = password {
@@ -11165,8 +11187,9 @@ mod tests {
             state.connection_name
         );
 
-        // Committed connection is persisted.
+        // Committed connection *and* db actually connected → persisted.
         app.active_connection_name = Some("real".to_string());
+        app.db.status = DbStatus::Connected;
         let state = app.capture_session_state();
         assert_eq!(state.connection_name.as_deref(), Some("real"));
 
@@ -11174,8 +11197,27 @@ mod tests {
         // still persist the committed one.
         app.current_connection_name = Some("cancelled".to_string());
         app.active_connection_name = Some("real".to_string());
+        app.db.status = DbStatus::Connected;
         let state = app.capture_session_state();
         assert_eq!(state.connection_name.as_deref(), Some("real"));
+
+        // Old active_name still cached but we're mid-handshake
+        // (`start_connect` cleared the client but hasn't seen a
+        // Connected event yet). Must NOT persist, or a quit during
+        // that window would save a stale name.
+        app.active_connection_name = Some("stale-handshake".to_string());
+        app.db.status = DbStatus::Connecting;
+        let state = app.capture_session_state();
+        assert!(
+            state.connection_name.is_none(),
+            "must not persist active name while db is Connecting"
+        );
+        app.db.status = DbStatus::Error;
+        let state = app.capture_session_state();
+        assert!(
+            state.connection_name.is_none(),
+            "must not persist active name while db is Error"
+        );
     }
 
     #[test]
@@ -11388,6 +11430,107 @@ mod tests {
         assert_eq!(stored.use_count, 0);
         assert!(stored.last_used_at.is_none());
         // Donor cleared after consuming.
+        assert!(app.pending_duplicate_donor.is_none());
+    }
+
+    #[test]
+    fn test_duplicate_donor_survives_first_save_failure_and_retry_preserves_fields() {
+        // Regression: the duplicate handler stashes the source as
+        // `pending_duplicate_donor` so Save's add-branch can re-apply
+        // non-form fields. Previously the donor was consumed BEFORE
+        // `connections.add()` succeeded, so if the user edited the
+        // auto-generated name to one that already exists, the retry
+        // silently lost SSL cert paths.
+        use std::path::PathBuf;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Seed: source "src" (TLS-configured) + a pre-existing name
+        // collision target "taken".
+        let src = crate::config::ConnectionEntry {
+            name: "src".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ssl_root_cert: Some(PathBuf::from("/etc/ssl/root.crt")),
+            ssl_client_cert: Some(PathBuf::from("/etc/ssl/client.crt")),
+            ssl_client_key: Some(PathBuf::from("/etc/ssl/client.key")),
+            ..Default::default()
+        };
+        let taken = crate::config::ConnectionEntry {
+            name: "taken".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        app.connections.add(src.clone()).unwrap();
+        app.connections.add(taken).unwrap();
+
+        // Stash donor (Duplicate action would do this).
+        app.handle_connection_manager_action(crate::ui::ConnectionManagerAction::Duplicate {
+            entry: src.clone(),
+        });
+        assert!(app.pending_duplicate_donor.is_some());
+
+        // First Save attempt: user edited the name to an existing one
+        // → add() fails.
+        let colliding = crate::config::ConnectionEntry {
+            name: "taken".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        app.handle_connection_form_action(crate::ui::ConnectionFormAction::Save {
+            entry: colliding,
+            password: None,
+            save_password: false,
+            original_name: None,
+        });
+        assert!(
+            app.pending_duplicate_donor.is_some(),
+            "donor must survive a failed save so the user can retry"
+        );
+        assert!(
+            app.last_error.is_some(),
+            "failed add() should surface an error"
+        );
+
+        // Second Save attempt with a fresh name: donor must still
+        // merge SSL paths in.
+        let good = crate::config::ConnectionEntry {
+            name: "src-copy".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        app.handle_connection_form_action(crate::ui::ConnectionFormAction::Save {
+            entry: good,
+            password: None,
+            save_password: false,
+            original_name: None,
+        });
+        let stored = app
+            .connections
+            .find_by_name("src-copy")
+            .expect("retry save should succeed");
+        assert_eq!(stored.ssl_root_cert, src.ssl_root_cert);
+        assert_eq!(stored.ssl_client_cert, src.ssl_client_cert);
+        assert_eq!(stored.ssl_client_key, src.ssl_client_key);
+        // Donor cleared now that the add succeeded.
         assert!(app.pending_duplicate_donor.is_none());
     }
 
