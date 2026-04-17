@@ -269,6 +269,118 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+/// Swap a non-favorite entry with its immediate neighbor in the
+/// manager's `FavoritesAlpha` sort order. Pure function on the
+/// `ConnectionsFile` so we can test it without booting an `App`.
+///
+/// `delta = -1` → move up, `+1` → move down.
+/// Favorite entries are rejected as "not reorderable".
+/// Boundary moves (top up / bottom down) are silent no-ops.
+fn reorder_in_file(
+    file: &mut crate::config::ConnectionsFile,
+    name: &str,
+    delta: i32,
+) -> anyhow::Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let mut ordered_names: Vec<String> = file
+        .sorted_by(crate::config::SortMode::FavoritesAlpha)
+        .into_iter()
+        .filter(|e| e.favorite.is_none())
+        .map(|e| e.name.clone())
+        .collect();
+
+    let idx = ordered_names
+        .iter()
+        .position(|n| n == name)
+        .ok_or_else(|| anyhow::anyhow!("Connection '{}' is not reorderable", name))?;
+
+    let neighbor_idx = if delta < 0 {
+        if idx == 0 {
+            return Ok(());
+        }
+        idx - 1
+    } else {
+        if idx + 1 >= ordered_names.len() {
+            return Ok(());
+        }
+        idx + 1
+    };
+
+    // Swap in the list view, then re-assign `order = 0..N` to every
+    // non-favorite entry. Pairwise-swap-by-value breaks when multiple
+    // entries share the default `order = 0`, so normalising is the
+    // only robust approach.
+    ordered_names.swap(idx, neighbor_idx);
+    for (i, n) in ordered_names.iter().enumerate() {
+        if let Some(entry) = file.find_by_name_mut(n) {
+            entry.order = i as i32;
+        }
+    }
+    Ok(())
+}
+
+/// Parse `:import-connections <path> [--flag]` arguments while tolerating
+/// paths with whitespace (common on macOS and Windows). Returns
+/// `(Some(path), Ok(strategy))` on success. Returns `(None, _)` when the
+/// input is empty, and `(_, Err(flag))` when an unknown flag is trailing.
+///
+/// Strategy for unquoted inputs: the last whitespace-delimited token
+/// that starts with `--` is treated as the flag; everything before it
+/// (joined back with single spaces) is the path. This matches shell
+/// intuition ("`tsql /Users/me/My Connections.toml --rename`") without
+/// forcing users to quote paths.
+fn parse_import_args(
+    args: &str,
+) -> (
+    Option<String>,
+    std::result::Result<crate::config::ImportConflict, String>,
+) {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return (None, Ok(crate::config::ImportConflict::Rename));
+    }
+
+    // First try shell-aware parsing so `"/path/with spaces.toml" --flag`
+    // is respected verbatim.
+    if let Some(tokens) = shlex::split(trimmed) {
+        match tokens.as_slice() {
+            [p] => return (Some(p.clone()), Ok(crate::config::ImportConflict::Rename)),
+            [p, flag] if flag.starts_with("--") => {
+                return (Some(p.clone()), parse_import_flag(flag));
+            }
+            _ => {
+                // Fall through to unquoted-path handling.
+            }
+        }
+    }
+
+    // Unquoted path with embedded whitespace: only the final `--flag`
+    // token (if any) is special; everything else is part of the path.
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let last = *tokens.last().unwrap_or(&"");
+    if last.starts_with("--") && tokens.len() >= 2 {
+        let strategy = parse_import_flag(last);
+        let path = tokens[..tokens.len() - 1].join(" ");
+        (Some(path), strategy)
+    } else {
+        (
+            Some(trimmed.to_string()),
+            Ok(crate::config::ImportConflict::Rename),
+        )
+    }
+}
+
+fn parse_import_flag(flag: &str) -> std::result::Result<crate::config::ImportConflict, String> {
+    match flag {
+        "--overwrite" => Ok(crate::config::ImportConflict::Overwrite),
+        "--skip" => Ok(crate::config::ImportConflict::Skip),
+        "--rename" => Ok(crate::config::ImportConflict::Rename),
+        other => Err(other.to_string()),
+    }
+}
+
 /// Build a compact "N lines, M bytes" label for yank status messages.
 fn yank_size_hint(text: &str) -> String {
     let bytes = text.len();
@@ -8279,32 +8391,24 @@ impl App {
                 Some("Usage: :import-connections <path> [--overwrite|--skip|--rename]".to_string());
             return;
         }
-        let tokens: Vec<&str> = args.split_whitespace().collect();
-        let (path, strategy) = match tokens.as_slice() {
-            [p] => (*p, crate::config::ImportConflict::Rename),
-            [p, flag] => {
-                let s = match *flag {
-                    "--overwrite" => crate::config::ImportConflict::Overwrite,
-                    "--skip" => crate::config::ImportConflict::Skip,
-                    "--rename" => crate::config::ImportConflict::Rename,
-                    _ => {
-                        self.last_error = Some(format!("Unknown flag: {}", flag));
-                        return;
-                    }
-                };
-                (*p, s)
-            }
-            _ => {
+        let (path, strategy) = parse_import_args(args);
+        let (path, strategy) = match (path, strategy) {
+            (Some(path), Ok(strategy)) => (path, strategy),
+            (None, _) => {
                 self.last_status = Some(
                     "Usage: :import-connections <path> [--overwrite|--skip|--rename]".to_string(),
                 );
+                return;
+            }
+            (_, Err(flag)) => {
+                self.last_error = Some(format!("Unknown flag: {}", flag));
                 return;
             }
         };
 
         match crate::config::import_from_path(
             &mut self.connections,
-            std::path::Path::new(path),
+            std::path::Path::new(&path),
             strategy,
         ) {
             Ok(summary) => {
@@ -8345,23 +8449,16 @@ impl App {
         }
     }
 
-    /// Shift the `order` field of the named non-favorite entry so its
-    /// relative position in the sorted list moves by `delta` slots (−1
-    /// = up, +1 = down). Favorites keep their slot.
+    /// Swap the named non-favorite entry with its immediate neighbor
+    /// (`delta = -1` up, `+1` down) in the manager's current sort order.
+    /// Favorites keep their slot — reorder is a no-op for them.
+    ///
+    /// We swap `order` values against the adjacent entry rather than
+    /// shifting by a fixed offset; otherwise multiple entries sharing
+    /// the default `order = 0` would all remain at the same position
+    /// and the user-visible move would jump around (see codex P2).
     fn reorder_connection(&mut self, name: &str, delta: i32) -> anyhow::Result<()> {
-        let target_order = self
-            .connections
-            .find_by_name(name)
-            .map(|e| e.order)
-            .ok_or_else(|| anyhow::anyhow!("Connection '{}' not found", name))?;
-        // Simple approach: shift the entry by (delta * 10) so there's
-        // always head-room to insert between. Collisions just sort by
-        // name as tiebreak.
-        let new_order = target_order.saturating_add(delta.saturating_mul(10));
-        if let Some(entry) = self.connections.find_by_name_mut(name) {
-            entry.order = new_order;
-        }
-        Ok(())
+        reorder_in_file(&mut self.connections, name, delta)
     }
 
     /// Kick off a background connection test. Resolves the password on a
@@ -10715,6 +10812,115 @@ mod tests {
         let data = "x".repeat(2000);
         let hint = yank_size_hint(&data);
         assert!(hint.contains("KB"));
+    }
+
+    #[test]
+    fn test_parse_import_args_quoted_path_with_spaces() {
+        let (path, strategy) = parse_import_args(r#""/Users/me/My Connections.toml" --rename"#);
+        assert_eq!(path.as_deref(), Some("/Users/me/My Connections.toml"));
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Rename);
+    }
+
+    #[test]
+    fn test_parse_import_args_unquoted_path_with_spaces() {
+        // Common macOS/Windows case: user types the path verbatim,
+        // trailing flag is the only `--` token.
+        let (path, strategy) = parse_import_args("/Users/me/My Connections.toml --overwrite");
+        assert_eq!(path.as_deref(), Some("/Users/me/My Connections.toml"));
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Overwrite);
+    }
+
+    #[test]
+    fn test_parse_import_args_path_without_flag() {
+        let (path, strategy) = parse_import_args("/tmp/out.toml");
+        assert_eq!(path.as_deref(), Some("/tmp/out.toml"));
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Rename);
+    }
+
+    #[test]
+    fn test_parse_import_args_unknown_flag_rejected() {
+        let (_, strategy) = parse_import_args("/tmp/out.toml --bogus");
+        assert_eq!(strategy.unwrap_err(), "--bogus");
+    }
+
+    #[test]
+    fn test_parse_import_args_empty() {
+        let (path, _) = parse_import_args("   ");
+        assert!(path.is_none());
+    }
+
+    fn make_reorder_fixture() -> crate::config::ConnectionsFile {
+        use crate::config::{ConnectionEntry, ConnectionsFile};
+        let mut f = ConnectionsFile::new();
+        for name in ["a", "b", "c"] {
+            f.add(ConnectionEntry {
+                name: name.to_string(),
+                host: "h".to_string(),
+                database: "d".to_string(),
+                user: "u".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        f
+    }
+
+    fn ordered_names(file: &crate::config::ConnectionsFile) -> Vec<String> {
+        file.sorted_by(crate::config::SortMode::FavoritesAlpha)
+            .into_iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_reorder_down_swaps_with_next_neighbor_when_all_orders_zero() {
+        // Regression: used to shift by +10 and jump to the bottom;
+        // should now swap with the adjacent entry.
+        let mut f = make_reorder_fixture();
+        reorder_in_file(&mut f, "a", 1).unwrap();
+        assert_eq!(ordered_names(&f), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn test_reorder_up_swaps_with_prev_neighbor_when_all_orders_zero() {
+        let mut f = make_reorder_fixture();
+        reorder_in_file(&mut f, "c", -1).unwrap();
+        assert_eq!(ordered_names(&f), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn test_reorder_distinct_orders_swap_then_normalise() {
+        // Starting from a custom ordering, reorder still works and the
+        // post-reorder sort is correct. Exact `order` values become
+        // sequential (0..N) because we normalise on every reorder.
+        let mut f = make_reorder_fixture();
+        f.find_by_name_mut("a").unwrap().order = 10;
+        f.find_by_name_mut("b").unwrap().order = 20;
+        f.find_by_name_mut("c").unwrap().order = 30;
+        reorder_in_file(&mut f, "b", 1).unwrap();
+        assert_eq!(ordered_names(&f), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn test_reorder_top_boundary_is_noop() {
+        let mut f = make_reorder_fixture();
+        reorder_in_file(&mut f, "a", -1).unwrap();
+        assert_eq!(ordered_names(&f), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_reorder_bottom_boundary_is_noop() {
+        let mut f = make_reorder_fixture();
+        reorder_in_file(&mut f, "c", 1).unwrap();
+        assert_eq!(ordered_names(&f), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_reorder_favorite_entry_is_rejected() {
+        let mut f = make_reorder_fixture();
+        f.set_favorite("a", Some(1)).unwrap();
+        let err = reorder_in_file(&mut f, "a", 1).unwrap_err();
+        assert!(err.to_string().contains("not reorderable"));
     }
 
     /// Guard that sets TSQL_CONFIG_DIR to a temp directory for test isolation.
