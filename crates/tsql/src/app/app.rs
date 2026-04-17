@@ -2550,8 +2550,19 @@ pub struct App {
 
     /// Saved database connections.
     pub connections: ConnectionsFile,
-    /// Name of the currently connected connection (if from saved connections).
+    /// Pending target — what we're *trying* to connect to. Updated
+    /// eagerly by `connect_to_entry` + `start_connect` so the
+    /// staleness guard in `PasswordResolved` can distinguish old
+    /// callbacks from the latest pick.
     pub current_connection_name: Option<String>,
+    /// Last *successfully* connected entry name. Only updated by the
+    /// `Connected` / `MongoConnected` events and cleared on
+    /// disconnect. Used as the source of truth for session save,
+    /// sidebar highlight, and "restore target" on prompt cancel —
+    /// `current_connection_name` alone is not safe for those because
+    /// an aborted pick would leave it pointing at an entry the user
+    /// never actually reached.
+    pub active_connection_name: Option<String>,
     /// Connection picker (fuzzy picker for quick connection selection).
     pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
@@ -2755,6 +2766,7 @@ impl App {
 
             connections: ConnectionsFile::new(),
             current_connection_name: None,
+            active_connection_name: None,
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
@@ -2811,8 +2823,18 @@ impl App {
 
     /// Capture current session state for persistence.
     pub fn capture_session_state(&self) -> SessionState {
+        // Persist the *committed* connection (one we actually reached),
+        // never the pending target that an in-flight pick/prompt may
+        // have put into `current_connection_name`. Falling back to
+        // `current_connection_name` keeps behavior identical for
+        // already-connected sessions (where the two match) and for
+        // tests that set only the current name.
+        let connection_name = self
+            .active_connection_name
+            .clone()
+            .or_else(|| self.current_connection_name.clone());
         SessionState {
-            connection_name: self.current_connection_name.clone(),
+            connection_name,
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
             sidebar_visible: self.sidebar_visible,
@@ -3723,15 +3745,16 @@ impl App {
                     return false;
                 }
                 PasswordPromptResult::Cancelled => {
-                    // Clear the pending target. `connect_to_entry` sets
-                    // `current_connection_name` before opening this
-                    // prompt (so the staleness guard for resolve
-                    // callbacks works); without clearing it here, a
-                    // cancel would leave the "active" connection name
-                    // pointing at an entry we never connected to — and
-                    // session-save would happily persist it and
-                    // auto-reconnect next launch.
-                    self.current_connection_name = None;
+                    // `connect_to_entry` eagerly points
+                    // `current_connection_name` at the new pick so the
+                    // resolve-callback staleness guard works. If the
+                    // user cancels, restore the pending target to
+                    // whatever we were *actually* connected to
+                    // (`active_connection_name`) — otherwise a user who
+                    // was connected to A, picked B, then cancelled
+                    // would lose the A session from the sidebar /
+                    // session-save state even though it's still open.
+                    self.current_connection_name = self.active_connection_name.clone();
                     self.last_status = Some("Connection cancelled".to_string());
                     return false;
                 }
@@ -5705,6 +5728,8 @@ impl App {
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
                 self.query_ui.clear();
+                self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
@@ -7820,9 +7845,8 @@ impl App {
             // Update the active target BEFORE opening the prompt so any
             // still-in-flight `PasswordResolved` callback for a prior
             // entry is recognised as stale by the guard in
-            // `DbEvent::PasswordResolved`. Otherwise picking a
-            // no-backend entry while a previous resolve is in flight
-            // would let that old callback hijack the reconnect.
+            // `DbEvent::PasswordResolved`. Cancel restores the real
+            // connected name from `active_connection_name`.
             self.current_connection_name = Some(entry.name.clone());
             self.password_prompt = Some(PasswordPrompt::new(entry));
             return;
@@ -7845,8 +7869,17 @@ impl App {
     /// entry to avoid pounding the filesystem on rapid reconnects.
     fn record_successful_connect(&mut self) {
         let Some(name) = self.current_connection_name.clone() else {
+            // Raw-URL connect (no saved entry): clear the "active saved
+            // name" so session save / sidebar / restore-on-cancel don't
+            // keep pointing at a stale entry.
+            self.active_connection_name = None;
             return;
         };
+        // Promote the pending target into the committed active name.
+        // This is the only place we update `active_connection_name`
+        // positively — it must outlive a later `connect_to_entry` that
+        // gets cancelled at the password prompt.
+        self.active_connection_name = Some(name.clone());
         if !self.connections.touch_use(&name) {
             return;
         }
@@ -10101,6 +10134,7 @@ impl App {
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
@@ -10113,6 +10147,7 @@ impl App {
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
@@ -10998,11 +11033,58 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_url_cancel_clears_current_connection_name() {
-        // Regression: cancelling the password prompt must clear
-        // `current_connection_name` so the staleness guard in
-        // `PasswordResolved` + session-save don't persist an
-        // unconnected entry as "active".
+    fn test_password_prompt_cancel_restores_active_connection() {
+        // Scenario: user is connected to A, picks B from the manager
+        // (which goes through `connect_to_entry`), then cancels the
+        // password prompt. The app must keep tracking A — the real
+        // active session is still open — instead of wiping
+        // `current_connection_name` to None and making session save
+        // / sidebar highlight believe nothing is active.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Pretend we're already connected to A.
+        app.active_connection_name = Some("a".to_string());
+        app.current_connection_name = Some("a".to_string());
+
+        // User picks B. `connect_to_entry` overwrites the pending
+        // target and opens the prompt (simulated directly here).
+        let entry_b = crate::config::ConnectionEntry {
+            name: "b".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        app.current_connection_name = Some(entry_b.name.clone());
+        app.password_prompt = Some(PasswordPrompt::new(entry_b));
+
+        // User cancels the prompt.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.current_connection_name.as_deref(),
+            Some("a"),
+            "cancel must restore the committed active entry, not wipe it"
+        );
+        assert_eq!(
+            app.active_connection_name.as_deref(),
+            Some("a"),
+            "active_connection_name is the source of truth and must not be touched by cancel"
+        );
+    }
+
+    #[test]
+    fn test_password_prompt_cancel_with_no_prior_connection_clears_target() {
+        // Inverse scenario: no prior connection. Cancelling the prompt
+        // must leave both names at None.
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11013,24 +11095,19 @@ mod tests {
         app.connection_manager = None;
 
         let entry = crate::config::ConnectionEntry {
-            name: "prompt-target".to_string(),
+            name: "pending".to_string(),
             host: "h".to_string(),
             port: 5432,
             database: "d".to_string(),
             user: "u".to_string(),
             ..Default::default()
         };
-        // Open the prompt exactly as `connect_to_entry` does for an
-        // entry with no backend-stored password.
         app.current_connection_name = Some(entry.name.clone());
         app.password_prompt = Some(PasswordPrompt::new(entry));
 
-        // Cancel the prompt.
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            app.current_connection_name.is_none(),
-            "cancelled password prompt must clear the active target",
-        );
+        assert!(app.current_connection_name.is_none());
+        assert!(app.active_connection_name.is_none());
     }
 
     #[test]
