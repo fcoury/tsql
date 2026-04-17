@@ -334,17 +334,16 @@ fn reorder_in_file(
 /// input is empty, and `(_, Err(flag))` when an unknown flag is trailing.
 ///
 /// Parsing rules:
-/// - If the input contains a `'` or `"` quote, assume the user wants
-///   shell-style quoting and let `shlex::split` do the work.
-/// - Otherwise use a pure whitespace-based split. This is the only
-///   path on Windows, where paths commonly contain `\` — if we sent
-///   those through `shlex::split` we'd silently strip the backslashes
-///   and turn `C:\Users\me\connections.toml` into
-///   `C:Usersmeconnections.toml`, which then fails to open.
-/// - In the whitespace branch, if the last token begins with `--`
-///   it's treated as the flag; everything before it (re-joined with
-///   single spaces) is the path, so unquoted spaced paths work too:
-///   `:import-connections /Users/me/My Connections.toml --rename`.
+/// - If the input starts with `'` or `"`, the path is the literal
+///   substring up to the matching closing quote (no escape processing
+///   at all). Everything after the quote, trimmed, is the optional
+///   flag. POSIX `shlex` is deliberately NOT used here — it would
+///   strip backslashes from Windows paths like
+///   `"C:\Users\me\My Connections.toml" --rename`.
+/// - Otherwise use whitespace splitting. If the last token starts with
+///   `--` it's the flag; everything before it (joined with single
+///   spaces) is the path. This handles bare Windows paths with
+///   backslashes and unquoted macOS paths with spaces.
 fn parse_import_args(
     args: &str,
 ) -> (
@@ -356,23 +355,21 @@ fn parse_import_args(
         return (None, Ok(crate::config::ImportConflict::Rename));
     }
 
-    // Only invoke shell-aware parsing when the user actually used
-    // quotes — otherwise POSIX `shlex` would eat Windows backslashes.
-    let has_quotes = trimmed.contains('\'') || trimmed.contains('"');
-    if has_quotes {
-        if let Some(tokens) = shlex::split(trimmed) {
-            match tokens.as_slice() {
-                [p] => return (Some(p.clone()), Ok(crate::config::ImportConflict::Rename)),
-                [p, flag] if flag.starts_with("--") => {
-                    return (Some(p.clone()), parse_import_flag(flag));
-                }
-                _ => {
-                    // Too many tokens even with quoting — fall through
-                    // to the whitespace path, which at least handles
-                    // "path --flag" correctly.
-                }
-            }
+    // Quoted path: take the literal substring up to the matching
+    // closing quote. No escape processing, so backslashes survive.
+    if let Some(quote) = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        let rest = &trimmed[1..];
+        if let Some(end) = rest.find(quote) {
+            let path = &rest[..end];
+            let tail = rest[end + 1..].trim();
+            let strategy = if tail.is_empty() {
+                Ok(crate::config::ImportConflict::Rename)
+            } else {
+                parse_import_flag(tail)
+            };
+            return (Some(path.to_string()), strategy);
         }
+        // Unterminated quote — fall through to whitespace handling.
     }
 
     // No quoting — treat the input as `path [--flag]` where only the
@@ -10962,6 +10959,26 @@ mod tests {
     fn test_parse_import_args_empty() {
         let (path, _) = parse_import_args("   ");
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_parse_import_args_quoted_windows_path_preserves_backslashes() {
+        // Regression: routing any quoted input through POSIX `shlex`
+        // silently stripped backslashes, so a user who quoted a Windows
+        // path to handle its spaces still got
+        // `C:UsersmeMy Connections.toml` back. Now the quoted branch
+        // does no escape processing.
+        let (path, strategy) = parse_import_args(r#""C:\Users\me\My Connections.toml" --rename"#);
+        assert_eq!(
+            path.as_deref(),
+            Some(r"C:\Users\me\My Connections.toml"),
+            "backslashes inside double quotes must be preserved verbatim"
+        );
+        assert_eq!(strategy.unwrap(), crate::config::ImportConflict::Rename);
+
+        // Single-quoted variant.
+        let (path, _) = parse_import_args(r#"'D:\data\imports\out.toml'"#);
+        assert_eq!(path.as_deref(), Some(r"D:\data\imports\out.toml"));
     }
 
     #[test]
