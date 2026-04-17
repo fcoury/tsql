@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use tsql::app::App;
-use tsql::config::{self, load_connections};
+use tsql::config;
 use tsql::session::load_session;
 use tsql::ui::GridModel;
 
@@ -189,29 +189,6 @@ fn onepassword_cli_available() -> bool {
         .unwrap_or(false)
 }
 
-fn onepassword_startup_warning(onepassword_enabled: bool) -> Option<String> {
-    if !onepassword_enabled {
-        return None;
-    }
-
-    if !cfg!(unix) {
-        return Some(
-            "1Password support is currently available only on Unix-like systems (Linux/macOS). \
-             Disable `connection.enable_onepassword` on this platform."
-                .to_string(),
-        );
-    }
-
-    if !onepassword_cli_available() {
-        return Some(
-            "1Password support is enabled, but `op` was not found on PATH. Install/sign in via \
-             1Password CLI or disable `connection.enable_onepassword`."
-                .to_string(),
-        );
-    }
-    None
-}
-
 fn main() -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -240,16 +217,26 @@ fn main() -> Result<()> {
         return run_debug_keys(debug_mouse);
     }
 
+    // --safe-mode: skip session auto-reconnect, update checks, and the
+    // 1Password CLI probe. Exists so a user with a broken keychain /
+    // unreachable network can always recover the app with
+    // `tsql --safe-mode`.
+    let safe_mode = args
+        .iter()
+        .any(|a| a == "--safe-mode" || a == "--no-auto-connect");
+
+    let mut startup_warnings: Vec<String> = Vec::new();
+
     if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
-        eprintln!(
-            "Warning: Failed to migrate legacy config directory to ~/.tsql: {}",
+        startup_warnings.push(format!(
+            "Failed to migrate legacy config directory to ~/.tsql: {}",
             err
-        );
+        ));
     }
 
     // Load configuration from ~/.tsql/config.toml
     let cfg = config::load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config: {}", e);
+        startup_warnings.push(format!("Failed to load config: {}", e));
         config::Config::default()
     });
     let onepassword_enabled = cfg.connection.enable_onepassword;
@@ -257,7 +244,7 @@ fn main() -> Result<()> {
     // Load session state if persistence is enabled
     let session = if cfg.editor.persist_session {
         load_session().unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to load session: {}", e);
+            startup_warnings.push(format!("Failed to load session: {}", e));
             Default::default()
         })
     } else {
@@ -291,54 +278,45 @@ fn main() -> Result<()> {
         conn_str.clone(),
         cfg,
     );
+    app.set_safe_mode(safe_mode);
 
-    // Display startup warnings.
+    // Display startup warnings through the status line instead of
+    // `eprintln!` — anything printed to stderr after we enter raw mode /
+    // alt-screen would clobber the TUI on macOS Terminal.
     if let Some(warning) = libpq_warning {
-        app.last_status = Some(warning);
+        startup_warnings.push(warning);
     }
-    if let Some(warning) = onepassword_startup_warning(onepassword_enabled) {
-        app.last_status = Some(match app.last_status.take() {
-            Some(existing) => format!("{} | {}", existing, warning),
-            None => warning,
-        });
+    // The 1Password CLI probe shells out to `op --version`; run it on a
+    // background thread with a hard timeout so a wedged `op` never stalls
+    // startup, and gate it behind safe_mode.
+    if !safe_mode {
+        if let Some(warning) = onepassword_startup_warning_nonblocking(onepassword_enabled) {
+            startup_warnings.push(warning);
+        }
+    }
+    if safe_mode {
+        startup_warnings.push(
+            "Running in safe mode: session auto-reconnect + update checks disabled".to_string(),
+        );
+    }
+    if !startup_warnings.is_empty() {
+        app.last_status = Some(startup_warnings.join(" | "));
     }
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
     let session_connection = app.apply_session_state(session);
 
-    // Auto-connect from session if no CLI/env connection was specified
-    let mut session_reconnected = false;
-    if conn_str.is_none() {
+    // Queue the session auto-reconnect if one is configured. `App::run`
+    // dispatches it AFTER the first draw — so the user never sees an empty
+    // alt-screen while keychain / 1Password resolves.
+    if conn_str.is_none() && !safe_mode {
         if let Some(conn_name) = session_connection {
-            // Verify connection still exists
-            let connections = load_connections().unwrap_or_default();
-            if let Some(entry) = connections.find_by_name(&conn_name) {
-                // Check if password is available (not requiring prompt)
-                let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
-                    5000
-                } else {
-                    500
-                };
-                match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
-                    Ok(Some(_)) | Ok(None) => {
-                        // Password available or not needed - auto-connect
-                        app.connect_to_entry(entry.clone());
-                        session_reconnected = true;
-                    }
-                    Err(_) => {
-                        // Password retrieval failed - skip auto-connect
-                        // User can manually connect
-                    }
-                }
-            }
-            // If connection doesn't exist, silently skip auto-connect
-        }
-
-        // Only open connection picker if no connection was established
-        // (no CLI/env URL and no session reconnection)
-        if !session_reconnected {
+            app.set_pending_startup_reconnect(Some(conn_name));
+        } else {
             app.open_connection_picker();
         }
+    } else if conn_str.is_none() && safe_mode {
+        app.open_connection_picker();
     }
 
     let res = app.run(&mut terminal);
@@ -346,6 +324,43 @@ fn main() -> Result<()> {
     restore_terminal(terminal)?;
 
     res
+}
+
+/// Non-blocking wrapper around `onepassword_startup_warning`. Returns a
+/// warning on a ~750ms timeout if `op --version` never returns — that way
+/// a broken `op` install can never wedge the app at startup.
+fn onepassword_startup_warning_nonblocking(onepassword_enabled: bool) -> Option<String> {
+    if !onepassword_enabled {
+        return None;
+    }
+    if !cfg!(unix) {
+        return Some(
+            "1Password support is currently available only on Unix-like systems (Linux/macOS). \
+             Disable `connection.enable_onepassword` on this platform."
+                .to_string(),
+        );
+    }
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = onepassword_cli_available();
+        let _ = tx.send(ok);
+    });
+    match rx.recv_timeout(Duration::from_millis(750)) {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "1Password support is enabled, but `op` was not found on PATH. Install/sign in via \
+             1Password CLI or disable `connection.enable_onepassword`."
+                .to_string(),
+        ),
+        Err(_) => Some(
+            "1Password CLI probe timed out. Credentials may be slow to resolve — \
+             use `tsql --safe-mode` to bypass."
+                .to_string(),
+        ),
+    }
 }
 
 fn run_debug_keys(with_mouse: bool) -> Result<()> {

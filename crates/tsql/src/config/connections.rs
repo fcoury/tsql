@@ -7,8 +7,10 @@
 //! - Connection entry validation
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use url::Url;
 
 /// Service name for keyring storage
@@ -215,6 +217,59 @@ pub struct ConnectionEntry {
     /// SSL mode (for Phase 7)
     #[serde(default)]
     pub ssl_mode: Option<SslMode>,
+
+    // --- v2 metadata fields (all serde(default) for backward compatibility) ---
+    /// Free-form description shown in the manager detail pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// User-provided tags used for filtering / grouping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Optional folder / group label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+
+    /// Postgres application_name connection parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+
+    /// Per-connection override for `config.connection.connect_timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// PG sslrootcert path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_root_cert: Option<PathBuf>,
+
+    /// PG sslcert path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_client_cert: Option<PathBuf>,
+
+    /// PG sslkey path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_client_key: Option<PathBuf>,
+
+    /// Timestamp of the last successful connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+
+    /// Number of successful connects using this entry.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub use_count: u64,
+
+    /// Manual ordering offset for non-favorite entries (smaller = higher).
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub order: i32,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 fn default_port() -> u16 {
@@ -239,6 +294,17 @@ impl Default for ConnectionEntry {
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: None,
+            description: None,
+            tags: Vec::new(),
+            folder: None,
+            application_name: None,
+            connect_timeout_secs: None,
+            ssl_root_cert: None,
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            last_used_at: None,
+            use_count: 0,
+            order: 0,
         }
     }
 }
@@ -389,6 +455,7 @@ impl ConnectionEntry {
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode,
+            ..Default::default()
         };
 
         Ok((entry, password))
@@ -607,6 +674,77 @@ impl ConnectionEntry {
                 Ok(None)
             }
         }
+    }
+
+    /// Human-friendly label for the password source.
+    pub fn password_source_label(&self) -> &'static str {
+        if self.no_password_required {
+            "none required"
+        } else if self.password_in_keychain {
+            "keychain"
+        } else if self.password_env.is_some() {
+            "env var"
+        } else if self.password_onepassword.is_some() {
+            "1Password"
+        } else {
+            "prompt"
+        }
+    }
+
+    /// Short relative-time description for `last_used_at` (e.g. "2m ago").
+    pub fn last_used_label(&self) -> String {
+        match self.last_used_at {
+            None => "never".to_string(),
+            Some(ts) => {
+                let now = Utc::now();
+                let delta = now.signed_duration_since(ts);
+                let secs = delta.num_seconds();
+                if secs < 0 {
+                    return "just now".to_string();
+                }
+                if secs < 60 {
+                    return format!("{}s ago", secs);
+                }
+                let mins = secs / 60;
+                if mins < 60 {
+                    return format!("{}m ago", mins);
+                }
+                let hours = mins / 60;
+                if hours < 24 {
+                    return format!("{}h ago", hours);
+                }
+                let days = hours / 24;
+                if days < 30 {
+                    return format!("{}d ago", days);
+                }
+                ts.format("%Y-%m-%d").to_string()
+            }
+        }
+    }
+
+    /// Sanitised `tsql <url>` CLI form for yanking to clipboard.
+    pub fn to_cli_command(&self) -> String {
+        let url = self.to_url(None);
+        format!("tsql {}", url)
+    }
+
+    /// Parse and normalise a comma-separated tag string. Whitespace trimmed;
+    /// empty tags dropped; duplicates collapsed preserving order.
+    pub fn parse_tags(input: &str) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        input
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                let t = s.to_string();
+                if seen.insert(t.clone()) {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Format connection for display (without password)
@@ -885,15 +1023,191 @@ impl ConnectionsFile {
 
     /// Get connections sorted by favorite first, then alphabetically
     pub fn sorted(&self) -> Vec<&ConnectionEntry> {
+        self.sorted_by(SortMode::FavoritesAlpha)
+    }
+
+    /// Get connections sorted by the given mode.
+    pub fn sorted_by(&self, mode: SortMode) -> Vec<&ConnectionEntry> {
         let mut sorted: Vec<_> = self.connections.iter().collect();
-        sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
-            (Some(fa), Some(fb)) => fa.cmp(&fb),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        });
+        match mode {
+            SortMode::FavoritesAlpha => {
+                sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
+                    (Some(fa), Some(fb)) => fa.cmp(&fb),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a
+                        .order
+                        .cmp(&b.order)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                });
+            }
+            SortMode::Recent => {
+                sorted.sort_by(|a, b| {
+                    b.last_used_at
+                        .cmp(&a.last_used_at)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+            SortMode::MostUsed => {
+                sorted.sort_by(|a, b| {
+                    b.use_count
+                        .cmp(&a.use_count)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+            SortMode::Alpha => {
+                sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            SortMode::Folder => {
+                sorted.sort_by(|a, b| {
+                    let fa = a.folder.as_deref().unwrap_or("~");
+                    let fb = b.folder.as_deref().unwrap_or("~");
+                    fa.to_lowercase()
+                        .cmp(&fb.to_lowercase())
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+        }
         sorted
     }
+
+    /// Touch an entry to record a successful use. Returns whether the entry
+    /// was found. Caller should persist via `save_connections_debounced`.
+    pub fn touch_use(&mut self, name: &str) -> bool {
+        if let Some(entry) = self.find_by_name_mut(name) {
+            entry.last_used_at = Some(Utc::now());
+            entry.use_count = entry.use_count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return all distinct folder labels in insertion order.
+    pub fn folders(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for c in &self.connections {
+            if let Some(f) = c.folder.as_deref() {
+                let f = f.to_string();
+                if seen.insert(f.clone()) {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Return all distinct tag labels across entries.
+    pub fn all_tags(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for c in &self.connections {
+            for t in &c.tags {
+                if seen.insert(t.clone()) {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Filter entries by a lowercase needle across name / host / database /
+    /// tags / description / folder. Empty needle returns all.
+    pub fn filtered(&self, needle: &str) -> Vec<&ConnectionEntry> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.connections.iter().collect();
+        }
+        self.connections
+            .iter()
+            .filter(|c| entry_matches(c, &needle))
+            .collect()
+    }
+}
+
+fn entry_matches(c: &ConnectionEntry, needle_lc: &str) -> bool {
+    if c.name.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.host.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.database.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.user.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if let Some(f) = &c.folder {
+        if f.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    if let Some(d) = &c.description {
+        if d.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    for t in &c.tags {
+        if t.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sort modes available in the connection manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Favorites first (by slot), then manual order, then alphabetical.
+    #[default]
+    FavoritesAlpha,
+    /// Most recently used first.
+    Recent,
+    /// Highest use_count first.
+    MostUsed,
+    /// Pure alphabetical order by name.
+    Alpha,
+    /// Grouped by folder, then alphabetical.
+    Folder,
+}
+
+impl SortMode {
+    /// Short label shown in UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::FavoritesAlpha => "favorites",
+            SortMode::Recent => "recent",
+            SortMode::MostUsed => "most used",
+            SortMode::Alpha => "alpha",
+            SortMode::Folder => "folder",
+        }
+    }
+
+    /// Cycle to the next sort mode.
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::FavoritesAlpha => SortMode::Recent,
+            SortMode::Recent => SortMode::MostUsed,
+            SortMode::MostUsed => SortMode::Alpha,
+            SortMode::Alpha => SortMode::Folder,
+            SortMode::Folder => SortMode::FavoritesAlpha,
+        }
+    }
+}
+
+/// Conflict-resolution strategy when importing an entry whose name already
+/// exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportConflict {
+    /// Skip the incoming entry.
+    Skip,
+    /// Overwrite the existing entry in place.
+    Overwrite,
+    /// Rename the incoming entry by appending " (imported)".
+    Rename,
 }
 
 /// Returns the connections file path (inside `config_dir()`).
@@ -915,11 +1229,16 @@ pub fn load_connections() -> Result<ConnectionsFile> {
     Ok(ConnectionsFile::new())
 }
 
-/// Save connections to the default path
+/// Save connections to the default path (atomic: writes to a tmp file and
+/// renames into place so a crash mid-write cannot corrupt the store).
 pub fn save_connections(file: &ConnectionsFile) -> Result<()> {
     let path = connections_path().ok_or_else(|| anyhow!("Could not determine config directory"))?;
+    write_connections_atomic(&path, file)
+}
 
-    // Ensure parent directory exists
+/// Write a `ConnectionsFile` to a specific path atomically. Public so tests
+/// and import/export can reuse the write path.
+pub fn write_connections_atomic(path: &Path, file: &ConnectionsFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
@@ -927,10 +1246,113 @@ pub fn save_connections(file: &ConnectionsFile) -> Result<()> {
 
     let content = toml::to_string_pretty(file).context("Failed to serialize connections")?;
 
-    std::fs::write(&path, content)
-        .with_context(|| format!("Failed to write connections file: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create tempfile in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())
+        .context("Failed to write connections temp file")?;
+    tmp.as_file()
+        .sync_all()
+        .context("Failed to fsync connections temp file")?;
+    tmp.persist(path)
+        .map_err(|e| anyhow!("Failed to rename temp file into place: {}", e))?;
 
     Ok(())
+}
+
+/// Export a subset of entries to a TOML file at the given path (atomic).
+pub fn export_to_path(path: &Path, entries: Vec<ConnectionEntry>) -> Result<()> {
+    let file = ConnectionsFile {
+        connections: entries,
+    };
+    write_connections_atomic(path, &file)
+}
+
+/// Summary returned from an import operation.
+#[derive(Debug, Default, Clone)]
+pub struct ImportSummary {
+    pub imported: usize,
+    pub renamed: usize,
+    pub overwritten: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Import connections from a TOML file at `path`, merging into `target`
+/// using the given conflict strategy. Does NOT persist — caller must call
+/// `save_connections` afterwards.
+pub fn import_from_path(
+    target: &mut ConnectionsFile,
+    path: &Path,
+    strategy: ImportConflict,
+) -> Result<ImportSummary> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+    let incoming: ConnectionsFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse import file: {}", path.display()))?;
+
+    let mut summary = ImportSummary::default();
+
+    for mut entry in incoming.connections.into_iter() {
+        // Drop favorite slot to avoid collisions on import; the user can
+        // reassign after review.
+        entry.favorite = None;
+
+        if entry.validate().is_err() {
+            summary
+                .errors
+                .push(format!("Skipped invalid entry '{}'", entry.name));
+            summary.skipped += 1;
+            continue;
+        }
+
+        if target.find_by_name(&entry.name).is_some() {
+            match strategy {
+                ImportConflict::Skip => {
+                    summary.skipped += 1;
+                    continue;
+                }
+                ImportConflict::Overwrite => {
+                    let name = entry.name.clone();
+                    match target.update(&name, entry) {
+                        Ok(()) => summary.overwritten += 1,
+                        Err(e) => {
+                            summary.errors.push(format!("{}: {}", name, e));
+                            summary.skipped += 1;
+                        }
+                    }
+                }
+                ImportConflict::Rename => {
+                    // Must not contain whitespace (connection names are
+                    // validated against that), so we use '-' separators.
+                    let mut candidate = format!("{}-imported", entry.name);
+                    let mut n = 2;
+                    while target.find_by_name(&candidate).is_some() {
+                        candidate = format!("{}-imported-{}", entry.name, n);
+                        n += 1;
+                    }
+                    entry.name = candidate;
+                    match target.add(entry) {
+                        Ok(()) => summary.renamed += 1,
+                        Err(e) => {
+                            summary.errors.push(e.to_string());
+                            summary.skipped += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            match target.add(entry) {
+                Ok(()) => summary.imported += 1,
+                Err(e) => {
+                    summary.errors.push(e.to_string());
+                    summary.skipped += 1;
+                }
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -946,6 +1368,198 @@ mod tests {
         assert_eq!(entry.color, ConnectionColor::None);
         assert!(entry.favorite.is_none());
         assert!(entry.ssl_mode.is_none());
+        assert!(entry.description.is_none());
+        assert!(entry.tags.is_empty());
+        assert!(entry.folder.is_none());
+        assert_eq!(entry.use_count, 0);
+        assert!(entry.last_used_at.is_none());
+        assert_eq!(entry.order, 0);
+    }
+
+    #[test]
+    fn test_metadata_fields_round_trip_via_toml() {
+        let mut entry = ConnectionEntry::new("prod-db");
+        entry.host = "db.internal".to_string();
+        entry.database = "main".to_string();
+        entry.user = "app".to_string();
+        entry.description = Some("Production — be careful".to_string());
+        entry.tags = vec!["prod".to_string(), "critical".to_string()];
+        entry.folder = Some("Production".to_string());
+        entry.application_name = Some("tsql-cli".to_string());
+        entry.connect_timeout_secs = Some(15);
+        entry.use_count = 42;
+        let mut file = ConnectionsFile::new();
+        file.add(entry.clone()).unwrap();
+        let toml_str = toml::to_string_pretty(&file).unwrap();
+        let reparsed: ConnectionsFile = toml::from_str(&toml_str).unwrap();
+        let got = reparsed.find_by_name("prod-db").unwrap();
+        assert_eq!(got.description.as_deref(), Some("Production — be careful"));
+        assert_eq!(got.tags, vec!["prod", "critical"]);
+        assert_eq!(got.folder.as_deref(), Some("Production"));
+        assert_eq!(got.application_name.as_deref(), Some("tsql-cli"));
+        assert_eq!(got.connect_timeout_secs, Some(15));
+        assert_eq!(got.use_count, 42);
+    }
+
+    #[test]
+    fn test_legacy_toml_loads_with_defaults_for_new_fields() {
+        // Simulates an existing connections.toml written before v2.
+        let toml_str = r#"
+[[connection]]
+kind = "postgres"
+name = "old"
+host = "localhost"
+port = 5432
+database = "db"
+user = "me"
+"#;
+        let parsed: ConnectionsFile = toml::from_str(toml_str).unwrap();
+        let entry = parsed.find_by_name("old").unwrap();
+        assert!(entry.description.is_none());
+        assert!(entry.tags.is_empty());
+        assert_eq!(entry.use_count, 0);
+    }
+
+    #[test]
+    fn test_parse_tags_trims_dedupes_and_drops_empty() {
+        let got = ConnectionEntry::parse_tags(" prod ,  , staging, prod, ");
+        assert_eq!(got, vec!["prod".to_string(), "staging".to_string()]);
+    }
+
+    #[test]
+    fn test_touch_use_bumps_counter_and_timestamp() {
+        let mut file = ConnectionsFile::new();
+        let entry = ConnectionEntry {
+            name: "x".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        file.add(entry).unwrap();
+        assert!(file.touch_use("x"));
+        assert_eq!(file.find_by_name("x").unwrap().use_count, 1);
+        assert!(file.find_by_name("x").unwrap().last_used_at.is_some());
+        assert!(file.touch_use("x"));
+        assert_eq!(file.find_by_name("x").unwrap().use_count, 2);
+        assert!(!file.touch_use("missing"));
+    }
+
+    #[test]
+    fn test_sort_modes_differ() {
+        let mut file = ConnectionsFile::new();
+        let mut a = ConnectionEntry::new("alpha");
+        a.host = "h".into();
+        a.database = "d".into();
+        a.user = "u".into();
+        a.use_count = 1;
+        let mut b = ConnectionEntry::new("bravo");
+        b.host = "h".into();
+        b.database = "d".into();
+        b.user = "u".into();
+        b.use_count = 10;
+        b.last_used_at = Some(Utc::now());
+        file.add(a).unwrap();
+        file.add(b).unwrap();
+
+        let by_alpha: Vec<&str> = file
+            .sorted_by(SortMode::Alpha)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_alpha, vec!["alpha", "bravo"]);
+
+        let by_most_used: Vec<&str> = file
+            .sorted_by(SortMode::MostUsed)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_most_used, vec!["bravo", "alpha"]);
+
+        let by_recent: Vec<&str> = file
+            .sorted_by(SortMode::Recent)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_recent, vec!["bravo", "alpha"]);
+
+        assert_eq!(SortMode::FavoritesAlpha.next(), SortMode::Recent);
+    }
+
+    #[test]
+    fn test_filtered_matches_across_fields() {
+        let mut file = ConnectionsFile::new();
+        let mut a = ConnectionEntry::new("alpha");
+        a.host = "prod-host".into();
+        a.database = "sales".into();
+        a.user = "u".into();
+        a.tags = vec!["prod".into()];
+        a.description = Some("Main read replica".into());
+        let mut b = ConnectionEntry::new("bravo");
+        b.host = "staging".into();
+        b.database = "sandbox".into();
+        b.user = "u".into();
+        b.folder = Some("Staging".into());
+        file.add(a).unwrap();
+        file.add(b).unwrap();
+
+        let hits: Vec<&str> = file
+            .filtered("prod")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["alpha"]);
+
+        let hits: Vec<&str> = file
+            .filtered("Staging")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["bravo"]);
+
+        let hits: Vec<&str> = file
+            .filtered("")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn test_atomic_write_and_import_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+
+        let mut file = ConnectionsFile::new();
+        let entry = ConnectionEntry {
+            name: "alpha".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            tags: vec!["prod".to_string()],
+            ..Default::default()
+        };
+        file.add(entry).unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        assert!(path.exists());
+
+        // Import into a fresh file: should come in clean.
+        let mut target = ConnectionsFile::new();
+        let summary = import_from_path(&mut target, &path, ImportConflict::Rename).unwrap();
+        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.renamed, 0);
+        assert_eq!(target.find_by_name("alpha").unwrap().tags, vec!["prod"]);
+
+        // Re-import into same target with Rename strategy: should
+        // produce a renamed copy.
+        let summary2 = import_from_path(&mut target, &path, ImportConflict::Rename).unwrap();
+        assert_eq!(summary2.renamed, 1);
+        assert!(target.find_by_name("alpha-imported").is_some());
+
+        // Skip strategy: no-op on collision.
+        let summary3 = import_from_path(&mut target, &path, ImportConflict::Skip).unwrap();
+        assert_eq!(summary3.skipped, 1);
+        assert_eq!(summary3.imported, 0);
     }
 
     #[test]

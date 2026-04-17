@@ -33,11 +33,17 @@ pub enum FormField {
     SslMode,
     Color,
     UrlPaste,
+    Description,
+    Tags,
+    Folder,
+    AppName,
+    ConnectTimeout,
 }
 
 impl FormField {
-    /// Get the next field in tab order
-    /// Order: Name → Kind → User → Password → OnePasswordRef → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
+    /// Get the next field in tab order. New metadata fields live at the
+    /// end of the form so they never disrupt muscle memory for the
+    /// pre-existing core fields.
     pub fn next(self) -> Self {
         match self {
             FormField::Name => FormField::Kind,
@@ -50,7 +56,12 @@ impl FormField {
             FormField::Host => FormField::Port,
             FormField::Port => FormField::Database,
             FormField::Database => FormField::Color,
-            FormField::Color => FormField::UrlPaste,
+            FormField::Color => FormField::Folder,
+            FormField::Folder => FormField::Tags,
+            FormField::Tags => FormField::Description,
+            FormField::Description => FormField::AppName,
+            FormField::AppName => FormField::ConnectTimeout,
+            FormField::ConnectTimeout => FormField::UrlPaste,
             FormField::UrlPaste => FormField::Name,
         }
     }
@@ -69,7 +80,12 @@ impl FormField {
             FormField::Port => FormField::Host,
             FormField::Database => FormField::Port,
             FormField::Color => FormField::Database,
-            FormField::UrlPaste => FormField::Color,
+            FormField::Folder => FormField::Color,
+            FormField::Tags => FormField::Folder,
+            FormField::Description => FormField::Tags,
+            FormField::AppName => FormField::Description,
+            FormField::ConnectTimeout => FormField::AppName,
+            FormField::UrlPaste => FormField::ConnectTimeout,
         }
     }
 }
@@ -122,6 +138,18 @@ pub struct ConnectionFormModal {
     color: ConnectionColor,
     url_paste: String,
 
+    // --- v2 metadata fields ---
+    /// Free-form description.
+    description: String,
+    /// Comma-separated tag input.
+    tags_input: String,
+    /// Folder / group label.
+    folder: String,
+    /// Postgres application_name override.
+    application_name: String,
+    /// Per-connection connect timeout (seconds as a string for editing).
+    connect_timeout_secs: String,
+
     /// Cursor positions for each text field
     name_cursor: usize,
     host_cursor: usize,
@@ -131,6 +159,11 @@ pub struct ConnectionFormModal {
     password_cursor: usize,
     op_ref_cursor: usize,
     url_paste_cursor: usize,
+    description_cursor: usize,
+    tags_input_cursor: usize,
+    folder_cursor: usize,
+    application_name_cursor: usize,
+    connect_timeout_cursor: usize,
 
     /// Currently focused field
     focused: FormField,
@@ -160,6 +193,9 @@ pub struct ConnectionFormModal {
     keymap: Keymap,
     /// Whether the 1Password reference field is enabled in the UI.
     onepassword_enabled: bool,
+    /// Set to `true` once the Issue #16 "password will be forgotten"
+    /// warning has fired, so a second save goes through without nagging.
+    password_persist_acknowledged: bool,
 }
 
 /// Original form values for tracking modifications
@@ -207,6 +243,12 @@ impl ConnectionFormModal {
             color: ConnectionColor::None,
             url_paste: String::new(),
 
+            description: String::new(),
+            tags_input: String::new(),
+            folder: String::new(),
+            application_name: String::new(),
+            connect_timeout_secs: String::new(),
+
             name_cursor: 0,
             host_cursor: 9, // "localhost".len()
             port_cursor: 4, // "5432".len()
@@ -215,6 +257,11 @@ impl ConnectionFormModal {
             password_cursor: 0,
             op_ref_cursor: 0,
             url_paste_cursor: 0,
+            description_cursor: 0,
+            tags_input_cursor: 0,
+            folder_cursor: 0,
+            application_name_cursor: 0,
+            connect_timeout_cursor: 0,
 
             focused: FormField::Name,
             color_index: 0,
@@ -226,6 +273,7 @@ impl ConnectionFormModal {
             original_values: None,
             keymap,
             onepassword_enabled,
+            password_persist_acknowledged: false,
         }
     }
 
@@ -279,6 +327,20 @@ impl ConnectionFormModal {
         let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
         let ssl_mode_index = ssl_mode.to_index();
 
+        let description = entry.description.clone().unwrap_or_default();
+        let tags_input = entry.tags.join(", ");
+        let folder = entry.folder.clone().unwrap_or_default();
+        let application_name = entry.application_name.clone().unwrap_or_default();
+        let connect_timeout_secs = entry
+            .connect_timeout_secs
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let description_cursor = description.chars().count();
+        let tags_input_cursor = tags_input.chars().count();
+        let folder_cursor = folder.chars().count();
+        let application_name_cursor = application_name.chars().count();
+        let connect_timeout_cursor = connect_timeout_secs.chars().count();
+
         Self {
             name: entry.name.clone(),
             kind: entry.kind,
@@ -294,6 +356,12 @@ impl ConnectionFormModal {
             color: entry.color,
             url_paste: String::new(),
 
+            description,
+            tags_input,
+            folder,
+            application_name,
+            connect_timeout_secs,
+
             name_cursor: entry.name.chars().count(),
             host_cursor: entry.host.chars().count(),
             port_cursor: entry.port.to_string().chars().count(),
@@ -302,6 +370,11 @@ impl ConnectionFormModal {
             password_cursor: password.chars().count(),
             op_ref_cursor: op_ref.chars().count(),
             url_paste_cursor: 0,
+            description_cursor,
+            tags_input_cursor,
+            folder_cursor,
+            application_name_cursor,
+            connect_timeout_cursor,
 
             focused: FormField::Name,
             color_index,
@@ -313,6 +386,9 @@ impl ConnectionFormModal {
             original_values: Some(original_values),
             keymap,
             onepassword_enabled,
+            // Editing an existing entry: don't warn — the user's prior
+            // choice is already committed to disk.
+            password_persist_acknowledged: true,
         }
     }
 
@@ -333,7 +409,12 @@ impl ConnectionFormModal {
                 || !self.database.is_empty()
                 || self.host != "localhost"
                 || self.port != "5432"
-                || self.ssl_mode != SslMode::Disable;
+                || self.ssl_mode != SslMode::Disable
+                || !self.description.is_empty()
+                || !self.tags_input.is_empty()
+                || !self.folder.is_empty()
+                || !self.application_name.is_empty()
+                || !self.connect_timeout_secs.is_empty();
         }
 
         // For editing, compare with original values
@@ -566,6 +647,17 @@ impl ConnectionFormModal {
             FormField::Password => Some((&mut self.password, &mut self.password_cursor)),
             FormField::OnePasswordRef => Some((&mut self.op_ref, &mut self.op_ref_cursor)),
             FormField::UrlPaste => Some((&mut self.url_paste, &mut self.url_paste_cursor)),
+            FormField::Description => Some((&mut self.description, &mut self.description_cursor)),
+            FormField::Tags => Some((&mut self.tags_input, &mut self.tags_input_cursor)),
+            FormField::Folder => Some((&mut self.folder, &mut self.folder_cursor)),
+            FormField::AppName => Some((
+                &mut self.application_name,
+                &mut self.application_name_cursor,
+            )),
+            FormField::ConnectTimeout => Some((
+                &mut self.connect_timeout_secs,
+                &mut self.connect_timeout_cursor,
+            )),
             FormField::Kind | FormField::SavePassword | FormField::SslMode | FormField::Color => {
                 None
             }
@@ -583,8 +675,10 @@ impl ConnectionFormModal {
     }
 
     fn insert_char(&mut self, c: char) {
-        // For port field, only allow digits
-        if self.focused == FormField::Port && !c.is_ascii_digit() {
+        // For port / timeout fields, only allow digits
+        if (self.focused == FormField::Port || self.focused == FormField::ConnectTimeout)
+            && !c.is_ascii_digit()
+        {
             return;
         }
 
@@ -784,6 +878,29 @@ impl ConnectionFormModal {
                         SslMode::Disable => None,
                         other => Some(other),
                     },
+                    description: if self.description.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.description.trim().to_string())
+                    },
+                    tags: ConnectionEntry::parse_tags(&self.tags_input),
+                    folder: if self.folder.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.folder.trim().to_string())
+                    },
+                    application_name: if self.application_name.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.application_name.trim().to_string())
+                    },
+                    connect_timeout_secs: self
+                        .connect_timeout_secs
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|v| *v > 0),
+                    ..Default::default()
                 }
             }
             DbKind::Mongo => ConnectionEntry {
@@ -809,6 +926,25 @@ impl ConnectionFormModal {
                 color: self.color,
                 favorite: None,
                 ssl_mode: None,
+                description: if self.description.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.description.trim().to_string())
+                },
+                tags: ConnectionEntry::parse_tags(&self.tags_input),
+                folder: if self.folder.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.folder.trim().to_string())
+                },
+                application_name: None,
+                connect_timeout_secs: self
+                    .connect_timeout_secs
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v > 0),
+                ..Default::default()
             },
         }
     }
@@ -897,6 +1033,24 @@ impl ConnectionFormModal {
             };
         }
 
+        // --- Issue #16 UX guard ---
+        // If the user typed a non-empty password but hasn't selected any
+        // persistence mechanism, warn them in-place. Auto-flip the
+        // keychain checkbox on the first save attempt so well-intentioned
+        // users don't silently lose their credential. A second save
+        // attempt proceeds regardless (respecting whatever the user does
+        // after seeing the warning).
+        let has_persistence = self.save_password || !self.op_ref.trim().is_empty();
+        if !self.password.is_empty() && !has_persistence && !self.password_persist_acknowledged {
+            self.save_password = true;
+            self.password_persist_acknowledged = true;
+            self.focused = FormField::SavePassword;
+            return ConnectionFormAction::StatusMessage(
+                "Password won't be remembered unless saved. Enabled [Save to keychain] — save again to confirm, or uncheck to discard."
+                    .to_string(),
+            );
+        }
+
         let entry = self.build_entry(self.name.clone(), None);
 
         let password = if self.password.is_empty() {
@@ -963,11 +1117,12 @@ impl ConnectionFormModal {
 
     /// Render the connection form modal.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        // Calculate modal size
-        let modal_width = 60u16.min(area.width - 4);
-        let modal_height = 21u16.min(area.height - 2);
-        let modal_x = (area.width - modal_width) / 2;
-        let modal_y = (area.height - modal_height) / 2;
+        // Calculate modal size. Taller now that we have metadata fields
+        // below the core form.
+        let modal_width = 72u16.min(area.width.saturating_sub(4));
+        let modal_height = 28u16.min(area.height.saturating_sub(2));
+        let modal_x = area.width.saturating_sub(modal_width) / 2;
+        let modal_y = area.height.saturating_sub(modal_height) / 2;
 
         let modal_area = Rect {
             x: modal_x,
@@ -1013,6 +1168,11 @@ impl ConnectionFormModal {
             Constraint::Length(1), // Database
             Constraint::Length(1), // Separator
             Constraint::Length(1), // Color
+            Constraint::Length(1), // Folder
+            Constraint::Length(1), // Tags
+            Constraint::Length(1), // Description
+            Constraint::Length(1), // AppName
+            Constraint::Length(1), // Connect timeout
             Constraint::Length(1), // URL paste
             Constraint::Length(1), // Separator
             Constraint::Length(1), // Help line
@@ -1097,6 +1257,51 @@ impl ConnectionFormModal {
         self.render_separator(frame, chunks[i]);
         i += 1;
         self.render_color_field(frame, chunks[i]);
+        i += 1;
+        self.render_text_field(
+            frame,
+            chunks[i],
+            "Folder:",
+            &self.folder,
+            self.folder_cursor,
+            FormField::Folder,
+        );
+        i += 1;
+        self.render_text_field(
+            frame,
+            chunks[i],
+            "Tags:",
+            &self.tags_input,
+            self.tags_input_cursor,
+            FormField::Tags,
+        );
+        i += 1;
+        self.render_text_field(
+            frame,
+            chunks[i],
+            "Notes:",
+            &self.description,
+            self.description_cursor,
+            FormField::Description,
+        );
+        i += 1;
+        self.render_text_field(
+            frame,
+            chunks[i],
+            "App:",
+            &self.application_name,
+            self.application_name_cursor,
+            FormField::AppName,
+        );
+        i += 1;
+        self.render_text_field(
+            frame,
+            chunks[i],
+            "Timeout:",
+            &self.connect_timeout_secs,
+            self.connect_timeout_cursor,
+            FormField::ConnectTimeout,
+        );
         i += 1;
         self.render_url_paste_field(frame, chunks[i]);
         i += 1;

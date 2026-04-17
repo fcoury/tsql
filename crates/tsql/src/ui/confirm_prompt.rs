@@ -46,8 +46,10 @@ pub enum ConfirmContext {
     DeleteConnection { name: String },
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
-    /// Switching to a new connection with unsaved query changes.
-    SwitchConnection { entry: ConnectionEntry },
+    /// Switching to a new connection with unsaved query changes. Boxed
+    /// because `ConnectionEntry` is large and `ConfirmContext` is used
+    /// on the heap-ish path of confirm prompts.
+    SwitchConnection { entry: Box<ConnectionEntry> },
     /// Applying an in-app binary update.
     ApplyUpdate { info: UpdateInfo },
 }

@@ -7,17 +7,17 @@
 //! - Visual indicators for connected state and favorites
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    ScrollbarState, Wrap,
 };
 use ratatui::Frame;
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
-use crate::config::{ConnectionEntry, ConnectionsFile};
+use crate::config::{ConnectionEntry, ConnectionsFile, SortMode};
 
 /// Result of handling a key event in the connection manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,15 +50,46 @@ pub enum ConnectionManagerAction {
         /// Current favorite position (for display in picker)
         current: Option<u8>,
     },
+    /// Duplicate the selected connection and open the form pre-populated.
+    Duplicate {
+        /// The connection entry to duplicate (name will be changed by caller)
+        entry: ConnectionEntry,
+    },
+    /// Yank the selected connection's URL (sanitised, no password) to the
+    /// clipboard.
+    YankUrl {
+        /// The URL text to copy
+        url: String,
+    },
+    /// Yank a `tsql <url>` CLI command for the selected entry.
+    YankCli {
+        /// The CLI command to copy
+        command: String,
+    },
+    /// Reorder the selected connection up (-1) or down (+1).
+    Reorder {
+        /// The connection name to reorder
+        name: String,
+        /// Delta: -1 = up, +1 = down
+        delta: i32,
+    },
+    /// Run a background smoke-test on the selected connection.
+    TestConnection {
+        /// The connection entry to test
+        entry: ConnectionEntry,
+    },
     /// Show a status message
     StatusMessage(String),
 }
 
 /// Modal for managing database connections.
 pub struct ConnectionManagerModal {
-    /// All connections from the file
+    /// All connections currently being displayed (post-filter, post-sort).
     connections: Vec<ConnectionEntry>,
-    /// Currently selected index
+    /// Full unfiltered list of connections — kept in sorted order so we can
+    /// apply/remove the filter without re-reading from disk.
+    all_connections: Vec<ConnectionEntry>,
+    /// Currently selected index (into `connections`)
     selected: usize,
     /// Scroll offset for the list
     scroll_offset: usize,
@@ -70,31 +101,69 @@ pub struct ConnectionManagerModal {
     modal_area: Option<Rect>,
     /// List area (set during render, used for mouse item selection)
     list_area: Option<Rect>,
+    /// Current sort mode.
+    sort_mode: SortMode,
+    /// Current fuzzy filter text.
+    search: String,
+    /// Whether `/` search input is active (capturing keystrokes).
+    search_active: bool,
+    /// Transient toast message shown under the search bar for ~1 draw.
+    /// Cleared by the caller via `clear_toast()` once displayed.
+    toast: Option<String>,
 }
 
 impl ConnectionManagerModal {
     /// Create a new connection manager modal.
     pub fn new(connections_file: &ConnectionsFile, connected_name: Option<String>) -> Self {
-        // Get connections sorted by favorite first, then alphabetically
-        let connections: Vec<ConnectionEntry> =
-            connections_file.sorted().into_iter().cloned().collect();
+        let sort_mode = SortMode::default();
+        let all_connections: Vec<ConnectionEntry> = connections_file
+            .sorted_by(sort_mode)
+            .into_iter()
+            .cloned()
+            .collect();
+        let connections = all_connections.clone();
 
         Self {
             connections,
+            all_connections,
             selected: 0,
             scroll_offset: 0,
             connected_name,
             visible_height: 10,
             modal_area: None,
             list_area: None,
+            sort_mode,
+            search: String::new(),
+            search_active: false,
+            toast: None,
         }
+    }
+
+    /// Current sort mode (for UI / external callers).
+    pub fn sort_mode(&self) -> SortMode {
+        self.sort_mode
+    }
+
+    /// Take the transient toast message (called by parent after draw).
+    pub fn take_toast(&mut self) -> Option<String> {
+        self.toast.take()
+    }
+
+    /// Push a transient toast to surface in the modal footer on next draw.
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some(msg.into());
     }
 
     /// Update the connections list (e.g., after add/edit/delete).
     pub fn update_connections(&mut self, connections_file: &ConnectionsFile) {
         let old_selected_name = self.connections.get(self.selected).map(|c| c.name.clone());
 
-        self.connections = connections_file.sorted().into_iter().cloned().collect();
+        self.all_connections = connections_file
+            .sorted_by(self.sort_mode)
+            .into_iter()
+            .cloned()
+            .collect();
+        self.connections = self.filtered_connections();
 
         // Try to preserve selection by name
         if let Some(name) = old_selected_name {
@@ -123,13 +192,66 @@ impl ConnectionManagerModal {
 
     /// Check if the list is empty.
     pub fn is_empty(&self) -> bool {
-        self.connections.is_empty()
+        self.all_connections.is_empty()
+    }
+
+    /// Compute the visible connection list after applying the current
+    /// search filter on top of the already-sorted `all_connections`.
+    fn filtered_connections(&self) -> Vec<ConnectionEntry> {
+        if self.search.trim().is_empty() {
+            return self.all_connections.clone();
+        }
+        let needle = self.search.to_lowercase();
+        self.all_connections
+            .iter()
+            .filter(|c| {
+                super::super::config::ConnectionEntry::display_string(c)
+                    .to_lowercase()
+                    .contains(&needle)
+                    || c.name.to_lowercase().contains(&needle)
+                    || c.host.to_lowercase().contains(&needle)
+                    || c.database.to_lowercase().contains(&needle)
+                    || c.user.to_lowercase().contains(&needle)
+                    || c.folder
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                    || c.description
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                    || c.tags.iter().any(|t| t.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn refresh_visible(&mut self) {
+        let old_selected_name = self.connections.get(self.selected).map(|c| c.name.clone());
+        self.connections = self.filtered_connections();
+        if let Some(name) = old_selected_name {
+            if let Some(idx) = self.connections.iter().position(|c| c.name == name) {
+                self.selected = idx;
+            } else if !self.connections.is_empty() {
+                self.selected = self.selected.min(self.connections.len() - 1);
+            } else {
+                self.selected = 0;
+            }
+        }
+        self.scroll_offset = 0;
+        self.ensure_selected_visible();
     }
 
     /// Handle a key event and return the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> ConnectionManagerAction {
+        // --- Search input mode: everything typed goes into the search
+        //     field until Esc / Enter closes it. ---
+        if self.search_active {
+            return self.handle_search_key(key);
+        }
+
         // Handle empty state specially
-        if self.connections.is_empty() {
+        if self.all_connections.is_empty() {
             return match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                     ConnectionManagerAction::Close
@@ -259,8 +381,154 @@ impl ConnectionManagerModal {
                 ConnectionManagerAction::Continue
             }
 
+            // Search / filter
+            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                self.search_active = true;
+                ConnectionManagerAction::Continue
+            }
+
+            // Cycle sort mode
+            (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                self.sort_mode = self.sort_mode.next();
+                self.resort_by_current_mode();
+                self.toast = Some(format!("Sort: {}", self.sort_mode.label()));
+                ConnectionManagerAction::Continue
+            }
+
+            // Duplicate selected (shift-d)
+            (KeyCode::Char('D'), _) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::Duplicate {
+                        entry: entry.clone(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Yank URL (no password)
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::YankUrl {
+                        url: entry.to_url(None),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Copy-as-CLI
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::YankCli {
+                        command: entry.to_cli_command(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Test connection
+            (KeyCode::Char('t'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::TestConnection {
+                        entry: entry.clone(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Reorder up / down (Ctrl-K / Ctrl-J)
+            (KeyCode::Char('K'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                if let Some(entry) = self.selected_connection() {
+                    return ConnectionManagerAction::Reorder {
+                        name: entry.name.clone(),
+                        delta: -1,
+                    };
+                }
+                ConnectionManagerAction::Continue
+            }
+            (KeyCode::Char('J'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                if let Some(entry) = self.selected_connection() {
+                    return ConnectionManagerAction::Reorder {
+                        name: entry.name.clone(),
+                        delta: 1,
+                    };
+                }
+                ConnectionManagerAction::Continue
+            }
+
             _ => ConnectionManagerAction::Continue,
         }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> ConnectionManagerAction {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.search_active = false;
+                self.search.clear();
+                self.refresh_visible();
+                ConnectionManagerAction::Continue
+            }
+            (KeyCode::Enter, _) => {
+                self.search_active = false;
+                ConnectionManagerAction::Continue
+            }
+            (KeyCode::Backspace, _) => {
+                self.search.pop();
+                self.refresh_visible();
+                ConnectionManagerAction::Continue
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.search.push(c);
+                self.refresh_visible();
+                ConnectionManagerAction::Continue
+            }
+            _ => ConnectionManagerAction::Continue,
+        }
+    }
+
+    fn resort_by_current_mode(&mut self) {
+        // Re-sort `all_connections` and re-apply filter. We keep existing
+        // clones since the underlying `ConnectionsFile` is not reachable
+        // from here.
+        let mut sorted = self.all_connections.clone();
+        match self.sort_mode {
+            SortMode::FavoritesAlpha => sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
+                (Some(fa), Some(fb)) => fa.cmp(&fb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a
+                    .order
+                    .cmp(&b.order)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            }),
+            SortMode::Recent => sorted.sort_by(|a, b| {
+                b.last_used_at
+                    .cmp(&a.last_used_at)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            SortMode::MostUsed => sorted.sort_by(|a, b| {
+                b.use_count
+                    .cmp(&a.use_count)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            SortMode::Alpha => {
+                sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+            SortMode::Folder => sorted.sort_by(|a, b| {
+                let fa = a.folder.as_deref().unwrap_or("~");
+                let fb = b.folder.as_deref().unwrap_or("~");
+                fa.to_lowercase()
+                    .cmp(&fb.to_lowercase())
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+        }
+        self.all_connections = sorted;
+        self.refresh_visible();
     }
 
     fn move_down(&mut self) {
@@ -354,11 +622,12 @@ impl ConnectionManagerModal {
 
     /// Render the connection manager modal.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        // Calculate modal size (70% width, 60% height)
-        let modal_width = ((area.width as f32 * 0.70) as u16).clamp(50, 80);
-        let modal_height = ((area.height as f32 * 0.60) as u16).clamp(12, 30);
-        let modal_x = (area.width - modal_width) / 2;
-        let modal_y = (area.height - modal_height) / 2;
+        // Wider modal now that we also show a detail pane. Falls back
+        // gracefully on narrow terminals.
+        let modal_width = ((area.width as f32 * 0.85) as u16).clamp(60, 120);
+        let modal_height = ((area.height as f32 * 0.70) as u16).clamp(14, 36);
+        let modal_x = area.width.saturating_sub(modal_width) / 2;
+        let modal_y = area.height.saturating_sub(modal_height) / 2;
 
         let modal_area = Rect {
             x: modal_x,
@@ -373,8 +642,23 @@ impl ConnectionManagerModal {
         // Clear the background
         frame.render_widget(Clear, modal_area);
 
-        // Build title
-        let title = format!(" Connections ({}) ", self.connections.len());
+        // Title shows filtered vs total count and current sort mode.
+        let total = self.all_connections.len();
+        let visible = self.connections.len();
+        let title = if visible == total {
+            format!(
+                " Connections ({}) · sort: {} ",
+                total,
+                self.sort_mode.label()
+            )
+        } else {
+            format!(
+                " Connections ({}/{}) · sort: {} ",
+                visible,
+                total,
+                self.sort_mode.label()
+            )
+        };
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -389,24 +673,131 @@ impl ConnectionManagerModal {
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
 
-        // Layout: list area, separator, help line
-        let chunks = Layout::vertical([
-            Constraint::Min(1),    // List
-            Constraint::Length(1), // Separator
-            Constraint::Length(1), // Help
-        ])
-        .split(inner);
+        // Vertical: search bar (if active OR non-empty), body, separator, help.
+        let show_search_bar = self.search_active || !self.search.is_empty();
+        let mut constraints: Vec<Constraint> = Vec::new();
+        if show_search_bar {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(1));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
 
-        // Render the list
-        self.render_list(frame, chunks[0]);
+        let vchunks = Layout::vertical(constraints).split(inner);
 
-        // Render separator
-        let sep = Paragraph::new("─".repeat(chunks[1].width as usize))
+        let mut idx = 0;
+        if show_search_bar {
+            self.render_search_bar(frame, vchunks[idx]);
+            idx += 1;
+        }
+        let body_area = vchunks[idx];
+        idx += 1;
+        let sep_area = vchunks[idx];
+        idx += 1;
+        let help_area = vchunks[idx];
+
+        // Body: list + detail pane side by side when wide enough.
+        if body_area.width >= 72 && !self.connections.is_empty() {
+            let hchunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(body_area);
+            self.render_list(frame, hchunks[0]);
+            self.render_detail(frame, hchunks[1]);
+        } else {
+            self.render_list(frame, body_area);
+        }
+
+        let sep = Paragraph::new("─".repeat(sep_area.width as usize))
             .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(sep, chunks[1]);
+        frame.render_widget(sep, sep_area);
 
-        // Render help line
-        self.render_help(frame, chunks[2]);
+        self.render_help(frame, help_area);
+    }
+
+    fn render_search_bar(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = vec![
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(self.search.clone()),
+        ];
+        if self.search_active {
+            spans.push(Span::styled("▎", Style::default().fg(Color::Yellow)));
+        }
+        let p = Paragraph::new(Line::from(spans));
+        frame.render_widget(p, area);
+    }
+
+    fn render_detail(&self, frame: &mut Frame, area: Rect) {
+        let Some(entry) = self.selected_connection() else {
+            return;
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        let name_color = entry.color.to_ratatui_color().unwrap_or(Color::White);
+        lines.push(Line::from(vec![Span::styled(
+            entry.name.clone(),
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+        )]));
+        let kind_label = match entry.kind {
+            crate::config::DbKind::Postgres => "PostgreSQL",
+            crate::config::DbKind::Mongo => "MongoDB",
+        };
+        lines.push(Line::from(Span::styled(
+            kind_label.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+
+        lines.push(detail_row("Target", entry.display_string()));
+        if let Some(folder) = entry.folder.as_deref() {
+            lines.push(detail_row("Folder", folder.to_string()));
+        }
+        if !entry.tags.is_empty() {
+            lines.push(detail_row("Tags", entry.tags.join(", ")));
+        }
+        if let Some(app) = entry.application_name.as_deref() {
+            lines.push(detail_row("App name", app.to_string()));
+        }
+        if let Some(t) = entry.connect_timeout_secs {
+            lines.push(detail_row("Timeout", format!("{}s", t)));
+        }
+        if let Some(ssl) = entry.ssl_mode {
+            lines.push(detail_row("SSL", ssl.as_str().to_string()));
+        }
+        lines.push(detail_row(
+            "Password",
+            entry.password_source_label().to_string(),
+        ));
+        lines.push(detail_row("Last used", entry.last_used_label()));
+        lines.push(detail_row("Use count", entry.use_count.to_string()));
+
+        if let Some(desc) = entry.description.as_deref() {
+            if !desc.trim().is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Notes".to_string(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::raw(desc.to_string())));
+            }
+        }
+
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let p = Paragraph::new(lines).wrap(Wrap { trim: true });
+        frame.render_widget(p, inner);
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
@@ -537,17 +928,40 @@ impl ConnectionManagerModal {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
+        if let Some(ref msg) = self.toast {
+            let p = Paragraph::new(Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(Color::Yellow),
+            )))
+            .alignment(ratatui::layout::Alignment::Center);
+            frame.render_widget(p, area);
+            return;
+        }
         let help_spans = vec![
+            Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+            Span::raw(" connect  "),
             Span::styled("[a]", Style::default().fg(Color::Yellow)),
             Span::raw("dd "),
             Span::styled("[e]", Style::default().fg(Color::Yellow)),
             Span::raw("dit "),
+            Span::styled("[D]", Style::default().fg(Color::Yellow)),
+            Span::raw("up "),
             Span::styled("[d]", Style::default().fg(Color::Yellow)),
-            Span::raw("elete "),
+            Span::raw("el "),
             Span::styled("[f]", Style::default().fg(Color::Yellow)),
-            Span::raw("avorite "),
-            Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
-            Span::raw(" connect "),
+            Span::raw("av "),
+            Span::styled("[t]", Style::default().fg(Color::Yellow)),
+            Span::raw("est "),
+            Span::styled("[/]", Style::default().fg(Color::Yellow)),
+            Span::raw("find "),
+            Span::styled("[s]", Style::default().fg(Color::Yellow)),
+            Span::raw("ort "),
+            Span::styled("[y]", Style::default().fg(Color::Yellow)),
+            Span::raw("ank "),
+            Span::styled("[c]", Style::default().fg(Color::Yellow)),
+            Span::raw("li "),
+            Span::styled("[^K/^J]", Style::default().fg(Color::Yellow)),
+            Span::raw(" reorder "),
             Span::styled("[q]", Style::default().fg(Color::Yellow)),
             Span::raw(" close"),
         ];
@@ -556,6 +970,16 @@ impl ConnectionManagerModal {
             Paragraph::new(Line::from(help_spans)).alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(help, area);
     }
+}
+
+fn detail_row(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<10}", label),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(value),
+    ])
 }
 
 /// Truncate a string to a maximum length, adding ellipsis if needed.

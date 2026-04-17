@@ -214,6 +214,55 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
     Ok(default)
 }
 
+/// Minimal "can we open a connection?" probe used by the connection
+/// manager's `t` test action. On Postgres we just do a `connect` with the
+/// right SSL mode; on Mongo we run `{ping: 1}` against the admin database.
+async fn probe_connection(url: &str, kind: DbKind) -> std::result::Result<(), String> {
+    if kind == DbKind::Mongo {
+        let client = mongodb::Client::with_uri_str(url)
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .database("admin")
+            .run_command(mongodb::bson::doc! { "ping": 1 })
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let ssl_mode = resolve_ssl_mode(url)?;
+    match ssl_mode {
+        SslMode::Disable => tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .map(|_| ())
+            .map_err(|e| format_pg_error(&e)),
+        SslMode::Require => {
+            let tls = make_rustls_connect_insecure();
+            tokio_postgres::connect(url, tls)
+                .await
+                .map(|_| ())
+                .map_err(|e| format_pg_error(&e))
+        }
+        SslMode::Prefer => {
+            let tls = make_rustls_connect_insecure();
+            match tokio_postgres::connect(url, tls).await {
+                Ok(_) => Ok(()),
+                Err(_) => tokio_postgres::connect(url, tokio_postgres::NoTls)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format_pg_error(&e)),
+            }
+        }
+        SslMode::VerifyCa | SslMode::VerifyFull => {
+            let tls = make_rustls_connect_verified();
+            tokio_postgres::connect(url, tls)
+                .await
+                .map(|_| ())
+                .map_err(|e| format_pg_error(&e))
+        }
+    }
+}
+
 /// Normalize the max_rows config value.
 ///
 /// If the user sets max_rows to 0 in config (or leaves it unset), this returns
@@ -1944,6 +1993,31 @@ pub enum DbEvent {
     UpdateApplyFinished {
         result: std::result::Result<ApplyResult, String>,
     },
+    /// Result of a background password resolution for a saved connection.
+    /// Delivered to the UI thread so neither keychain nor `op read` ever
+    /// block the main thread during startup or during a picker selection.
+    /// `entry` is boxed because `ConnectionEntry` is the largest payload
+    /// in the enum and would otherwise bloat every other variant.
+    PasswordResolved {
+        entry: Box<ConnectionEntry>,
+        /// `Ok(Some(pw))` — password retrieved.
+        /// `Ok(None)` — no password available (keychain empty / timeout).
+        /// `Err(msg)` — retrieval failed hard.
+        result: std::result::Result<Option<String>, String>,
+        reason: PasswordResolveReason,
+    },
+}
+
+/// Why a password is being resolved in the background. Determines what the
+/// UI should do when there is no password: startup silently falls back to
+/// the connection picker; a user-initiated pick shows the password prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordResolveReason {
+    /// Dispatched from `main` after the first draw — the user didn't
+    /// explicitly ask for this connection.
+    Startup,
+    /// The user picked a connection from the picker / manager.
+    UserPicked,
 }
 
 pub struct DbSession {
@@ -2285,6 +2359,23 @@ pub struct App {
     update_apply_in_flight: bool,
     /// Query pane size mode used outside Insert mode.
     query_height_mode: QueryHeightMode,
+
+    /// Pending session reconnect that must be dispatched AFTER the first
+    /// draw — never before, or the terminal appears frozen on macOS while
+    /// keychain / 1Password prompts resolve behind the alt-screen.
+    pending_startup_reconnect: Option<String>,
+    /// True once we've drawn at least one frame.
+    first_draw_complete: bool,
+    /// When set to `true`, bypasses all blocking-capable startup side
+    /// effects (session auto-reconnect, scheduled update check, keychain
+    /// probes from the connection picker). Activated by `--safe-mode`.
+    safe_mode: bool,
+    /// Currently in-flight `resolve_password` reasons keyed by connection
+    /// name, used to suppress duplicate dispatches.
+    password_resolve_in_flight: std::collections::HashSet<String>,
+    /// Cache of when each connection was last persisted via `touch_use`,
+    /// so we can debounce frequent reconnects to the same entry.
+    last_touch_save: std::collections::HashMap<String, Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2450,6 +2541,12 @@ impl App {
             update_state: UpdateState::default(),
             update_apply_in_flight: false,
             query_height_mode: QueryHeightMode::Minimized,
+
+            pending_startup_reconnect: None,
+            first_draw_complete: false,
+            safe_mode: false,
+            password_resolve_in_flight: std::collections::HashSet::new(),
+            last_touch_save: std::collections::HashMap::new(),
         };
 
         // Load saved connections
@@ -2599,7 +2696,11 @@ impl App {
                 self.query_ui.tick();
             }
 
-            self.maybe_start_scheduled_update_check();
+            // Update checks run off-thread but we still suppress them in
+            // safe mode so recovery launches never hit the network.
+            if !self.safe_mode {
+                self.maybe_start_scheduled_update_check();
+            }
 
             // Pre-compute highlighted lines before the draw closure
             let query_text = self.editor.text();
@@ -3305,6 +3406,15 @@ impl App {
             // Mark hint as shown after rendering (must be outside draw closure)
             if show_key_hint && !self.key_sequence.is_hint_shown() {
                 self.key_sequence.mark_hint_shown();
+            }
+
+            // --- Deferred startup work ---
+            // We must never do anything blocking BEFORE the first draw, or
+            // the terminal appears frozen (especially on macOS with hidden
+            // keychain / 1Password prompts behind the alt-screen).
+            if !self.first_draw_complete {
+                self.first_draw_complete = true;
+                self.dispatch_pending_startup_reconnect();
             }
 
             // Use faster polling when query is running or loading more rows
@@ -4167,7 +4277,9 @@ impl App {
                     if self.editor.is_modified() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
-                            ConfirmContext::SwitchConnection { entry },
+                            ConfirmContext::SwitchConnection {
+                                entry: Box::new(entry),
+                            },
                         ));
                     } else {
                         self.connect_to_entry(entry);
@@ -4657,7 +4769,7 @@ impl App {
             }
             ConfirmContext::SwitchConnection { entry } => {
                 // Proceed with connection switch despite unsaved changes
-                self.connect_to_entry(entry);
+                self.connect_to_entry(*entry);
                 false
             }
             ConfirmContext::ApplyUpdate { info } => {
@@ -5465,6 +5577,12 @@ impl App {
             }
             "connections" | "conn" => {
                 self.open_connection_manager();
+            }
+            "export-connections" => {
+                self.handle_export_connections_command(args);
+            }
+            "import-connections" => {
+                self.handle_import_connections_command(args);
             }
             "sbt" | "sidebar-toggle" => {
                 self.toggle_sidebar();
@@ -7418,42 +7536,139 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
-        // Try to get the password from keychain / env var / 1Password.
-        // Give 1Password more time since it shells out to `op`.
+        // If the entry has no_password_required, connect immediately without
+        // ever touching the keychain — that's the fastest path and avoids
+        // any macOS keychain prompt.
+        if entry.no_password_required {
+            let url = entry.to_url(None);
+            self.current_connection_name = Some(entry.name.clone());
+            self.start_connect(url);
+            return;
+        }
+
+        // Also skip the background resolve when nothing is configured to
+        // resolve — jump straight to the password prompt.
+        let op_configured =
+            self.config.connection.enable_onepassword && entry.password_onepassword.is_some();
+        let env_configured = entry.password_env.is_some();
+        if !entry.password_in_keychain && !op_configured && !env_configured {
+            self.last_error = None;
+            self.password_prompt = Some(PasswordPrompt::new(entry));
+            return;
+        }
+
+        // Background-resolve the password so we never block the UI thread.
+        self.current_connection_name = Some(entry.name.clone());
+        self.last_status = Some(format!("Resolving credentials for {}…", entry.name));
+        self.begin_password_resolve(entry, PasswordResolveReason::UserPicked);
+    }
+
+    /// Queue a session auto-reconnect that `run()` will dispatch after the
+    /// first draw. Called from `main` before the event loop starts.
+    pub fn set_pending_startup_reconnect(&mut self, name: Option<String>) {
+        self.pending_startup_reconnect = name;
+    }
+
+    /// Called once per successful connect to bump `last_used_at` /
+    /// `use_count` on the entry. Saves to disk at most once per 30s per
+    /// entry to avoid pounding the filesystem on rapid reconnects.
+    fn record_successful_connect(&mut self) {
+        let Some(name) = self.current_connection_name.clone() else {
+            return;
+        };
+        if !self.connections.touch_use(&name) {
+            return;
+        }
+        let now = Instant::now();
+        let should_save = match self.last_touch_save.get(&name) {
+            None => true,
+            Some(prev) => now.duration_since(*prev) >= Duration::from_secs(30),
+        };
+        if should_save {
+            if let Err(e) = save_connections(&self.connections) {
+                self.last_status = Some(format!("Failed to save usage stats: {}", e));
+            } else {
+                self.last_touch_save.insert(name, now);
+            }
+        }
+    }
+
+    /// Enable safe-mode: skip all blocking-capable startup side effects.
+    pub fn set_safe_mode(&mut self, safe: bool) {
+        self.safe_mode = safe;
+    }
+
+    /// Called from the event loop after the first frame has rendered.
+    /// Performs any deferred startup work that could otherwise block the
+    /// terminal before the user sees anything.
+    fn dispatch_pending_startup_reconnect(&mut self) {
+        if self.safe_mode {
+            self.pending_startup_reconnect = None;
+            return;
+        }
+        let Some(name) = self.pending_startup_reconnect.take() else {
+            return;
+        };
+        // Reload from disk so we catch any external edits.
+        if let Ok(connections) = load_connections() {
+            self.connections = connections;
+        }
+        match self.connections.find_by_name(&name) {
+            Some(entry) => {
+                let entry = entry.clone();
+                self.current_connection_name = Some(entry.name.clone());
+                self.last_status = Some(format!("Reconnecting to {}…", entry.name));
+                if entry.no_password_required {
+                    let url = entry.to_url(None);
+                    self.start_connect(url);
+                } else {
+                    self.begin_password_resolve(entry, PasswordResolveReason::Startup);
+                }
+            }
+            None => {
+                self.last_status = Some(format!(
+                    "Previous connection '{}' no longer exists — pick one",
+                    name
+                ));
+                self.open_connection_picker();
+            }
+        }
+    }
+
+    /// Dispatch a background password-resolution task. Result arrives via
+    /// `DbEvent::PasswordResolved`.
+    pub fn begin_password_resolve(
+        &mut self,
+        entry: ConnectionEntry,
+        reason: PasswordResolveReason,
+    ) {
+        // Dedupe concurrent resolves on the same entry (e.g. user smashing
+        // Enter in the picker twice).
+        if !self.password_resolve_in_flight.insert(entry.name.clone()) {
+            return;
+        }
+
+        let tx = self.db_events_tx.clone();
         let onepassword_enabled = self.config.connection.enable_onepassword;
         let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
             5000
         } else {
             500
         };
-        let password =
-            match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
-                Ok(Some(pwd)) => Some(pwd),
-                Ok(None) => None,
-                Err(e) => {
-                    self.last_error = None;
-                    self.last_status = Some(format!(
-                        "Password lookup failed ({}); enter password manually",
-                        e
-                    ));
-                    None
-                }
-            };
 
-        // Determine if we need to prompt for password:
-        // - If we have a password from keychain/env, use it
-        // - If no_password_required is true, connect without password
-        // - Otherwise, prompt for password
-        if password.is_some() || entry.no_password_required {
-            // We have a password or don't need one - connect directly
-            let url = entry.to_url(password.as_deref());
-            self.current_connection_name = Some(entry.name.clone());
-            self.start_connect(url);
-        } else {
-            // Need to prompt for password
-            self.last_error = None;
-            self.password_prompt = Some(PasswordPrompt::new(entry));
-        }
+        self.rt.spawn_blocking(move || {
+            let result = match entry
+                .get_password_with_timeout_and_options(timeout_ms, onepassword_enabled)
+            {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(DbEvent::PasswordResolved {
+                entry: Box::new(entry),
+                result,
+                reason,
+            });
+        });
     }
 
     /// Connect to an entry with the provided password (called after password prompt).
@@ -7534,7 +7749,9 @@ impl App {
                 if self.editor.is_modified() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
-                        ConfirmContext::SwitchConnection { entry },
+                        ConfirmContext::SwitchConnection {
+                            entry: Box::new(entry),
+                        },
                     ));
                 } else {
                     self.connect_to_entry(entry);
@@ -7799,7 +8016,9 @@ impl App {
                 if self.editor.is_modified() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
-                        ConfirmContext::SwitchConnection { entry },
+                        ConfirmContext::SwitchConnection {
+                            entry: Box::new(entry),
+                        },
                     ));
                 } else {
                     self.connect_to_entry(entry);
@@ -7851,10 +8070,254 @@ impl App {
                     }
                 }
             }
+            ConnectionManagerAction::Duplicate { entry } => {
+                // Connection names are required to be whitespace-free,
+                // so we use '-' as the separator in the generated name.
+                let mut candidate = format!("{}-copy", entry.name);
+                let mut n = 2;
+                while self.connections.find_by_name(&candidate).is_some() {
+                    candidate = format!("{}-copy-{}", entry.name, n);
+                    n += 1;
+                }
+                let mut dup = entry.clone();
+                dup.name = candidate;
+                // Duplicated entries start with no favorite slot + no
+                // password in keychain (since the keychain entry is keyed
+                // by name).
+                dup.favorite = None;
+                dup.password_in_keychain = false;
+                dup.last_used_at = None;
+                dup.use_count = 0;
+                self.connection_form = Some(ConnectionFormModal::edit_with_keymap_and_onepassword(
+                    &dup,
+                    None,
+                    self.connection_form_keymap.clone(),
+                    self.config.connection.enable_onepassword,
+                ));
+            }
+            ConnectionManagerAction::YankUrl { url } => {
+                self.copy_to_clipboard(&url);
+                if let Some(ref mut m) = self.connection_manager {
+                    m.set_toast("URL copied (password stripped)");
+                }
+            }
+            ConnectionManagerAction::YankCli { command } => {
+                self.copy_to_clipboard(&command);
+                if let Some(ref mut m) = self.connection_manager {
+                    m.set_toast("tsql CLI command copied");
+                }
+            }
+            ConnectionManagerAction::Reorder { name, delta } => {
+                if let Err(e) = self.reorder_connection(&name, delta) {
+                    self.last_error = Some(format!("Reorder failed: {}", e));
+                } else if let Err(e) = save_connections(&self.connections) {
+                    self.last_error = Some(format!("Failed to save connections: {}", e));
+                } else if let Some(ref mut manager) = self.connection_manager {
+                    manager.update_connections(&self.connections);
+                }
+            }
+            ConnectionManagerAction::TestConnection { entry } => {
+                if let Some(ref mut m) = self.connection_manager {
+                    m.set_toast(format!("Testing {}…", entry.name));
+                }
+                self.last_status = Some(format!("Testing connection to {}…", entry.name));
+                self.test_entry_in_background(entry);
+            }
             ConnectionManagerAction::StatusMessage(msg) => {
                 self.last_status = Some(msg);
             }
         }
+    }
+
+    /// `:export-connections <path>` → write the current connections.toml
+    /// (passwords are never included) to a user-chosen path.
+    fn handle_export_connections_command(&mut self, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            self.last_status = Some("Usage: :export-connections <path>".to_string());
+            return;
+        }
+        let entries: Vec<_> = self.connections.connections.clone();
+        match crate::config::export_to_path(std::path::Path::new(path), entries) {
+            Ok(()) => {
+                self.last_error = None;
+                self.last_status = Some(format!(
+                    "Exported {} connection{} to {}",
+                    self.connections.connections.len(),
+                    if self.connections.connections.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    path
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Export failed: {}", e));
+            }
+        }
+    }
+
+    /// `:import-connections <path>` → merge connections from a TOML file.
+    /// Conflicts are renamed by default; pass `--overwrite` or `--skip`
+    /// to change the strategy.
+    fn handle_import_connections_command(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            self.last_status =
+                Some("Usage: :import-connections <path> [--overwrite|--skip|--rename]".to_string());
+            return;
+        }
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        let (path, strategy) = match tokens.as_slice() {
+            [p] => (*p, crate::config::ImportConflict::Rename),
+            [p, flag] => {
+                let s = match *flag {
+                    "--overwrite" => crate::config::ImportConflict::Overwrite,
+                    "--skip" => crate::config::ImportConflict::Skip,
+                    "--rename" => crate::config::ImportConflict::Rename,
+                    _ => {
+                        self.last_error = Some(format!("Unknown flag: {}", flag));
+                        return;
+                    }
+                };
+                (*p, s)
+            }
+            _ => {
+                self.last_status = Some(
+                    "Usage: :import-connections <path> [--overwrite|--skip|--rename]".to_string(),
+                );
+                return;
+            }
+        };
+
+        match crate::config::import_from_path(
+            &mut self.connections,
+            std::path::Path::new(path),
+            strategy,
+        ) {
+            Ok(summary) => {
+                if let Err(e) = save_connections(&self.connections) {
+                    self.last_error = Some(format!("Save after import failed: {}", e));
+                    return;
+                }
+                if let Some(ref mut manager) = self.connection_manager {
+                    manager.update_connections(&self.connections);
+                }
+                let mut parts = Vec::new();
+                if summary.imported > 0 {
+                    parts.push(format!("{} imported", summary.imported));
+                }
+                if summary.renamed > 0 {
+                    parts.push(format!("{} renamed", summary.renamed));
+                }
+                if summary.overwritten > 0 {
+                    parts.push(format!("{} overwritten", summary.overwritten));
+                }
+                if summary.skipped > 0 {
+                    parts.push(format!("{} skipped", summary.skipped));
+                }
+                let msg = if parts.is_empty() {
+                    "Import produced no changes".to_string()
+                } else {
+                    format!("Imported: {}", parts.join(", "))
+                };
+                self.last_error = None;
+                self.last_status = Some(msg);
+                if !summary.errors.is_empty() {
+                    self.last_error = Some(summary.errors.join("; "));
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Import failed: {}", e));
+            }
+        }
+    }
+
+    /// Shift the `order` field of the named non-favorite entry so its
+    /// relative position in the sorted list moves by `delta` slots (−1
+    /// = up, +1 = down). Favorites keep their slot.
+    fn reorder_connection(&mut self, name: &str, delta: i32) -> anyhow::Result<()> {
+        let target_order = self
+            .connections
+            .find_by_name(name)
+            .map(|e| e.order)
+            .ok_or_else(|| anyhow::anyhow!("Connection '{}' not found", name))?;
+        // Simple approach: shift the entry by (delta * 10) so there's
+        // always head-room to insert between. Collisions just sort by
+        // name as tiebreak.
+        let new_order = target_order.saturating_add(delta.saturating_mul(10));
+        if let Some(entry) = self.connections.find_by_name_mut(name) {
+            entry.order = new_order;
+        }
+        Ok(())
+    }
+
+    /// Kick off a background connection test. Resolves the password on a
+    /// worker thread (to avoid blocking the UI) and then dispatches the
+    /// existing form-level TestConnection flow.
+    fn test_entry_in_background(&mut self, entry: ConnectionEntry) {
+        // Immediate path for entries with no password required — skip the
+        // password resolve entirely.
+        if entry.no_password_required {
+            self.handle_connection_form_action(ConnectionFormAction::TestConnection {
+                entry,
+                password: None,
+            });
+            return;
+        }
+
+        // Need a password. Resolve it off-thread, then dispatch the test
+        // via a DbEvent so the UI is never blocked.
+        let tx = self.db_events_tx.clone();
+        let onepassword_enabled = self.config.connection.enable_onepassword;
+        let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
+            5000
+        } else {
+            500
+        };
+        // Reuse PasswordResolveReason to carry the entry back; we'll fork
+        // on the current_connection_name to decide if this was a test or
+        // a connect. Simpler: send a dedicated event via a channel-only
+        // closure using a synthetic sentinel, but TestConnectionResult +
+        // PasswordResolved already do the job. Use a one-shot background
+        // test that reproduces the form's TestConnection logic inline,
+        // keeping the UI thread free.
+        self.rt.spawn_blocking(move || {
+            let password = entry
+                .get_password_with_timeout_and_options(timeout_ms, onepassword_enabled)
+                .ok()
+                .flatten();
+            // Synthesize the same TestConnectionResult the form path
+            // emits, by sending a URL-probe on a tokio runtime.
+            let url = entry.to_url(password.as_deref());
+            let _ = tx.send(DbEvent::TestConnectionResult {
+                success: true,
+                message: format!("Launching probe for {}…", entry.name),
+            });
+            // Trigger the real test via the runtime inside the blocking
+            // thread by building a small tokio runtime here. This is
+            // acceptable because we're already on spawn_blocking.
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async move {
+                    let result = probe_connection(&url, entry.kind).await;
+                    let ev = match result {
+                        Ok(()) => DbEvent::TestConnectionResult {
+                            success: true,
+                            message: format!("Test OK: {} is reachable", entry.name),
+                        },
+                        Err(msg) => DbEvent::TestConnectionResult {
+                            success: false,
+                            message: format!("Test failed for {}: {}", entry.name, msg),
+                        },
+                    };
+                    let _ = tx.send(ev);
+                });
+            }
+        });
     }
 
     /// Handle sidebar actions (from mouse clicks or keyboard).
@@ -7872,7 +8335,7 @@ impl App {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
                             ConfirmContext::SwitchConnection {
-                                entry: entry.clone(),
+                                entry: Box::new(entry.clone()),
                             },
                         ));
                     } else {
@@ -7931,11 +8394,23 @@ impl App {
                 self.connection_form = None;
             }
             ConnectionFormAction::Save {
-                entry,
+                mut entry,
                 password,
                 save_password,
                 original_name,
             } => {
+                // Preserve metadata that the form itself doesn't edit
+                // (usage stats + favorite slot) across saves, so an edit
+                // never resets `last_used_at` / `use_count` / `favorite`.
+                if let Some(ref orig) = original_name {
+                    if let Some(existing) = self.connections.find_by_name(orig) {
+                        entry.last_used_at = existing.last_used_at;
+                        entry.use_count = existing.use_count;
+                        entry.favorite = existing.favorite;
+                        entry.order = existing.order;
+                    }
+                }
+
                 // Handle add vs edit
                 let result = if let Some(ref orig) = original_name {
                     self.connections.update(orig, entry.clone())
@@ -9292,6 +9767,7 @@ impl App {
                 self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
+                self.record_successful_connect();
                 // Load schema for completion
                 self.load_schema();
             }
@@ -9309,6 +9785,7 @@ impl App {
                 self.last_status = Some(format!(
                     "Connected to Mongo ({database}), loading schema..."
                 ));
+                self.record_successful_connect();
                 self.load_schema();
             }
             DbEvent::ConnectError { error } => {
@@ -9523,6 +10000,61 @@ impl App {
                     Err(error) => {
                         self.last_error = Some(error);
                         self.last_status = Some("Update apply failed (see error)".to_string());
+                    }
+                }
+            }
+            DbEvent::PasswordResolved {
+                entry,
+                result,
+                reason,
+            } => {
+                let entry = *entry;
+                self.password_resolve_in_flight.remove(&entry.name);
+                match result {
+                    Ok(Some(pwd)) => {
+                        let url = entry.to_url(Some(&pwd));
+                        self.current_connection_name = Some(entry.name.clone());
+                        self.last_error = None;
+                        self.last_status = Some(format!("Connecting to {}…", entry.name));
+                        self.start_connect(url);
+                    }
+                    Ok(None) => {
+                        // No password available. For user-initiated picks
+                        // we show the password prompt so the user can type
+                        // one; for startup reconnects we fall back to the
+                        // picker so the user is never stuck on an empty
+                        // alt-screen.
+                        match reason {
+                            PasswordResolveReason::UserPicked => {
+                                self.last_error = None;
+                                self.last_status = None;
+                                self.password_prompt = Some(PasswordPrompt::new(entry));
+                            }
+                            PasswordResolveReason::Startup => {
+                                self.current_connection_name = None;
+                                self.last_status = Some(format!(
+                                    "Saved credentials for '{}' unavailable — pick a connection",
+                                    entry.name
+                                ));
+                                self.open_connection_picker();
+                            }
+                        }
+                    }
+                    Err(msg) => {
+                        self.current_connection_name = None;
+                        self.last_error = None;
+                        self.last_status = Some(format!(
+                            "Password lookup failed: {} (pick a connection)",
+                            msg
+                        ));
+                        match reason {
+                            PasswordResolveReason::UserPicked => {
+                                self.password_prompt = Some(PasswordPrompt::new(entry));
+                            }
+                            PasswordResolveReason::Startup => {
+                                self.open_connection_picker();
+                            }
+                        }
                     }
                 }
             }
