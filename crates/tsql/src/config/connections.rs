@@ -264,6 +264,34 @@ pub struct ConnectionEntry {
     pub order: i32,
 }
 
+/// Best-effort sanitiser for Mongo URIs that didn't round-trip through
+/// `Url::parse`. Strips any `user:password@` userinfo by replacing it
+/// with a bare `@`, so a malformed URI can't end up on screen with
+/// credentials attached. Kept separate from `sanitize_url` (which
+/// relies on the url crate) for exactly this fallback case.
+fn sanitize_mongo_uri_fallback(uri: &str) -> String {
+    // Find the first `://` so we don't touch anything before the
+    // scheme, then look for `user[:password]@` up to the first `/` or
+    // `?` after that.
+    let Some(scheme_end) = uri.find("://") else {
+        return uri.to_string();
+    };
+    let after = scheme_end + 3;
+    let tail = &uri[after..];
+    let stop = tail.find(['/', '?']).unwrap_or(tail.len());
+    let authority = &tail[..stop];
+    match authority.rfind('@') {
+        Some(at) => {
+            let mut out = String::with_capacity(uri.len());
+            out.push_str(&uri[..after]);
+            out.push_str(&authority[at..]); // includes the `@`
+            out.push_str(&tail[stop..]);
+            out
+        }
+        None => uri.to_string(),
+    }
+}
+
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -790,10 +818,19 @@ impl ConnectionEntry {
     /// Format connection for display (without password)
     pub fn display_string(&self) -> String {
         if self.kind == DbKind::Mongo {
-            return self
-                .uri
-                .clone()
-                .unwrap_or_else(|| "mongodb://localhost".to_string());
+            // Imported / hand-edited entries can embed credentials in
+            // `uri`. The detail pane and status line call into this
+            // directly, so strip the password before handing the string
+            // back — otherwise opening the connection manager on a
+            // wide terminal would render plaintext credentials.
+            let uri = self.uri.as_deref().unwrap_or("mongodb://localhost");
+            if let Ok(mut parsed) = Url::parse(uri) {
+                if parsed.password().is_some() {
+                    let _ = parsed.set_password(None);
+                    return parsed.to_string();
+                }
+            }
+            return uri.to_string();
         }
         format!(
             "{}@{}:{}/{}",
@@ -817,7 +854,10 @@ impl ConnectionEntry {
                 }
                 return format!("mongodb://{}/{}", host, db);
             }
-            return uri;
+            // Unparseable fallback: strip anything that looks like
+            // `user:password@` so a malformed-but-credential-bearing
+            // URI doesn't end up on screen verbatim.
+            return sanitize_mongo_uri_fallback(&uri);
         }
         if self.port == 5432 {
             format!("{}@{}/{}", self.user, self.host, self.database)
@@ -1470,6 +1510,45 @@ user = "me"
         assert!(entry.description.is_none());
         assert!(entry.tags.is_empty());
         assert_eq!(entry.use_count, 0);
+    }
+
+    #[test]
+    fn test_mongo_display_string_strips_password() {
+        // Regression: the detail pane renders `display_string()` for
+        // the "Target" row. If the stored URI embedded credentials
+        // (imported / hand-edited), the password used to appear on
+        // screen when the user opened the manager.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:topsecret@host:27017/db".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let display = entry.display_string();
+        assert!(!display.contains("topsecret"), "leaked: {display}");
+        assert!(display.contains("user"));
+        assert!(display.contains("host"));
+    }
+
+    #[test]
+    fn test_sanitize_mongo_uri_fallback_strips_userinfo() {
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://user:pw@host/db"),
+            "mongodb://@host/db"
+        );
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://host/db"),
+            "mongodb://host/db"
+        );
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://host/db?ssl=true"),
+            "mongodb://host/db?ssl=true"
+        );
+        assert_eq!(sanitize_mongo_uri_fallback("not a url"), "not a url");
     }
 
     #[test]

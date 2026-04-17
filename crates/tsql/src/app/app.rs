@@ -2597,9 +2597,13 @@ pub struct App {
     /// effects (session auto-reconnect, scheduled update check, keychain
     /// probes from the connection picker). Activated by `--safe-mode`.
     safe_mode: bool,
-    /// Currently in-flight `resolve_password` reasons keyed by connection
-    /// name, used to suppress duplicate dispatches.
-    password_resolve_in_flight: std::collections::HashSet<String>,
+    /// Currently in-flight `resolve_password` tasks keyed by connection
+    /// name, used to suppress duplicate dispatches. The stored value is
+    /// the *effective* reason for the in-flight task — if a startup
+    /// resolve is running and the user then picks the same entry, we
+    /// upgrade this to `UserPicked` so the callback routes to the
+    /// password prompt instead of the startup fallback.
+    password_resolve_in_flight: std::collections::HashMap<String, PasswordResolveReason>,
     /// Cache of when each connection was last persisted via `touch_use`,
     /// so we can debounce frequent reconnects to the same entry.
     last_touch_save: std::collections::HashMap<String, Instant>,
@@ -2772,7 +2776,7 @@ impl App {
             pending_startup_reconnect: None,
             first_draw_complete: false,
             safe_mode: false,
-            password_resolve_in_flight: std::collections::HashSet::new(),
+            password_resolve_in_flight: std::collections::HashMap::new(),
             last_touch_save: std::collections::HashMap::new(),
         };
 
@@ -7904,15 +7908,34 @@ impl App {
 
     /// Dispatch a background password-resolution task. Result arrives via
     /// `DbEvent::PasswordResolved`.
+    ///
+    /// Dedupes concurrent resolves on the same entry name, but allows
+    /// the stored reason to be *upgraded* from `Startup` to
+    /// `UserPicked` when the user explicitly picks an entry whose
+    /// startup reconnect is still in flight. Without this upgrade, a
+    /// `None` result from the shared task would route through the
+    /// startup fallback (reopen picker) instead of the user-picked
+    /// fallback (password prompt) the explicit selection expects.
     pub fn begin_password_resolve(
         &mut self,
         entry: ConnectionEntry,
         reason: PasswordResolveReason,
     ) {
-        // Dedupe concurrent resolves on the same entry (e.g. user smashing
-        // Enter in the picker twice).
-        if !self.password_resolve_in_flight.insert(entry.name.clone()) {
-            return;
+        use std::collections::hash_map::Entry as MapEntry;
+        match self.password_resolve_in_flight.entry(entry.name.clone()) {
+            MapEntry::Occupied(mut slot) => {
+                // Already in flight. Upgrade Startup → UserPicked if
+                // the new request is user-initiated; otherwise leave
+                // the existing reason alone and skip the duplicate
+                // dispatch.
+                if matches!(reason, PasswordResolveReason::UserPicked) {
+                    *slot.get_mut() = PasswordResolveReason::UserPicked;
+                }
+                return;
+            }
+            MapEntry::Vacant(slot) => {
+                slot.insert(reason);
+            }
         }
 
         let tx = self.db_events_tx.clone();
@@ -10290,7 +10313,15 @@ impl App {
                 reason,
             } => {
                 let entry = *entry;
-                self.password_resolve_in_flight.remove(&entry.name);
+                // Prefer the in-flight map's reason — `begin_password_resolve`
+                // may have upgraded `Startup` → `UserPicked` while this
+                // task was running, and the upgraded reason is what
+                // routes the Ok(None) / Err branches to the password
+                // prompt instead of the startup picker fallback.
+                let reason = self
+                    .password_resolve_in_flight
+                    .remove(&entry.name)
+                    .unwrap_or(reason);
 
                 // Drop stale callbacks: if the user has since connected
                 // (or started connecting) to a different entry while
@@ -10904,6 +10935,66 @@ mod tests {
         let data = "x".repeat(2000);
         let hint = yank_size_hint(&data);
         assert!(hint.contains("KB"));
+    }
+
+    #[test]
+    fn test_password_resolve_reason_upgrades_to_user_picked() {
+        // Regression: dedup by name alone dropped the user's explicit
+        // pick when a startup resolve for the same entry was still in
+        // flight — the callback then ran with the stale `Startup`
+        // reason and routed `Ok(None)` to the picker instead of the
+        // password prompt. Now the in-flight slot stores the reason
+        // and upgrades Startup → UserPicked on re-request.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Entry that only has password-in-keychain, so the resolve
+        // code path is taken (not no_password_required / prompt-direct).
+        let entry = crate::config::ConnectionEntry {
+            name: "race".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            password_in_keychain: true,
+            ..Default::default()
+        };
+
+        // Pretend the startup dispatcher registered the slot. We avoid
+        // actually spawning the background task (which would talk to
+        // the real keychain and race us) by mutating the field
+        // directly. This is a regression unit test for the dedup
+        // bookkeeping, not a full end-to-end.
+        app.password_resolve_in_flight
+            .insert(entry.name.clone(), PasswordResolveReason::Startup);
+
+        // User now explicitly picks the same entry. `begin_password_resolve`
+        // should upgrade the stored reason even though it returns
+        // early without dispatching a new task.
+        app.begin_password_resolve(entry.clone(), PasswordResolveReason::UserPicked);
+        assert_eq!(
+            app.password_resolve_in_flight.get(&entry.name),
+            Some(&PasswordResolveReason::UserPicked),
+            "reason must upgrade when user explicitly picks in-flight entry"
+        );
+
+        // Reverse direction (UserPicked already in flight, a later
+        // Startup request must not downgrade it).
+        app.password_resolve_in_flight.clear();
+        app.password_resolve_in_flight
+            .insert(entry.name.clone(), PasswordResolveReason::UserPicked);
+        app.begin_password_resolve(entry.clone(), PasswordResolveReason::Startup);
+        assert_eq!(
+            app.password_resolve_in_flight.get(&entry.name),
+            Some(&PasswordResolveReason::UserPicked),
+            "reason must not downgrade from UserPicked → Startup",
+        );
     }
 
     #[test]
