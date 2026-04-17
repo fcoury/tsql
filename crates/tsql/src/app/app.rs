@@ -2823,18 +2823,16 @@ impl App {
 
     /// Capture current session state for persistence.
     pub fn capture_session_state(&self) -> SessionState {
-        // Persist the *committed* connection (one we actually reached),
-        // never the pending target that an in-flight pick/prompt may
-        // have put into `current_connection_name`. Falling back to
-        // `current_connection_name` keeps behavior identical for
-        // already-connected sessions (where the two match) and for
-        // tests that set only the current name.
-        let connection_name = self
-            .active_connection_name
-            .clone()
-            .or_else(|| self.current_connection_name.clone());
+        // Persist only the *committed* connection, i.e. one we
+        // actually reached via `Connected` / `MongoConnected`. Never
+        // fall back to `current_connection_name`: that field is set
+        // eagerly when a user picks an entry — well before any
+        // successful connect — so if the app exited during a
+        // still-pending password resolve or prompt, we'd save a
+        // target the user never actually connected to and then
+        // auto-reconnect to it on the next launch.
         SessionState {
-            connection_name,
+            connection_name: self.active_connection_name.clone(),
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
             sidebar_visible: self.sidebar_visible,
@@ -11037,6 +11035,47 @@ mod tests {
             Some(&PasswordResolveReason::UserPicked),
             "reason must not downgrade from UserPicked → Startup",
         );
+    }
+
+    #[test]
+    fn test_capture_session_state_persists_only_committed_connection() {
+        // Regression: `current_connection_name` is set eagerly when
+        // the user picks an entry (so the staleness guard works), but
+        // the connection hasn't happened yet. If we exited during a
+        // pending password prompt, the session used to persist that
+        // pending name and the next launch would auto-reconnect to
+        // an entry the user never successfully reached. Persist only
+        // `active_connection_name`.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Pending pick only — nothing committed.
+        app.current_connection_name = Some("pending-only".to_string());
+        app.active_connection_name = None;
+        let state = app.capture_session_state();
+        assert!(
+            state.connection_name.is_none(),
+            "pending-but-not-connected must not be persisted; got {:?}",
+            state.connection_name
+        );
+
+        // Committed connection is persisted.
+        app.active_connection_name = Some("real".to_string());
+        let state = app.capture_session_state();
+        assert_eq!(state.connection_name.as_deref(), Some("real"));
+
+        // Committed + different pending (cancelled mid-flight) — we
+        // still persist the committed one.
+        app.current_connection_name = Some("cancelled".to_string());
+        app.active_connection_name = Some("real".to_string());
+        let state = app.capture_session_state();
+        assert_eq!(state.connection_name.as_deref(), Some("real"));
     }
 
     #[test]
