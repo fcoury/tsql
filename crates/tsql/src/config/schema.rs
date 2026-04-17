@@ -241,7 +241,7 @@ impl Default for UpdatesConfig {
             mode: UpdateMode::Auto,
             interval_hours: 24,
             allow_apply_for_standalone: true,
-            github_repo: "fcoury/tsql".to_string(),
+            github_repo: "rekurt/tsql".to_string(),
         }
     }
 }
@@ -342,7 +342,7 @@ channel = "stable"
 mode = "notify-only"
 interval_hours = 12
 allow_apply_for_standalone = true
-github_repo = "fcoury/tsql"
+github_repo = "rekurt/tsql"
 
 [[keymap.normal]]
 key = "ctrl+s"
@@ -397,7 +397,7 @@ description = "Export results as CSV"
         assert_eq!(config.updates.mode, UpdateMode::NotifyOnly);
         assert_eq!(config.updates.interval_hours, 12);
         assert!(config.updates.allow_apply_for_standalone);
-        assert_eq!(config.updates.github_repo, "fcoury/tsql");
+        assert_eq!(config.updates.github_repo, "rekurt/tsql");
     }
 
     #[test]

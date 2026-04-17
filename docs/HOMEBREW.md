@@ -44,22 +44,22 @@ Create `Formula/tsql.rb` with the following content:
 ```ruby
 class Tsql < Formula
   desc "A modern, keyboard-first PostgreSQL CLI"
-  homepage "https://github.com/fcoury/tsql"
+  homepage "https://github.com/rekurt/tsql"
   version "0.1.0"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-aarch64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_AARCH64_MACOS_SHA256"
     else
-      url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-x86_64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_X86_64_MACOS_SHA256"
     end
   end
 
   on_linux do
-    url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-x86_64-unknown-linux-gnu.tar.gz"
+    url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-x86_64-unknown-linux-gnu.tar.gz"
     sha256 "REPLACE_WITH_LINUX_SHA256"
   end
 
@@ -79,7 +79,7 @@ After a release is published, download the checksums:
 
 ```bash
 # Download the SHA256SUMS.txt from the release
-curl -LO https://github.com/fcoury/tsql/releases/download/v0.1.0/SHA256SUMS.txt
+curl -LO https://github.com/rekurt/tsql/releases/download/v0.1.0/SHA256SUMS.txt
 cat SHA256SUMS.txt
 ```
 
@@ -87,13 +87,13 @@ Or calculate them manually:
 
 ```bash
 # Download each tarball and calculate SHA256
-curl -LO https://github.com/fcoury/tsql/releases/download/v0.1.0/tsql-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/rekurt/tsql/releases/download/v0.1.0/tsql-aarch64-apple-darwin.tar.gz
 shasum -a 256 tsql-aarch64-apple-darwin.tar.gz
 
-curl -LO https://github.com/fcoury/tsql/releases/download/v0.1.0/tsql-x86_64-apple-darwin.tar.gz
+curl -LO https://github.com/rekurt/tsql/releases/download/v0.1.0/tsql-x86_64-apple-darwin.tar.gz
 shasum -a 256 tsql-x86_64-apple-darwin.tar.gz
 
-curl -LO https://github.com/fcoury/tsql/releases/download/v0.1.0/tsql-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/rekurt/tsql/releases/download/v0.1.0/tsql-x86_64-unknown-linux-gnu.tar.gz
 shasum -a 256 tsql-x86_64-unknown-linux-gnu.tar.gz
 ```
 
@@ -132,7 +132,7 @@ After each new release:
 VERSION=0.2.0  # New version
 
 # Download checksums from release
-curl -LO https://github.com/fcoury/tsql/releases/download/v${VERSION}/SHA256SUMS.txt
+curl -LO https://github.com/rekurt/tsql/releases/download/v${VERSION}/SHA256SUMS.txt
 cat SHA256SUMS.txt
 ```
 
@@ -148,16 +148,16 @@ version "0.2.0"  # Updated version
 
 on_macos do
   if Hardware::CPU.arm?
-    url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-aarch64-apple-darwin.tar.gz"
     sha256 "new_aarch64_sha256_here"
   else
-    url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-x86_64-apple-darwin.tar.gz"
     sha256 "new_x86_64_macos_sha256_here"
   end
 end
 
 on_linux do
-  url "https://github.com/fcoury/tsql/releases/download/v#{version}/tsql-x86_64-unknown-linux-gnu.tar.gz"
+  url "https://github.com/rekurt/tsql/releases/download/v#{version}/tsql-x86_64-unknown-linux-gnu.tar.gz"
   sha256 "new_linux_sha256_here"
 end
 ```
@@ -255,7 +255,7 @@ jobs:
       - name: Download checksums
         run: |
           VERSION=${{ github.event.inputs.version || github.event.client_payload.version }}
-          curl -LO https://github.com/fcoury/tsql/releases/download/v${VERSION}/SHA256SUMS.txt
+          curl -LO https://github.com/rekurt/tsql/releases/download/v${VERSION}/SHA256SUMS.txt
           
       - name: Update formula
         run: |

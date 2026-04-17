@@ -119,7 +119,7 @@ interval_hours = 24
 allow_apply_for_standalone = true
 
 # GitHub repository used for release checks
-github_repo = "fcoury/tsql"
+github_repo = "rekurt/tsql"
 
 # Clipboard settings
 [clipboard]

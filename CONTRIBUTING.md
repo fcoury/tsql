@@ -12,7 +12,7 @@ Thank you for your interest in contributing to tsql! This document provides guid
 ### Clone and Build
 
 ```bash
-git clone https://github.com/fcoury/tsql.git
+git clone https://github.com/rekurt/tsql.git
 cd tsql
 git submodule update --init --recursive
 cargo build
@@ -168,7 +168,7 @@ For feature requests, please describe:
 
 If you have questions, feel free to:
 
-- Open a [GitHub Issue](https://github.com/fcoury/tsql/issues)
-- Start a [GitHub Discussion](https://github.com/fcoury/tsql/discussions)
+- Open a [GitHub Issue](https://github.com/rekurt/tsql/issues)
+- Start a [GitHub Discussion](https://github.com/rekurt/tsql/discussions)
 
 Thank you for contributing!

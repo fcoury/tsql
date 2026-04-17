@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_map_fetch_error_status_is_descriptive() {
         let response = ureq::Response::new(403, "Forbidden", "").expect("valid response");
-        let error = map_fetch_error("fcoury/tsql", ureq::Error::Status(403, response));
+        let error = map_fetch_error("rekurt/tsql", ureq::Error::Status(403, response));
         assert!(
             error
                 .to_string()

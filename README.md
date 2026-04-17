@@ -2,7 +2,7 @@
 
 A modern, keyboard-first PostgreSQL and MongoDB CLI with a TUI interface.
 
-[![CI](https://github.com/fcoury/tsql/actions/workflows/ci.yml/badge.svg)](https://github.com/fcoury/tsql/actions/workflows/ci.yml)
+[![CI](https://github.com/rekurt/tsql/actions/workflows/ci.yml/badge.svg)](https://github.com/rekurt/tsql/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/tsql.svg)](https://crates.io/crates/tsql)
 [![License](https://img.shields.io/crates/l/tsql.svg)](LICENSE)
 [![Discord](https://img.shields.io/discord/1204152891049512960)](https://discord.gg/b928dKDcQq)
@@ -47,7 +47,7 @@ cargo install tsql
 
 ### Binary Download
 
-Download pre-built binaries from the [GitHub Releases](https://github.com/fcoury/tsql/releases) page.
+Download pre-built binaries from the [GitHub Releases](https://github.com/rekurt/tsql/releases) page.
 
 ## Quick Start
 
@@ -208,7 +208,7 @@ channel = "stable"
 mode = "auto"
 interval_hours = 24
 allow_apply_for_standalone = true
-github_repo = "fcoury/tsql"
+github_repo = "rekurt/tsql"
 
 [keymap]
 # Custom keymap overrides (see config.example.toml for options)

@@ -88,7 +88,7 @@ mod tests {
             mode: UpdateMode::Auto,
             interval_hours: 24,
             allow_apply_for_standalone: true,
-            github_repo: "fcoury/tsql".to_string(),
+            github_repo: "rekurt/tsql".to_string(),
         };
 
         assert_eq!(UpdateState::policy(&config), UpdatePolicy::Off);

@@ -2136,7 +2136,7 @@ password_in_keychain = true
     }
 
     // ========== Issue #16 Reproduction Tests ==========
-    // https://github.com/fcoury/tsql/issues/16
+    // https://github.com/rekurt/tsql/issues/16
     // "Password missing even though the test connection worked"
 
     /// This test reproduces issue #16: when a user creates a new connection,

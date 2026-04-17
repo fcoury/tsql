@@ -65,9 +65,9 @@ git push origin v0.2.0
 
 ### Step 5: Monitor the Release
 
-1. Go to the [Actions tab](https://github.com/fcoury/tsql/actions) on GitHub
+1. Go to the [Actions tab](https://github.com/rekurt/tsql/actions) on GitHub
 2. Watch the "Release" workflow
-3. Once complete, check the [Releases page](https://github.com/fcoury/tsql/releases)
+3. Once complete, check the [Releases page](https://github.com/rekurt/tsql/releases)
 
 ## What Happens Automatically
 
@@ -97,7 +97,7 @@ For each platform in the matrix:
 
 ### Update Check Compatibility
 
-`tsql`'s in-app update checks read GitHub releases from `fcoury/tsql`.
+`tsql`'s in-app update checks read GitHub releases from `rekurt/tsql`.
 To keep update notifications working:
 
 - Use semver tags (for example `v0.4.3`)
