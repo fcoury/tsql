@@ -825,15 +825,19 @@ impl ConnectionEntry {
             // `uri`. The detail pane and status line call into this
             // directly, so strip the password before handing the string
             // back — otherwise opening the connection manager on a
-            // wide terminal would render plaintext credentials.
+            // wide terminal would render plaintext credentials. Cover
+            // the Url::parse success branch AND the unparseable
+            // fallback: a slightly-off URI (e.g. literal space in the
+            // host) was still going through verbatim and leaking.
             let uri = self.uri.as_deref().unwrap_or("mongodb://localhost");
             if let Ok(mut parsed) = Url::parse(uri) {
                 if parsed.password().is_some() {
                     let _ = parsed.set_password(None);
                     return parsed.to_string();
                 }
+                return uri.to_string();
             }
-            return uri.to_string();
+            return sanitize_mongo_uri_fallback(uri);
         }
         format!(
             "{}@{}:{}/{}",
@@ -1643,6 +1647,25 @@ user = "me"
         .unwrap();
         assert_eq!(file.find_by_name("alpha").unwrap().order, 0);
         assert_eq!(file.find_by_name("bravo").unwrap().order, 0);
+    }
+
+    #[test]
+    fn test_mongo_display_string_strips_password_when_uri_not_parseable() {
+        // Regression: `display_string` used to `return uri.to_string()`
+        // unchanged if Url::parse failed, leaking embedded credentials
+        // in the connection-manager detail pane.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:topsecret@bad host/db".to_string()),
+            host: "bad host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let display = entry.display_string();
+        assert!(!display.contains("topsecret"), "leaked: {display}");
     }
 
     #[test]
