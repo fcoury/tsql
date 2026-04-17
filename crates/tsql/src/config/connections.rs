@@ -1386,19 +1386,34 @@ pub fn write_connections_atomic(path: &Path, file: &ConnectionsFile) -> Result<(
         .sync_all()
         .context("Failed to fsync connections temp file")?;
 
-    // `NamedTempFile::persist` does a rename, but tempfile's own docs
-    // note that on Windows persist-over-an-existing-file is not
-    // guaranteed. Convert to a `TempPath` (giving up the destructor)
-    // and use `std::fs::rename`, which is documented to replace on
-    // every supported platform: Unix atomic rename, Windows
-    // `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`.
+    // `std::fs::rename` on modern Rust uses `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING` on Windows, so it should overwrite
+    // an existing target. But older Windows versions, FAT32 volumes,
+    // and some network shares still reject replace-rename with
+    // `AlreadyExists` / `PermissionDenied`. Fall back to explicit
+    // `remove_file` + `rename` on those — not atomic, but lets the
+    // save succeed where it would otherwise wedge the config file.
     let tmp_path = tmp.into_temp_path();
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "Failed to rename temp connections file into place at {}",
-            path.display()
-        )
-    })?;
+    std::fs::rename(&tmp_path, path)
+        .or_else(|e| {
+            if cfg!(windows)
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                )
+            {
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&tmp_path, path)
+            } else {
+                Err(e)
+            }
+        })
+        .with_context(|| {
+            format!(
+                "Failed to rename temp connections file into place at {}",
+                path.display()
+            )
+        })?;
     // rename consumed the inode but the TempPath still points at the
     // old location — detach it so its Drop doesn't try to unlink a
     // path that no longer exists.
@@ -1871,6 +1886,44 @@ user = "me"
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(hits, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn test_write_connections_atomic_overwrites_existing_target() {
+        // Regression: `write_connections_atomic` must succeed when the
+        // target already exists. Every save after the first one hits
+        // this path, so a failure here would wedge the config file.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+
+        // First write creates the file.
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "one".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        assert!(path.exists());
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("one"));
+
+        // Second write must overwrite in place, not error.
+        file.add(ConnectionEntry {
+            name: "two".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.contains("one"));
+        assert!(second.contains("two"));
     }
 
     #[test]
