@@ -420,6 +420,19 @@ impl ConnectionEntry {
                 query.push(("application_name", trimmed.to_string()));
             }
         }
+        // SSL cert paths: libpq-compatible `sslrootcert` / `sslcert` /
+        // `sslkey`. Without these, saved TLS-configured entries would
+        // connect anyway but without the user's CA / client cert,
+        // silently failing handshakes or skipping verification.
+        if let Some(p) = self.ssl_root_cert.as_ref() {
+            query.push(("sslrootcert", p.to_string_lossy().into_owned()));
+        }
+        if let Some(p) = self.ssl_client_cert.as_ref() {
+            query.push(("sslcert", p.to_string_lossy().into_owned()));
+        }
+        if let Some(p) = self.ssl_client_key.as_ref() {
+            query.push(("sslkey", p.to_string_lossy().into_owned()));
+        }
         if !query.is_empty() {
             url.push('?');
             for (i, (k, v)) in query.iter().enumerate() {
@@ -1941,6 +1954,34 @@ user = "me"
 
         let url = entry.to_url(None);
         assert_eq!(url, "postgres://postgres@localhost/mydb?sslmode=require");
+    }
+
+    #[test]
+    fn test_connection_to_url_threads_ssl_cert_paths() {
+        // Regression: saved per-entry SSL cert paths were inert at
+        // connect / test time because `to_url` never emitted them
+        // as `sslrootcert` / `sslcert` / `sslkey` query params.
+        use std::path::PathBuf;
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_root_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            ssl_client_cert: Some(PathBuf::from("/etc/ssl/client.pem")),
+            ssl_client_key: Some(PathBuf::from("/etc/ssl/client.key")),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(url.contains("sslmode=verify-full"), "url: {url}");
+        assert!(
+            url.contains("sslrootcert=") && (url.contains("ca.pem") || url.contains("ca%2Epem")),
+            "url: {url}"
+        );
+        assert!(url.contains("sslcert="), "url: {url}");
+        assert!(url.contains("sslkey="), "url: {url}");
     }
 
     #[test]
