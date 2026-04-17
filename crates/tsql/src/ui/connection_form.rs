@@ -173,10 +173,6 @@ pub struct ConnectionFormModal {
     /// SSL mode selection index (for cycling through modes)
     ssl_mode_index: usize,
 
-    /// Whether we're editing an existing connection (used for UI hints)
-    #[allow(dead_code)]
-    editing: bool,
-
     /// Original name when editing (for rename detection)
     original_name: Option<String>,
 
@@ -266,7 +262,6 @@ impl ConnectionFormModal {
             focused: FormField::Name,
             color_index: 0,
             ssl_mode_index: 0,
-            editing: false,
             original_name: None,
             title: "New Connection".to_string(),
             modified: false,
@@ -379,7 +374,6 @@ impl ConnectionFormModal {
             focused: FormField::Name,
             color_index,
             ssl_mode_index,
-            editing: true,
             original_name: Some(entry.name.clone()),
             title: format!("Edit: {}", entry.name),
             modified: false,
@@ -472,8 +466,22 @@ impl ConnectionFormModal {
                     self.clear_field();
                     return ConnectionFormAction::Continue;
                 }
+                Action::DeleteWord => {
+                    self.delete_word_before();
+                    return ConnectionFormAction::Continue;
+                }
                 _ => {}
             }
+        }
+
+        // Readline-style Ctrl-W (delete previous word). Always available
+        // inside text fields regardless of user keymap.
+        if key.code == KeyCode::Char('w')
+            && key.modifiers == KeyModifiers::CONTROL
+            && self.get_current_field_and_cursor().is_some()
+        {
+            self.delete_word_before();
+            return ConnectionFormAction::Continue;
         }
 
         match (key.code, key.modifiers) {
@@ -748,6 +756,27 @@ impl ConnectionFormModal {
             field.clear();
             *cursor = 0;
         }
+    }
+
+    /// Readline-style `Ctrl-W` — delete from the cursor back to the start
+    /// of the current word (skipping trailing whitespace first).
+    fn delete_word_before(&mut self) {
+        let Some((field, cursor)) = self.get_current_field_and_cursor() else {
+            return;
+        };
+        let chars: Vec<char> = field.chars().collect();
+        let mut idx = (*cursor).min(chars.len());
+        // Skip trailing whitespace.
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        // Then skip the word itself.
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        let new_chars: String = chars[..idx].iter().chain(chars[*cursor..].iter()).collect();
+        *field = new_chars;
+        *cursor = idx;
     }
 
     fn cycle_color(&mut self, direction: i32) {
@@ -1645,12 +1674,47 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_word_before_removes_last_word() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::Host;
+        form.host = "db.example.com".to_string();
+        form.host_cursor = form.host.chars().count();
+        form.delete_word_before();
+        assert_eq!(form.host, "");
+        assert_eq!(form.host_cursor, 0);
+    }
+
+    #[test]
+    fn test_delete_word_before_skips_trailing_whitespace() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::Host;
+        form.host = "prod.db.io  ".to_string();
+        form.host_cursor = form.host.chars().count();
+        form.delete_word_before();
+        // Drops "prod.db.io" + trailing spaces, cursor at 0.
+        assert_eq!(form.host, "");
+        assert_eq!(form.host_cursor, 0);
+    }
+
+    #[test]
+    fn test_delete_word_before_middle_of_field() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::Host;
+        form.host = "abc def ghi".to_string();
+        // Place cursor between "def" and " ghi" (after "abc def").
+        form.host_cursor = "abc def".chars().count();
+        form.delete_word_before();
+        // Removes "def", leaving "abc  ghi".
+        assert_eq!(form.host, "abc  ghi");
+        assert_eq!(form.host_cursor, "abc ".chars().count());
+    }
+
+    #[test]
     fn test_new_form_defaults() {
         let form = ConnectionFormModal::new();
         assert_eq!(form.kind, DbKind::Postgres);
         assert_eq!(form.host, "localhost");
         assert_eq!(form.port, "5432");
-        assert!(!form.editing);
         assert!(form.original_name.is_none());
     }
 
@@ -1672,7 +1736,6 @@ mod tests {
         assert_eq!(form.host, "db.example.com");
         assert_eq!(form.port, "5433");
         assert_eq!(form.password, "secret");
-        assert!(form.editing);
         assert_eq!(form.original_name, Some("test".to_string()));
     }
 

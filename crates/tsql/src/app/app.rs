@@ -214,6 +214,79 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
     Ok(default)
 }
 
+/// Validate a connection URL up-front so the user gets an immediate,
+/// actionable error instead of a generic tokio-postgres failure later.
+///
+/// Accepts PostgreSQL (`postgres://` / `postgresql://`) and MongoDB
+/// (`mongodb://` / `mongodb+srv://`) schemes, plus bare key=value libpq
+/// style strings (e.g. `host=localhost user=postgres`). Returns an
+/// `Err` with a single-line human-friendly hint describing what's
+/// wrong.
+pub fn validate_connection_url(raw: &str) -> std::result::Result<(), String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("Connection URL is empty".to_string());
+    }
+    // libpq key=value style: must contain at least one '=' and no '://'.
+    if !s.contains("://") {
+        if s.contains('=') {
+            return Ok(());
+        }
+        return Err(format!(
+            "Not a recognised connection URL. Expected postgres://user:pass@host:port/db, mongodb://…, or libpq `host=... user=...`. Got: {}",
+            truncate_for_error(s)
+        ));
+    }
+    let parsed = url::Url::parse(s).map_err(|e| {
+        format!(
+            "Malformed URL: {} — expected e.g. postgres://user:pass@host:5432/dbname",
+            e
+        )
+    })?;
+    match parsed.scheme() {
+        "postgres" | "postgresql" => {
+            if parsed.host_str().is_none() {
+                return Err(
+                    "PostgreSQL URL is missing a host (did you forget the hostname?)".to_string(),
+                );
+            }
+            Ok(())
+        }
+        "mongodb" | "mongodb+srv" => Ok(()),
+        other => Err(format!(
+            "Unsupported scheme '{}://'. Use postgres://, postgresql://, mongodb://, or mongodb+srv://",
+            other
+        )),
+    }
+}
+
+fn truncate_for_error(s: &str) -> String {
+    if s.chars().count() <= 64 {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(60).collect();
+        format!("{}…", truncated)
+    }
+}
+
+/// Build a compact "N lines, M bytes" label for yank status messages.
+fn yank_size_hint(text: &str) -> String {
+    let bytes = text.len();
+    let lines = text.lines().count();
+    let size_label = if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    };
+    if lines <= 1 {
+        size_label
+    } else {
+        format!("{} lines · {}", lines, size_label)
+    }
+}
+
 /// Minimal "can we open a connection?" probe used by the connection
 /// manager's `t` test action. On Postgres we just do a `connect` with the
 /// right SSL mode; on Mongo we run `{ping: 1}` against the admin database.
@@ -3888,9 +3961,10 @@ impl App {
                         self.maybe_fetch_more_rows();
                         if let GridKeyResult::Yank { text, status } = result {
                             self.last_error = None;
+                            let size_hint = yank_size_hint(&text);
                             self.copy_to_clipboard(&text);
                             if self.last_error.is_none() {
-                                self.last_status = Some(status);
+                                self.last_status = Some(format!("{} · {}", status, size_hint));
                             }
                         }
                         return false;
@@ -3971,9 +4045,10 @@ impl App {
                         }
                         GridKeyResult::Yank { text, status } => {
                             self.last_error = None;
+                            let size_hint = yank_size_hint(&text);
                             self.copy_to_clipboard(&text);
                             if self.last_error.is_none() {
-                                self.last_status = Some(status);
+                                self.last_status = Some(format!("{} · {}", status, size_hint));
                             }
                         }
                         GridKeyResult::ResizeColumn { col, action } => match action {
@@ -5427,9 +5502,20 @@ impl App {
             }
             "connect" | "c" => {
                 if args.is_empty() {
-                    self.last_status = Some("Usage: :connect <connection_url>".to_string());
+                    self.last_status = Some(
+                        "Usage: :connect <connection_url> (postgres://… or mongodb://…)"
+                            .to_string(),
+                    );
                 } else {
-                    self.start_connect(args.to_string());
+                    // Validate URL synchronously to give the user immediate
+                    // feedback rather than waiting for the background task
+                    // to fail with a cryptic tokio error.
+                    match validate_connection_url(args) {
+                        Ok(()) => self.start_connect(args.to_string()),
+                        Err(hint) => {
+                            self.last_error = Some(hint);
+                        }
+                    }
                 }
             }
             "disconnect" | "dc" => {
@@ -7691,19 +7777,31 @@ impl App {
             return;
         }
 
-        // Get sorted connections (favorites first, then alphabetical)
-        // Clone them since FuzzyPicker needs owned values
-        let entries: Vec<ConnectionEntry> =
-            self.connections.sorted().into_iter().cloned().collect();
+        // Use the last-used sort mode the user picked in the manager so
+        // the picker's default order matches their preference.
+        let sort_mode = self.connections.last_sort_mode;
+        let entries: Vec<ConnectionEntry> = self
+            .connections
+            .sorted_by(sort_mode)
+            .into_iter()
+            .cloned()
+            .collect();
 
         let picker =
             FuzzyPicker::with_display(entries, "Connect (gm or Ctrl+Shift+C: manage)", |entry| {
-                // Display: "[fav] name - user@host/db"
+                // Display: `[fav] name  user@host/db  · tag1,tag2  (2m ago)`
                 let fav = entry
                     .favorite
                     .map(|f| format!("[{}] ", f))
                     .unwrap_or_default();
-                format!("{}{} - {}", fav, entry.name, entry.short_display())
+                let mut line = format!("{}{} - {}", fav, entry.name, entry.short_display());
+                if !entry.tags.is_empty() {
+                    line.push_str(&format!("  · {}", entry.tags.join(",")));
+                }
+                if entry.last_used_at.is_some() {
+                    line.push_str(&format!("  ({})", entry.last_used_label()));
+                }
+                line
             });
 
         self.connection_picker = Some(picker);
@@ -8122,6 +8220,14 @@ impl App {
                 }
                 self.last_status = Some(format!("Testing connection to {}…", entry.name));
                 self.test_entry_in_background(entry);
+            }
+            ConnectionManagerAction::SortModeChanged { mode } => {
+                // Persist so the user's preference survives restarts. Best
+                // effort — a transient I/O error here shouldn't surface an
+                // error dialog, but we do let the next persistence attempt
+                // retry cleanly.
+                self.connections.last_sort_mode = mode;
+                let _ = save_connections(&self.connections);
             }
             ConnectionManagerAction::StatusMessage(msg) => {
                 self.last_status = Some(msg);
@@ -8653,8 +8759,16 @@ impl App {
                         source_database: None,
                     });
                 }
-                Err(_) => {
-                    // Schema loading failed silently - not critical
+                Err(e) => {
+                    // Surface a zero-tables schema + a non-fatal error so
+                    // the user at least knows why the sidebar is empty.
+                    let _ = tx.send(DbEvent::SchemaLoaded {
+                        tables: Vec::new(),
+                        source_database: None,
+                    });
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Schema load failed: {}", e),
+                    });
                 }
             }
         });
@@ -10534,6 +10648,67 @@ fn escape_sql_literal_for_where(s: &str) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_validate_connection_url_accepts_postgres() {
+        assert!(validate_connection_url("postgres://u:p@localhost/db").is_ok());
+        assert!(validate_connection_url("postgresql://u@h:5432/d?sslmode=require").is_ok());
+    }
+
+    #[test]
+    fn test_validate_connection_url_accepts_mongodb() {
+        assert!(validate_connection_url("mongodb://localhost/mydb").is_ok());
+        assert!(validate_connection_url("mongodb+srv://cluster.example.net/db").is_ok());
+    }
+
+    #[test]
+    fn test_validate_connection_url_accepts_libpq_kv() {
+        assert!(validate_connection_url("host=localhost user=postgres dbname=mydb").is_ok());
+    }
+
+    #[test]
+    fn test_validate_connection_url_rejects_empty() {
+        assert!(validate_connection_url("").is_err());
+        assert!(validate_connection_url("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_connection_url_rejects_bare_string() {
+        let err = validate_connection_url("justastring").unwrap_err();
+        assert!(err.to_lowercase().contains("connection url"));
+    }
+
+    #[test]
+    fn test_validate_connection_url_rejects_malformed() {
+        let err = validate_connection_url("postgres://").unwrap_err();
+        // Either the parse fails, or it parses but has no host.
+        assert!(err.to_lowercase().contains("url") || err.to_lowercase().contains("host"));
+    }
+
+    #[test]
+    fn test_validate_connection_url_rejects_unknown_scheme() {
+        let err = validate_connection_url("mysql://localhost/db").unwrap_err();
+        assert!(err.contains("Unsupported scheme"));
+    }
+
+    #[test]
+    fn test_yank_size_hint_single_line() {
+        assert_eq!(yank_size_hint("hello"), "5 B");
+        assert_eq!(yank_size_hint(""), "0 B");
+    }
+
+    #[test]
+    fn test_yank_size_hint_multi_line_shows_line_count() {
+        let hint = yank_size_hint("a\nb\nc\n");
+        assert!(hint.contains("3 lines"));
+    }
+
+    #[test]
+    fn test_yank_size_hint_kilobytes() {
+        let data = "x".repeat(2000);
+        let hint = yank_size_hint(&data);
+        assert!(hint.contains("KB"));
+    }
 
     /// Guard that sets TSQL_CONFIG_DIR to a temp directory for test isolation.
     /// Automatically cleans up when dropped (even on panic).

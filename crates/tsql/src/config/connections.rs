@@ -889,6 +889,14 @@ pub struct ConnectionsFile {
     /// List of saved connections
     #[serde(default, rename = "connection")]
     pub connections: Vec<ConnectionEntry>,
+    /// Sort mode last chosen in the connection manager. Persisted so the
+    /// user's preference survives restarts.
+    #[serde(default, skip_serializing_if = "is_default_sort")]
+    pub last_sort_mode: SortMode,
+}
+
+fn is_default_sort(mode: &SortMode) -> bool {
+    *mode == SortMode::default()
 }
 
 impl ConnectionsFile {
@@ -896,6 +904,7 @@ impl ConnectionsFile {
     pub fn new() -> Self {
         Self {
             connections: Vec::new(),
+            last_sort_mode: SortMode::default(),
         }
     }
 
@@ -1158,8 +1167,10 @@ fn entry_matches(c: &ConnectionEntry, needle_lc: &str) -> bool {
     false
 }
 
-/// Sort modes available in the connection manager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Sort modes available in the connection manager. Persisted across
+/// restarts via `ConnectionsFile.last_sort_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SortMode {
     /// Favorites first (by slot), then manual order, then alphabetical.
     #[default]
@@ -1264,6 +1275,7 @@ pub fn write_connections_atomic(path: &Path, file: &ConnectionsFile) -> Result<(
 pub fn export_to_path(path: &Path, entries: Vec<ConnectionEntry>) -> Result<()> {
     let file = ConnectionsFile {
         connections: entries,
+        last_sort_mode: SortMode::default(),
     };
     write_connections_atomic(path, &file)
 }

@@ -14,7 +14,55 @@ pub fn format_pg_error(e: &tokio_postgres::Error) -> String {
         msg = format!("{}: {}", msg, source);
     }
 
-    msg
+    let hint = pg_error_hint(&msg);
+    if !hint.is_empty() {
+        format!("{}  →  {}", msg, hint)
+    } else {
+        msg
+    }
+}
+
+/// Strip the password component from a connection URL, preserving the
+/// rest of the URL exactly. Used before displaying a URL to the user or
+/// writing it to a log line. Leaves the input unchanged if it isn't a
+/// parseable URL.
+pub fn sanitize_url(url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(None);
+            return parsed.to_string();
+        }
+    }
+    url.to_string()
+}
+
+/// Return a one-line actionable hint for a Postgres error message, or an
+/// empty string if nothing recognisable.
+///
+/// Kept public for tests and for the connection-test smoke probe.
+pub fn pg_error_hint(msg: &str) -> &'static str {
+    let lc = msg.to_lowercase();
+    if lc.contains("connection refused") {
+        "is postgres running and is the port correct?"
+    } else if lc.contains("password authentication failed") {
+        "wrong password — check keychain / env / op:// ref"
+    } else if lc.contains("no pg_hba.conf entry") || lc.contains("no entry for host") {
+        "server rejects this client; add a pg_hba.conf line for your host/role"
+    } else if lc.contains("does not exist") && lc.contains("database") {
+        "database name is wrong, or you lack CONNECT privilege on it"
+    } else if lc.contains("role ") && lc.contains("does not exist") {
+        "username is wrong, or the role was dropped"
+    } else if lc.contains("timeout expired") || lc.contains("timed out") {
+        "server unreachable — check host/firewall/VPN"
+    } else if lc.contains("ssl") && (lc.contains("required") || lc.contains("not allowed")) {
+        "SSL mode mismatch — try toggling sslmode (disable / require / verify-full)"
+    } else if lc.contains("connection reset by peer") {
+        "server closed the connection — check max_connections and your network path"
+    } else if lc.contains("name or service not known") || lc.contains("nodename nor servname") {
+        "DNS lookup failed — the hostname doesn't resolve"
+    } else {
+        ""
+    }
 }
 
 /// Check if a string looks like JSON (starts/ends with {} or [])
@@ -383,6 +431,51 @@ mod tests {
         assert!(!is_uuid("GGGGGGGG-GGGG-GGGG-GGGG-GGGGGGGGGGGG")); // invalid hex
         assert!(!is_uuid("hello-world")); // not a UUID
         assert!(!is_uuid("")); // empty
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_password() {
+        let sanitized = sanitize_url("postgres://user:secret@host:5432/db");
+        // Must not contain the password…
+        assert!(!sanitized.contains("secret"), "sanitized: {}", sanitized);
+        // …and must keep everything else meaningful.
+        assert!(sanitized.contains("user"));
+        assert!(sanitized.contains("host"));
+        assert!(sanitized.contains("5432"));
+        assert!(sanitized.contains("db"));
+    }
+
+    #[test]
+    fn test_sanitize_url_leaves_url_without_password_alone() {
+        assert_eq!(
+            sanitize_url("postgres://user@host/db"),
+            "postgres://user@host/db"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_url_handles_libpq_style_untouched() {
+        // Not a parsable URL scheme; leave as-is so we don't corrupt
+        // e.g. `host=x user=y password=secret`. Callers must use a
+        // different formatter for those.
+        assert_eq!(
+            sanitize_url("host=localhost user=postgres"),
+            "host=localhost user=postgres"
+        );
+    }
+
+    #[test]
+    fn test_pg_error_hint_recognises_common_failures() {
+        assert!(pg_error_hint("connection refused").contains("port"));
+        assert!(
+            pg_error_hint("password authentication failed for user \"x\"")
+                .contains("wrong password")
+        );
+        assert!(pg_error_hint("FATAL: database \"foo\" does not exist").contains("database name"));
+        assert!(pg_error_hint("FATAL: role \"x\" does not exist").contains("username is wrong"));
+        assert!(pg_error_hint("timeout expired").contains("unreachable"));
+        assert!(pg_error_hint("SSL connection is required").contains("SSL"));
+        assert!(pg_error_hint("totally unrelated").is_empty());
     }
 
     #[test]

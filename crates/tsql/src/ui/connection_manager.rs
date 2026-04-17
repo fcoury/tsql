@@ -78,6 +78,12 @@ pub enum ConnectionManagerAction {
         /// The connection entry to test
         entry: ConnectionEntry,
     },
+    /// User cycled the sort mode — caller should persist it so the
+    /// preference survives restarts.
+    SortModeChanged {
+        /// The new sort mode.
+        mode: SortMode,
+    },
     /// Show a status message
     StatusMessage(String),
 }
@@ -113,9 +119,10 @@ pub struct ConnectionManagerModal {
 }
 
 impl ConnectionManagerModal {
-    /// Create a new connection manager modal.
+    /// Create a new connection manager modal. Uses the last-used sort
+    /// mode persisted in the file if present, otherwise the default.
     pub fn new(connections_file: &ConnectionsFile, connected_name: Option<String>) -> Self {
-        let sort_mode = SortMode::default();
+        let sort_mode = connections_file.last_sort_mode;
         let all_connections: Vec<ConnectionEntry> = connections_file
             .sorted_by(sort_mode)
             .into_iter()
@@ -392,7 +399,9 @@ impl ConnectionManagerModal {
                 self.sort_mode = self.sort_mode.next();
                 self.resort_by_current_mode();
                 self.toast = Some(format!("Sort: {}", self.sort_mode.label()));
-                ConnectionManagerAction::Continue
+                ConnectionManagerAction::SortModeChanged {
+                    mode: self.sort_mode,
+                }
             }
 
             // Duplicate selected (shift-d)
@@ -724,7 +733,7 @@ impl ConnectionManagerModal {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::raw(self.search.clone()),
+            Span::raw(self.search.as_str()),
         ];
         if self.search_active {
             spans.push(Span::styled("▎", Style::default().fg(Color::Yellow)));
@@ -738,11 +747,11 @@ impl ConnectionManagerModal {
             return;
         };
 
-        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
 
         let name_color = entry.color.to_ratatui_color().unwrap_or(Color::White);
         lines.push(Line::from(vec![Span::styled(
-            entry.name.clone(),
+            entry.name.as_str(),
             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
         )]));
         let kind_label = match entry.kind {
@@ -750,44 +759,41 @@ impl ConnectionManagerModal {
             crate::config::DbKind::Mongo => "MongoDB",
         };
         lines.push(Line::from(Span::styled(
-            kind_label.to_string(),
+            kind_label,
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(""));
 
-        lines.push(detail_row("Target", entry.display_string()));
+        lines.push(detail_row_owned("Target", entry.display_string()));
         if let Some(folder) = entry.folder.as_deref() {
-            lines.push(detail_row("Folder", folder.to_string()));
+            lines.push(detail_row("Folder", folder));
         }
         if !entry.tags.is_empty() {
-            lines.push(detail_row("Tags", entry.tags.join(", ")));
+            lines.push(detail_row_owned("Tags", entry.tags.join(", ")));
         }
         if let Some(app) = entry.application_name.as_deref() {
-            lines.push(detail_row("App name", app.to_string()));
+            lines.push(detail_row("App name", app));
         }
         if let Some(t) = entry.connect_timeout_secs {
-            lines.push(detail_row("Timeout", format!("{}s", t)));
+            lines.push(detail_row_owned("Timeout", format!("{}s", t)));
         }
         if let Some(ssl) = entry.ssl_mode {
-            lines.push(detail_row("SSL", ssl.as_str().to_string()));
+            lines.push(detail_row("SSL", ssl.as_str()));
         }
-        lines.push(detail_row(
-            "Password",
-            entry.password_source_label().to_string(),
-        ));
-        lines.push(detail_row("Last used", entry.last_used_label()));
-        lines.push(detail_row("Use count", entry.use_count.to_string()));
+        lines.push(detail_row("Password", entry.password_source_label()));
+        lines.push(detail_row_owned("Last used", entry.last_used_label()));
+        lines.push(detail_row_owned("Use count", entry.use_count.to_string()));
 
         if let Some(desc) = entry.description.as_deref() {
             if !desc.trim().is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "Notes".to_string(),
+                    "Notes",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::raw(desc.to_string())));
+                lines.push(Line::from(Span::raw(desc)));
             }
         }
 
@@ -972,7 +978,17 @@ impl ConnectionManagerModal {
     }
 }
 
-fn detail_row(label: &str, value: String) -> Line<'static> {
+fn detail_row<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<10}", label),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(value),
+    ])
+}
+
+fn detail_row_owned(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{:<10}", label),
