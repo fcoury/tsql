@@ -334,6 +334,16 @@ impl ConnectionEntry {
                         }
                     }
                 }
+                // No password supplied — the stored URI may still carry
+                // one (imported files or manual edits can embed
+                // `mongodb://user:password@host/…`). Strip it so yank /
+                // copy-as-CLI never leaks credentials to the clipboard.
+                if let Ok(mut parsed) = Url::parse(uri) {
+                    if parsed.password().is_some() {
+                        let _ = parsed.set_password(None);
+                        return parsed.to_string();
+                    }
+                }
                 return uri.clone();
             }
             return "mongodb://localhost".to_string();
@@ -724,8 +734,14 @@ impl ConnectionEntry {
 
     /// Sanitised `tsql <url>` CLI form for yanking to clipboard.
     pub fn to_cli_command(&self) -> String {
+        // Shell-quote the URL so characters like `&` (common in Mongo
+        // query strings, e.g. `?replicaSet=rs0&ssl=true`) don't get
+        // interpreted by the user's shell when they paste the command.
         let url = self.to_url(None);
-        format!("tsql {}", url)
+        let quoted = shlex::try_quote(&url)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| format!("'{}'", url.replace('\'', "'\\''")));
+        format!("tsql {}", quoted)
     }
 
     /// Parse and normalise a comma-separated tag string. Whitespace trimmed;
@@ -1430,6 +1446,54 @@ user = "me"
         assert!(entry.description.is_none());
         assert!(entry.tags.is_empty());
         assert_eq!(entry.use_count, 0);
+    }
+
+    #[test]
+    fn test_mongo_to_url_none_strips_password_from_stored_uri() {
+        // Regression: imported/manually-edited connections.toml entries
+        // can carry passwords embedded in the `uri`. `to_url(None)` is
+        // used by yank and copy-as-CLI actions, which advertise "no
+        // password". Ensure the password is actually stripped.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:secret@host:27017/db".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(!url.contains("secret"), "leaked password: {url}");
+        assert!(url.contains("user"));
+        assert!(url.contains("host"));
+    }
+
+    #[test]
+    fn test_to_cli_command_quotes_url_with_shell_meta_chars() {
+        // Regression: URLs with `&`, `?`, `*`, etc. (common in Mongo
+        // query strings like `?replicaSet=rs0&ssl=true`) must be
+        // shell-escaped or the pasted command breaks / runs unintended
+        // things.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://host/db?replicaSet=rs0&ssl=true".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: String::new(),
+            ..Default::default()
+        };
+        let cmd = entry.to_cli_command();
+        // The URL must be inside quotes (single or double), i.e. the
+        // command should NOT be just `tsql mongodb://…&…`.
+        assert!(
+            cmd.starts_with("tsql '") || cmd.starts_with("tsql \""),
+            "cli command not quoted: {cmd}",
+        );
+        assert!(cmd.contains("mongodb://host/db?replicaSet=rs0&ssl=true"));
     }
 
     #[test]

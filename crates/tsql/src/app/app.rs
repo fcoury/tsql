@@ -245,9 +245,16 @@ pub fn validate_connection_url(raw: &str) -> std::result::Result<(), String> {
     })?;
     match parsed.scheme() {
         "postgres" | "postgresql" => {
-            if parsed.host_str().is_none() {
+            // libpq accepts hostless forms that default to a local
+            // Unix socket: `postgresql:///mydb` or `postgres://user@/db`.
+            // We only reject URLs whose path (i.e. database name) is
+            // also empty and have no query string that could supply
+            // fallback settings.
+            let has_host = parsed.host_str().is_some();
+            let has_db = !parsed.path().trim_start_matches('/').is_empty();
+            if !has_host && !has_db && parsed.query().is_none() {
                 return Err(
-                    "PostgreSQL URL is missing a host (did you forget the hostname?)".to_string(),
+                    "PostgreSQL URL is empty — need a host or a database name".to_string(),
                 );
             }
             Ok(())
@@ -10242,6 +10249,13 @@ impl App {
                         // one; for startup reconnects we fall back to the
                         // picker so the user is never stuck on an empty
                         // alt-screen.
+                        // Regardless of reason: no connection has
+                        // actually been established, so don't let the
+                        // pending `current_connection_name` make the
+                        // rest of the app (session save, use-count
+                        // bump, sidebar highlight) think this entry is
+                        // active.
+                        self.current_connection_name = None;
                         match reason {
                             PasswordResolveReason::UserPicked => {
                                 self.last_error = None;
@@ -10249,7 +10263,6 @@ impl App {
                                 self.password_prompt = Some(PasswordPrompt::new(entry));
                             }
                             PasswordResolveReason::Startup => {
-                                self.current_connection_name = None;
                                 self.last_status = Some(format!(
                                     "Saved credentials for '{}' unavailable — pick a connection",
                                     entry.name
@@ -10785,8 +10798,19 @@ mod tests {
     #[test]
     fn test_validate_connection_url_rejects_malformed() {
         let err = validate_connection_url("postgres://").unwrap_err();
-        // Either the parse fails, or it parses but has no host.
-        assert!(err.to_lowercase().contains("url") || err.to_lowercase().contains("host"));
+        // Either the parse fails, or it parses but is empty in every
+        // sense (no host, no database, no query).
+        let lc = err.to_lowercase();
+        assert!(lc.contains("url") || lc.contains("empty") || lc.contains("host"));
+    }
+
+    #[test]
+    fn test_validate_connection_url_accepts_hostless_libpq_forms() {
+        // `postgresql:///mydb` — libpq Unix-socket form, valid. The
+        // previous validator rejected it for having no host.
+        assert!(validate_connection_url("postgresql:///mydb").is_ok());
+        // Bare socket with query parameters: accepted for forwarding.
+        assert!(validate_connection_url("postgres:///?host=/var/run").is_ok());
     }
 
     #[test]
