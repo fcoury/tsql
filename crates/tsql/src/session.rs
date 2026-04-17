@@ -124,7 +124,12 @@ pub fn save_session_to_path(state: &SessionState, path: &Path) -> Result<()> {
 
     tmp.write_all(content.as_bytes())
         .context("Failed to write temp session file")?;
-    tmp.flush().context("Failed to flush temp session file")?;
+    // fsync before rename — otherwise a hard power-cut between flush
+    // and rename can leave the session.json pointing at a file whose
+    // contents never reached disk.
+    tmp.as_file()
+        .sync_all()
+        .context("Failed to fsync temp session file")?;
 
     tmp.persist(path)
         .map_err(|e| anyhow::anyhow!("Failed to persist session file: {}", e))?;

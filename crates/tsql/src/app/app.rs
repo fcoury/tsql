@@ -3587,15 +3587,15 @@ impl App {
         }
 
         // Handle connection form when active - it captures all input
-        if self.connection_form.is_some() {
-            let action = self.connection_form.as_mut().unwrap().handle_key(key);
+        if let Some(form) = self.connection_form.as_mut() {
+            let action = form.handle_key(key);
             self.handle_connection_form_action(action);
             return false;
         }
 
         // Handle connection manager when active - it captures all input
-        if self.connection_manager.is_some() {
-            let action = self.connection_manager.as_mut().unwrap().handle_key(key);
+        if let Some(manager) = self.connection_manager.as_mut() {
+            let action = manager.handle_key(key);
             self.handle_connection_manager_action(action);
             return false;
         }
@@ -8948,6 +8948,14 @@ impl App {
             return;
         }
 
+        // Reject re-entry BEFORE pushing history, so rapid-fire Enter
+        // presses while a query is still in flight don't bloat the
+        // history with duplicates.
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
         // Push to both editor history (for Ctrl-p/n navigation) and persistent history.
         self.editor.push_history(query.clone());
         let conn_info = self
@@ -8956,12 +8964,6 @@ impl App {
             .as_ref()
             .map(|s| ConnectionInfo::parse(s).format(50));
         self.history.push(query.clone(), conn_info);
-
-        // Only block if a query is actively running (not just an idle paged cursor)
-        if self.db.running {
-            self.last_status = Some("Query already running".to_string());
-            return;
-        }
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());

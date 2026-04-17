@@ -279,6 +279,29 @@ const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
     ],
 );
 
+const CONNECTION_MANAGER: HelpSection = HelpSection::new(
+    "Connection Manager (gm / Ctrl+Shift+C)",
+    &[
+        KeyBinding::new("Enter", "Connect to selected"),
+        KeyBinding::new("a / e / d", "Add / Edit / Delete"),
+        KeyBinding::new("D", "Duplicate selected"),
+        KeyBinding::new("f", "Cycle favorite slot (1–9)"),
+        KeyBinding::new("t", "Test connection (non-blocking)"),
+        KeyBinding::new("/", "Fuzzy filter across fields"),
+        KeyBinding::new("s", "Cycle sort mode (persisted)"),
+        KeyBinding::new("Ctrl+K / Ctrl+J", "Move selected up / down"),
+        KeyBinding::new("y", "Yank URL (password stripped)"),
+        KeyBinding::new("c", "Copy tsql <url> CLI command"),
+        KeyBinding::new("Ctrl+S / Ctrl+T (in form)", "Save / Test"),
+        KeyBinding::new("Ctrl+U / Ctrl+W (in form)", "Clear field / Delete word"),
+        KeyBinding::new(":export-connections <path>", "Export to TOML"),
+        KeyBinding::new(
+            ":import-connections <path>",
+            "Import (+ --overwrite/--skip/--rename)",
+        ),
+    ],
+);
+
 const ALL_SECTIONS: &[HelpSection] = &[
     GLOBAL,
     GOTO,
@@ -295,6 +318,7 @@ const ALL_SECTIONS: &[HelpSection] = &[
     GRID_COLUMNS,
     COMMANDS,
     SCHEMA_COMMANDS,
+    CONNECTION_MANAGER,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

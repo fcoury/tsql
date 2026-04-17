@@ -1927,16 +1927,13 @@ mod tests {
 
     #[test]
     fn test_colon_key_opens_command_in_grid() {
-        // Bug: pressing ':' in grid mode should open command prompt
-        // but GridKeyResult doesn't have an OpenCommand variant
+        // Regression: ':' in grid mode must open the command prompt.
         let mut state = GridState::default();
         let model = create_test_model();
 
         let key = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE);
         let result = state.handle_key(key, &model);
 
-        // This test documents the bug: ':' should return OpenCommand
-        // Currently it returns None because ':' is not handled
         assert_eq!(
             result,
             GridKeyResult::OpenCommand,

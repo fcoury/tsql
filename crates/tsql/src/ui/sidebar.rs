@@ -231,13 +231,26 @@ impl Sidebar {
             Style::default().fg(Color::Yellow)
         };
 
-        let tree = Tree::new(schema_items)
-            .expect("valid tree items")
-            .block(block)
-            .highlight_style(highlight_style)
-            .highlight_symbol("› ");
-
-        frame.render_stateful_widget(tree, area, &mut self.schema_state);
+        // Tree::new fails if any of the items have duplicate IDs.
+        // In a real DB this can't happen (schema/table/column names are
+        // unique within their parent) but a misbehaving driver should
+        // degrade gracefully rather than panic the whole TUI.
+        match Tree::new(schema_items) {
+            Ok(tree) => {
+                let tree = tree
+                    .block(block)
+                    .highlight_style(highlight_style)
+                    .highlight_symbol("› ");
+                frame.render_stateful_widget(tree, area, &mut self.schema_state);
+            }
+            Err(e) => {
+                let err =
+                    Paragraph::new(format!("Schema tree build failed: {}\n(retry with `r`)", e))
+                        .block(block)
+                        .style(Style::default().fg(Color::Red));
+                frame.render_widget(err, area);
+            }
+        }
     }
 
     /// Move selection up in connections list by the specified amount.
