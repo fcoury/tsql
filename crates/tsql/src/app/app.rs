@@ -2164,16 +2164,25 @@ pub enum DbEvent {
         client: SharedClient,
         cancel_token: CancelToken,
         connected_with_tls: bool,
+        /// Generation number of the `start_connect` call that spawned
+        /// the task. The UI handler drops events whose generation no
+        /// longer matches `App::connect_generation`, so a stale
+        /// connect for `A` that finishes after the user has already
+        /// moved on to `B` never installs its client.
+        connect_generation: u64,
     },
     MongoConnected {
         client: SharedMongoClient,
         database: String,
+        connect_generation: u64,
     },
     ConnectError {
         error: String,
+        connect_generation: u64,
     },
     ConnectionLost {
         error: String,
+        connect_generation: u64,
     },
     QueryFinished {
         result: QueryResult,
@@ -2563,6 +2572,22 @@ pub struct App {
     /// an aborted pick would leave it pointing at an entry the user
     /// never actually reached.
     pub active_connection_name: Option<String>,
+    /// Monotonic counter bumped on every `start_connect`. Stamped on
+    /// the connect task's events so the UI can tell whether a late
+    /// `Connected` / `ConnectError` belongs to the current attempt
+    /// or to one the user has since abandoned (e.g. picked another
+    /// connection mid-handshake).
+    pub connect_generation: u64,
+    /// When the user triggers "duplicate" in the connection manager,
+    /// the form goes through the edit path (to seed every visible
+    /// field) but is flipped to `add` semantics via `mark_as_new` so
+    /// the save lands in `connections.add`. `add` doesn't do the
+    /// edit-path merge, so fields with no form input (SSL cert paths,
+    /// other future non-form fields) would silently drop. Stash the
+    /// source here so the Save handler can merge those back in when
+    /// the next `ConnectionFormAction::Save` fires without an
+    /// `original_name`.
+    pub pending_duplicate_donor: Option<Box<ConnectionEntry>>,
     /// Connection picker (fuzzy picker for quick connection selection).
     pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
@@ -2767,6 +2792,8 @@ impl App {
             connections: ConnectionsFile::new(),
             current_connection_name: None,
             active_connection_name: None,
+            connect_generation: 0,
+            pending_duplicate_donor: None,
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
@@ -5031,6 +5058,7 @@ impl App {
             ConfirmContext::CloseConnectionForm => {
                 // Close the connection form without saving
                 self.connection_form = None;
+                self.pending_duplicate_donor = None;
                 self.last_status = Some("Changes discarded".to_string());
                 false
             }
@@ -7642,6 +7670,13 @@ impl App {
 
         self.last_status = Some("Connecting...".to_string());
 
+        // Bump generation so any still-in-flight connect task from a
+        // previous `start_connect` call is recognised as stale by
+        // `apply_db_event` and its Connected / error events are
+        // dropped.
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        let gen = self.connect_generation;
+
         let tx = self.db_events_tx.clone();
         let rt = self.rt.clone();
 
@@ -7655,17 +7690,20 @@ impl App {
                         if let Err(e) = ping_db.run_command(doc! { "ping": 1 }).await {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format!("Mongo connection error: {e}"),
+                                connect_generation: gen,
                             });
                             return;
                         }
                         let _ = tx.send(DbEvent::MongoConnected {
                             client: Arc::new(client),
                             database: db_name,
+                            connect_generation: gen,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(DbEvent::ConnectError {
                             error: format!("Mongo connection error: {e}"),
+                            connect_generation: gen,
                         });
                     }
                 }
@@ -7675,7 +7713,10 @@ impl App {
             let ssl_mode = match resolve_ssl_mode(&conn_str) {
                 Ok(m) => m,
                 Err(msg) => {
-                    let _ = tx.send(DbEvent::ConnectError { error: msg });
+                    let _ = tx.send(DbEvent::ConnectError {
+                        error: msg,
+                        connect_generation: gen,
+                    });
                     return;
                 }
             };
@@ -7689,6 +7730,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation: gen,
                                     });
                                 }
                             });
@@ -7699,11 +7741,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: false,
+                                connect_generation: gen,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation: gen,
                             });
                         }
                     }
@@ -7718,6 +7762,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation: gen,
                                     });
                                 }
                             });
@@ -7728,11 +7773,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation: gen,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation: gen,
                             });
                         }
                     }
@@ -7747,6 +7794,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation: gen,
                                     });
                                 }
                             });
@@ -7757,6 +7805,7 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation: gen,
                             });
                         }
                         Err(e) => {
@@ -7768,6 +7817,7 @@ impl App {
                                         if let Err(e) = connection.await {
                                             let _ = tx2.send(DbEvent::ConnectionLost {
                                                 error: format_pg_error(&e),
+                                                connect_generation: gen,
                                             });
                                         }
                                     });
@@ -7778,6 +7828,7 @@ impl App {
                                         client: shared,
                                         cancel_token: token,
                                         connected_with_tls: false,
+                                        connect_generation: gen,
                                     });
                                 }
                                 Err(e) => {
@@ -7786,6 +7837,7 @@ impl App {
                                         error: format!(
                                             "{tls_error}\n\nTLS failed (sslmode=prefer), then plain connect failed:\n{plain_error}"
                                         ),
+                                        connect_generation: gen,
                                     });
                                 }
                             }
@@ -7802,6 +7854,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation: gen,
                                     });
                                 }
                             });
@@ -7812,11 +7865,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation: gen,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation: gen,
                             });
                         }
                     }
@@ -8436,8 +8491,11 @@ impl App {
                 );
                 // Duplicate is a fresh entry, not an edit — flip the save
                 // path from update() to add() so the new name is actually
-                // inserted rather than rejected as "not found".
+                // inserted rather than rejected as "not found". Remember
+                // the source so Save can re-apply fields the form doesn't
+                // expose (SSL cert paths etc.).
                 form.mark_as_new(format!("Duplicate: {}", dup.name));
+                self.pending_duplicate_donor = Some(Box::new(dup));
                 self.connection_form = Some(form);
             }
             ConnectionManagerAction::YankUrl { url } => {
@@ -8730,6 +8788,9 @@ impl App {
             ConnectionFormAction::Continue => {}
             ConnectionFormAction::Cancel => {
                 self.connection_form = None;
+                // If we arrived here via a Duplicate, drop the stashed
+                // donor — the duplicate was abandoned.
+                self.pending_duplicate_donor = None;
             }
             ConnectionFormAction::Save {
                 mut entry,
@@ -8741,6 +8802,18 @@ impl App {
                     if let Some(existing) = self.connections.find_by_name(orig) {
                         merge_edit_preserving_non_form_fields(&mut entry, existing);
                     }
+                } else if let Some(donor) = self.pending_duplicate_donor.take() {
+                    // Duplicate: form has add-semantics (original_name=None)
+                    // but we still want to carry over non-form fields
+                    // (notably SSL cert paths) from the donor.
+                    merge_edit_preserving_non_form_fields(&mut entry, &donor);
+                    // Reset ephemeral donor-specific metadata so the
+                    // duplicate doesn't inherit use_count / favorite /
+                    // order from the source.
+                    entry.use_count = 0;
+                    entry.last_used_at = None;
+                    entry.favorite = None;
+                    entry.order = 0;
                 }
 
                 // Handle add vs edit
@@ -10098,7 +10171,15 @@ impl App {
                 client,
                 cancel_token,
                 connected_with_tls,
+                connect_generation,
             } => {
+                // Drop events from abandoned `start_connect` attempts —
+                // otherwise a slow handshake for entry A could land its
+                // client after the user has picked B, and the app would
+                // silently install A while marking B as active.
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Connected;
                 self.db.kind = Some(DbKind::Postgres);
                 self.db.client = Some(client);
@@ -10113,7 +10194,14 @@ impl App {
                 // Load schema for completion
                 self.load_schema();
             }
-            DbEvent::MongoConnected { client, database } => {
+            DbEvent::MongoConnected {
+                client,
+                database,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Connected;
                 self.db.kind = Some(DbKind::Mongo);
                 self.db.client = None;
@@ -10130,7 +10218,13 @@ impl App {
                 self.record_successful_connect();
                 self.load_schema();
             }
-            DbEvent::ConnectError { error } => {
+            DbEvent::ConnectError {
+                error,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -10143,7 +10237,13 @@ impl App {
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
-            DbEvent::ConnectionLost { error } => {
+            DbEvent::ConnectionLost {
+                error,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -11218,6 +11318,126 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.current_connection_name.is_none());
         assert!(app.active_connection_name.is_none());
+    }
+
+    #[test]
+    fn test_duplicate_preserves_non_form_fields_like_ssl_cert_paths() {
+        // Regression: duplicate path went through
+        // `ConnectionFormModal::edit_with_keymap_*` + `mark_as_new`,
+        // which flips Save from `update` to `add`. `add` doesn't go
+        // through the edit-path merge, so fields the form never shows
+        // (notably the three SSL cert paths) silently dropped —
+        // duplicated TLS-cert connections then stopped working.
+        use std::path::PathBuf;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Seed a source entry with SSL cert paths (non-form fields).
+        let src = crate::config::ConnectionEntry {
+            name: "src".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ssl_root_cert: Some(PathBuf::from("/etc/ssl/root.crt")),
+            ssl_client_cert: Some(PathBuf::from("/etc/ssl/client.crt")),
+            ssl_client_key: Some(PathBuf::from("/etc/ssl/client.key")),
+            ..Default::default()
+        };
+        app.connections.add(src.clone()).unwrap();
+
+        // Fire Duplicate → stashes donor.
+        app.handle_connection_manager_action(crate::ui::ConnectionManagerAction::Duplicate {
+            entry: src.clone(),
+        });
+        assert!(app.pending_duplicate_donor.is_some());
+
+        // Simulate the form's Save with a form-rebuilt entry that has
+        // NO cert paths (because the form has no inputs for them).
+        let form_built = crate::config::ConnectionEntry {
+            name: "src-copy".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            // cert paths intentionally absent — the form strips them.
+            ..Default::default()
+        };
+        app.handle_connection_form_action(crate::ui::ConnectionFormAction::Save {
+            entry: form_built,
+            password: None,
+            save_password: false,
+            original_name: None,
+        });
+
+        let stored = app
+            .connections
+            .find_by_name("src-copy")
+            .expect("duplicate saved");
+        assert_eq!(stored.ssl_root_cert, src.ssl_root_cert);
+        assert_eq!(stored.ssl_client_cert, src.ssl_client_cert);
+        assert_eq!(stored.ssl_client_key, src.ssl_client_key);
+        // Usage metadata should not carry over.
+        assert_eq!(stored.use_count, 0);
+        assert!(stored.last_used_at.is_none());
+        // Donor cleared after consuming.
+        assert!(app.pending_duplicate_donor.is_none());
+    }
+
+    #[test]
+    fn test_stale_connect_events_dropped_by_generation_guard() {
+        // Regression: a slow Connected event from a previous
+        // start_connect must not overwrite the current session when
+        // the user has since moved on. The `connect_generation` field
+        // stamps outgoing events and the handler drops mismatches.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        // Simulate: two start_connect calls bumped the generation, so
+        // the "current" is now 7. A stale event from generation 5
+        // arrives.
+        app.connect_generation = 7;
+        app.current_connection_name = Some("b".to_string());
+        app.db.status = DbStatus::Connecting;
+
+        app.apply_db_event(DbEvent::ConnectError {
+            error: "stale".to_string(),
+            connect_generation: 5,
+        });
+        assert_eq!(
+            app.db.status,
+            DbStatus::Connecting,
+            "stale ConnectError must not flip status to Error"
+        );
+        assert!(
+            app.last_error.is_none(),
+            "stale ConnectError must not surface error to user"
+        );
+
+        // Matching-generation event goes through.
+        app.apply_db_event(DbEvent::ConnectError {
+            error: "real".to_string(),
+            connect_generation: 7,
+        });
+        assert_eq!(app.db.status, DbStatus::Error);
+        assert!(app
+            .last_error
+            .as_deref()
+            .map(|e| e.contains("real"))
+            .unwrap_or(false));
     }
 
     #[test]

@@ -1372,8 +1372,24 @@ pub fn write_connections_atomic(path: &Path, file: &ConnectionsFile) -> Result<(
     tmp.as_file()
         .sync_all()
         .context("Failed to fsync connections temp file")?;
-    tmp.persist(path)
-        .map_err(|e| anyhow!("Failed to rename temp file into place: {}", e))?;
+
+    // `NamedTempFile::persist` does a rename, but tempfile's own docs
+    // note that on Windows persist-over-an-existing-file is not
+    // guaranteed. Convert to a `TempPath` (giving up the destructor)
+    // and use `std::fs::rename`, which is documented to replace on
+    // every supported platform: Unix atomic rename, Windows
+    // `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`.
+    let tmp_path = tmp.into_temp_path();
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename temp connections file into place at {}",
+            path.display()
+        )
+    })?;
+    // rename consumed the inode but the TempPath still points at the
+    // old location — detach it so its Drop doesn't try to unlink a
+    // path that no longer exists.
+    let _ = tmp_path.keep();
 
     Ok(())
 }
