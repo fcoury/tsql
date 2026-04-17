@@ -388,6 +388,31 @@ fn parse_import_flag(flag: &str) -> std::result::Result<crate::config::ImportCon
     }
 }
 
+/// Merge the non-form-editable fields of `existing` into `updated` so
+/// that saving an edited connection never drops metadata the UI can't
+/// see. The form currently covers user / host / port / database / tags
+/// / folder / description / application_name / connect_timeout_secs
+/// / ssl_mode / color — everything else must be threaded through from
+/// the existing record:
+///
+/// - usage stats (`last_used_at`, `use_count`)
+/// - `favorite` slot and manual `order`
+/// - SSL certificate paths (root, client cert, client key) — there's
+///   no form input for these yet and wiping them would silently break
+///   TLS for imported entries.
+fn merge_edit_preserving_non_form_fields(
+    updated: &mut ConnectionEntry,
+    existing: &ConnectionEntry,
+) {
+    updated.last_used_at = existing.last_used_at;
+    updated.use_count = existing.use_count;
+    updated.favorite = existing.favorite;
+    updated.order = existing.order;
+    updated.ssl_root_cert = existing.ssl_root_cert.clone();
+    updated.ssl_client_cert = existing.ssl_client_cert.clone();
+    updated.ssl_client_key = existing.ssl_client_key.clone();
+}
+
 /// Build a compact "N lines, M bytes" label for yank status messages.
 fn yank_size_hint(text: &str) -> String {
     let bytes = text.len();
@@ -8614,15 +8639,9 @@ impl App {
                 save_password,
                 original_name,
             } => {
-                // Preserve metadata that the form itself doesn't edit
-                // (usage stats + favorite slot) across saves, so an edit
-                // never resets `last_used_at` / `use_count` / `favorite`.
                 if let Some(ref orig) = original_name {
                     if let Some(existing) = self.connections.find_by_name(orig) {
-                        entry.last_used_at = existing.last_used_at;
-                        entry.use_count = existing.use_count;
-                        entry.favorite = existing.favorite;
-                        entry.order = existing.order;
+                        merge_edit_preserving_non_form_fields(&mut entry, existing);
                     }
                 }
 
@@ -10235,10 +10254,22 @@ impl App {
             } => {
                 let entry = *entry;
                 self.password_resolve_in_flight.remove(&entry.name);
+
+                // Drop stale callbacks: if the user has since connected
+                // (or started connecting) to a different entry while
+                // this background resolve was in flight, applying the
+                // old result would silently replace their active
+                // target. Compare against the currently-tracked
+                // connection name — we set that to `Some(entry.name)`
+                // right before dispatching the resolve, so a mismatch
+                // means "user moved on, discard me".
+                if self.current_connection_name.as_deref() != Some(entry.name.as_str()) {
+                    return;
+                }
+
                 match result {
                     Ok(Some(pwd)) => {
                         let url = entry.to_url(Some(&pwd));
-                        self.current_connection_name = Some(entry.name.clone());
                         self.last_error = None;
                         self.last_status = Some(format!("Connecting to {}…", entry.name));
                         self.start_connect(url);
@@ -10836,6 +10867,46 @@ mod tests {
         let data = "x".repeat(2000);
         let hint = yank_size_hint(&data);
         assert!(hint.contains("KB"));
+    }
+
+    #[test]
+    fn test_merge_edit_preserves_ssl_cert_paths_and_usage_metadata() {
+        // Regression: the form has no inputs for ssl_root_cert / ssl_client_cert
+        // / ssl_client_key, so editing an imported TLS-configured entry would
+        // silently drop them. The merge helper must carry them over, along
+        // with the usage stats / favorite slot / manual order the form doesn't
+        // expose either.
+        use std::path::PathBuf;
+        let existing = ConnectionEntry {
+            name: "x".to_string(),
+            host: "old-host".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ssl_root_cert: Some(PathBuf::from("/etc/ssl/root.crt")),
+            ssl_client_cert: Some(PathBuf::from("/etc/ssl/client.crt")),
+            ssl_client_key: Some(PathBuf::from("/etc/ssl/client.key")),
+            favorite: Some(3),
+            use_count: 42,
+            order: 7,
+            ..Default::default()
+        };
+        let mut updated = ConnectionEntry {
+            name: "x".to_string(),
+            host: "new-host".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        merge_edit_preserving_non_form_fields(&mut updated, &existing);
+        assert_eq!(updated.host, "new-host", "form field must win");
+        assert_eq!(updated.ssl_root_cert, existing.ssl_root_cert);
+        assert_eq!(updated.ssl_client_cert, existing.ssl_client_cert);
+        assert_eq!(updated.ssl_client_key, existing.ssl_client_key);
+        assert_eq!(updated.favorite, Some(3));
+        assert_eq!(updated.use_count, 42);
+        assert_eq!(updated.order, 7);
     }
 
     #[test]
