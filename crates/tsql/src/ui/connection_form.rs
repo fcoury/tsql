@@ -209,6 +209,13 @@ struct OriginalFormValues {
     save_password: bool,
     ssl_mode: SslMode,
     color: ConnectionColor,
+    // v2 metadata fields — must be in the snapshot too or editing them
+    // alone and pressing Esc would skip the unsaved-changes prompt.
+    description: String,
+    tags_input: String,
+    folder: String,
+    application_name: String,
+    connect_timeout_secs: String,
 }
 
 impl ConnectionFormModal {
@@ -304,6 +311,15 @@ impl ConnectionFormModal {
             .position(|&c| c == entry.color.to_string())
             .unwrap_or(0);
 
+        let description = entry.description.clone().unwrap_or_default();
+        let tags_input = entry.tags.join(", ");
+        let folder = entry.folder.clone().unwrap_or_default();
+        let application_name = entry.application_name.clone().unwrap_or_default();
+        let connect_timeout_secs = entry
+            .connect_timeout_secs
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+
         let original_values = OriginalFormValues {
             name: entry.name.clone(),
             kind: entry.kind,
@@ -317,19 +333,15 @@ impl ConnectionFormModal {
             save_password: entry.password_in_keychain,
             ssl_mode: entry.ssl_mode.unwrap_or(SslMode::Disable),
             color: entry.color,
+            description: description.clone(),
+            tags_input: tags_input.clone(),
+            folder: folder.clone(),
+            application_name: application_name.clone(),
+            connect_timeout_secs: connect_timeout_secs.clone(),
         };
 
         let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
         let ssl_mode_index = ssl_mode.to_index();
-
-        let description = entry.description.clone().unwrap_or_default();
-        let tags_input = entry.tags.join(", ");
-        let folder = entry.folder.clone().unwrap_or_default();
-        let application_name = entry.application_name.clone().unwrap_or_default();
-        let connect_timeout_secs = entry
-            .connect_timeout_secs
-            .map(|v| v.to_string())
-            .unwrap_or_default();
         let description_cursor = description.chars().count();
         let tags_input_cursor = tags_input.chars().count();
         let folder_cursor = folder.chars().count();
@@ -386,6 +398,21 @@ impl ConnectionFormModal {
         }
     }
 
+    /// Convert an edit-mode form into new-entry mode. Called by the
+    /// connection manager's "duplicate" action: seed all fields from an
+    /// existing entry (via `edit_with_keymap_*`), then call this to flip
+    /// the save path from `update()` → `add()` — otherwise saving would
+    /// fail with "Connection '<generated>' not found" because the new
+    /// name doesn't exist yet.
+    pub fn mark_as_new(&mut self, title: impl Into<String>) {
+        self.original_name = None;
+        self.original_values = None;
+        self.title = title.into();
+        // Force dirty state so the unsaved-changes prompt fires on Esc
+        // without the user having to touch any field first.
+        self.modified = true;
+    }
+
     /// Check if the form has unsaved changes.
     pub fn is_modified(&self) -> bool {
         if self.modified {
@@ -424,7 +451,12 @@ impl ConnectionFormModal {
                 || self.op_ref != orig.op_ref
                 || self.save_password != orig.save_password
                 || self.ssl_mode != orig.ssl_mode
-                || self.color != orig.color;
+                || self.color != orig.color
+                || self.description != orig.description
+                || self.tags_input != orig.tags_input
+                || self.folder != orig.folder
+                || self.application_name != orig.application_name
+                || self.connect_timeout_secs != orig.connect_timeout_secs;
         }
 
         false
@@ -1737,6 +1769,86 @@ mod tests {
         assert_eq!(form.port, "5433");
         assert_eq!(form.password, "secret");
         assert_eq!(form.original_name, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_mark_as_new_clears_edit_metadata_so_save_goes_through_add() {
+        // Regression: duplicate action used `edit_with_keymap_*` which
+        // set `original_name`, and the save path then called
+        // `ConnectionsFile::update(orig, ...)` — failing with
+        // "Connection '<name>' not found" because the new name doesn't
+        // exist yet. `mark_as_new` must clear that so save goes through
+        // `add()` instead.
+        let entry = ConnectionEntry {
+            name: "src".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        let mut form = ConnectionFormModal::edit(&entry, None);
+        assert_eq!(form.original_name, Some("src".to_string()));
+        form.mark_as_new("Duplicate: src-copy");
+        assert!(form.original_name.is_none());
+        assert!(form.original_values.is_none());
+        assert!(form.is_modified());
+    }
+
+    #[test]
+    fn test_is_modified_detects_description_tag_folder_changes_in_edit_mode() {
+        // Regression: changing only v2 metadata fields
+        // (description/tags/folder/application_name/connect_timeout_secs)
+        // in edit mode used to report `is_modified() == false`, so Esc
+        // closed the form without the unsaved-changes prompt and the
+        // user's edits were discarded.
+        let entry = ConnectionEntry {
+            name: "x".to_string(),
+            host: "h".to_string(),
+            port: 5432,
+            database: "d".to_string(),
+            user: "u".to_string(),
+            description: Some("old desc".to_string()),
+            tags: vec!["prod".to_string()],
+            folder: Some("Production".to_string()),
+            application_name: Some("tsql".to_string()),
+            connect_timeout_secs: Some(10),
+            ..Default::default()
+        };
+        for (mutate, label) in [
+            (
+                Box::new(|f: &mut ConnectionFormModal| f.description = "new desc".to_string())
+                    as Box<dyn FnOnce(&mut ConnectionFormModal)>,
+                "description",
+            ),
+            (
+                Box::new(|f: &mut ConnectionFormModal| f.tags_input = "prod, critical".to_string()),
+                "tags",
+            ),
+            (
+                Box::new(|f: &mut ConnectionFormModal| f.folder = "Staging".to_string()),
+                "folder",
+            ),
+            (
+                Box::new(|f: &mut ConnectionFormModal| f.application_name = "other".to_string()),
+                "application_name",
+            ),
+            (
+                Box::new(|f: &mut ConnectionFormModal| f.connect_timeout_secs = "30".to_string()),
+                "connect_timeout_secs",
+            ),
+        ] {
+            let mut form = ConnectionFormModal::edit(&entry, None);
+            assert!(
+                !form.is_modified(),
+                "{label}: freshly edit-loaded form should be unmodified",
+            );
+            mutate(&mut form);
+            assert!(
+                form.is_modified(),
+                "{label}: changing only this field must dirty the form",
+            );
+        }
     }
 
     #[test]

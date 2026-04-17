@@ -8186,12 +8186,17 @@ impl App {
                 dup.password_in_keychain = false;
                 dup.last_used_at = None;
                 dup.use_count = 0;
-                self.connection_form = Some(ConnectionFormModal::edit_with_keymap_and_onepassword(
+                let mut form = ConnectionFormModal::edit_with_keymap_and_onepassword(
                     &dup,
                     None,
                     self.connection_form_keymap.clone(),
                     self.config.connection.enable_onepassword,
-                ));
+                );
+                // Duplicate is a fresh entry, not an edit — flip the save
+                // path from update() to add() so the new name is actually
+                // inserted rather than rejected as "not found".
+                form.mark_as_new(format!("Duplicate: {}", dup.name));
+                self.connection_form = Some(form);
             }
             ConnectionManagerAction::YankUrl { url } => {
                 self.copy_to_clipboard(&url);
