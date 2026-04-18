@@ -1,0 +1,47 @@
+[changelog]
+header = """
+## What's Changed
+
+"""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+{% set message = commit.message | split(pat="\n") | first | trim -%}
+{% if commit.remote.pr_number -%}
+{% set pr_suffix = " (#" ~ commit.remote.pr_number ~ ")" -%}
+{% set message = message | replace(from=pr_suffix, to="") -%}
+{% endif -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ message | upper_first }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+{%- endfor %}
+
+{% endfor %}
+{% if github.contributors %}
+## Contributors
+{% for contributor in github.contributors %}
+- @{{ contributor.username }}{% if contributor.pr_number %} in #{{ contributor.pr_number }}{% endif %}{% if contributor.is_first_time %} (first-time contributor){% endif %}
+{%- endfor %}
+{% endif %}
+"""
+trim = true
+postprocessors = [
+  { pattern = ' by @[^[:space:]]+\[bot\]', replace = "" },
+  { pattern = '\n- @[^[:space:]]+\[bot\][^\n]*', replace = "" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+tag_pattern = "v[0-9].*"
+sort_commits = "oldest"
+
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactoring" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Tests" },
+  { message = "^chore", group = "Maintenance" },
+]

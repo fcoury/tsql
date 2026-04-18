@@ -1000,12 +1000,7 @@ impl ConnectionFormModal {
                     Some(self.folder.trim().to_string())
                 },
                 application_name: None,
-                connect_timeout_secs: self
-                    .connect_timeout_secs
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|v| *v > 0),
+                connect_timeout_secs: None,
                 ..Default::default()
             },
         }
@@ -1028,6 +1023,11 @@ impl ConnectionFormModal {
                 self.user = entry.user;
                 self.ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
                 self.ssl_mode_index = self.ssl_mode.to_index();
+                self.application_name = entry.application_name.unwrap_or_default();
+                self.connect_timeout_secs = entry
+                    .connect_timeout_secs
+                    .map(|secs| secs.to_string())
+                    .unwrap_or_default();
 
                 if let Some(pwd) = password {
                     self.password = pwd;
@@ -1039,6 +1039,8 @@ impl ConnectionFormModal {
                 self.port_cursor = Self::char_count(&self.port);
                 self.database_cursor = Self::char_count(&self.database);
                 self.user_cursor = Self::char_count(&self.user);
+                self.application_name_cursor = Self::char_count(&self.application_name);
+                self.connect_timeout_cursor = Self::char_count(&self.connect_timeout_secs);
 
                 // Clear URL paste field
                 self.url_paste.clear();
@@ -2134,6 +2136,30 @@ mod tests {
     }
 
     #[test]
+    fn test_url_paste_preserves_postgres_query_options_on_save() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "prod".to_string();
+        form.focused = FormField::UrlPaste;
+        form.url_paste =
+            "postgres://admin@db.example.com/production?connect_timeout=5&application_name=tsql"
+                .to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, ConnectionFormAction::StatusMessage(_)));
+        assert_eq!(form.application_name, "tsql");
+        assert_eq!(form.connect_timeout_secs, "5");
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.application_name.as_deref(), Some("tsql"));
+                assert_eq!(entry.connect_timeout_secs, Some(5));
+            }
+            other => panic!("Expected Save action, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_url_paste_decodes_postgres_username() {
         let mut form = ConnectionFormModal::new();
         form.focused = FormField::UrlPaste;
@@ -2188,6 +2214,27 @@ mod tests {
                 let uri = entry.uri.as_deref().unwrap_or("");
                 assert!(uri.contains("authSource=admin"));
                 assert!(!uri.contains(":secret@"));
+            }
+            other => panic!("Expected Save action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_save_mongodb_drops_postgres_only_timeout() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "mongo1".to_string();
+        form.kind = DbKind::Mongo;
+        form.host = "mongo.example.com".to_string();
+        form.port = "27018".to_string();
+        form.database = "sample".to_string();
+        form.user = "admin".to_string();
+        form.connect_timeout_secs = "7".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::Save { entry, .. } => {
+                assert_eq!(entry.kind, DbKind::Mongo);
+                assert_eq!(entry.connect_timeout_secs, None);
             }
             other => panic!("Expected Save action, got {:?}", other),
         }

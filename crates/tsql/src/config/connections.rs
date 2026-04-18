@@ -1501,9 +1501,10 @@ pub fn import_from_path(
     let mut summary = ImportSummary::default();
 
     for mut entry in incoming.connections.into_iter() {
-        // Drop favorite slot to avoid collisions on import; the user can
-        // reassign after review.
+        // Drop source-file ordering metadata to avoid collisions on import;
+        // the user can reassign after review.
         entry.favorite = None;
+        entry.order = 0;
 
         if entry.validate().is_err() {
             summary
@@ -1979,6 +1980,43 @@ user = "me"
         let summary3 = import_from_path(&mut target, &path, ImportConflict::Skip).unwrap();
         assert_eq!(summary3.skipped, 1);
         assert_eq!(summary3.imported, 0);
+    }
+
+    #[test]
+    fn test_import_resets_source_order_before_appending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+
+        let mut incoming = ConnectionsFile::new();
+        incoming.connections.push(ConnectionEntry {
+            name: "imported".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            favorite: Some(1),
+            order: 1,
+            ..Default::default()
+        });
+        write_connections_atomic(&path, &incoming).unwrap();
+
+        let mut target = ConnectionsFile::new();
+        target
+            .add(ConnectionEntry {
+                name: "existing".to_string(),
+                host: "h".to_string(),
+                database: "d".to_string(),
+                user: "u".to_string(),
+                order: 3,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let summary = import_from_path(&mut target, &path, ImportConflict::Rename).unwrap();
+        assert_eq!(summary.imported, 1);
+
+        let imported = target.find_by_name("imported").unwrap();
+        assert_eq!(imported.favorite, None);
+        assert_eq!(imported.order, 4);
     }
 
     #[test]
