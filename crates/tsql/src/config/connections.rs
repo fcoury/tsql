@@ -276,7 +276,7 @@ impl ConnectionEntry {
         let mut url = "postgres://".to_string();
 
         // Add user
-        url.push_str(&self.user);
+        url.push_str(&urlencoding::encode(&self.user));
 
         // Add password if provided
         if let Some(pwd) = password {
@@ -342,7 +342,9 @@ impl ConnectionEntry {
                 DbKind::Mongo => String::new(),
             }
         } else {
-            url.username().to_string()
+            urlencoding::decode(url.username())
+                .map(|s| s.into_owned())
+                .unwrap_or_else(|_| url.username().to_string())
         };
 
         let password = url.password().map(|p| {
@@ -1010,6 +1012,51 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_to_url_with_at_in_username() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "user@domain.com".to_string(),
+            ..Default::default()
+        };
+
+        let url = entry.to_url(None);
+        assert_eq!(url, "postgres://user%40domain.com@localhost/mydb");
+    }
+
+    #[test]
+    fn test_connection_to_url_encodes_reserved_username_chars() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "user:name/role".to_string(),
+            ..Default::default()
+        };
+
+        let url = entry.to_url(None);
+        assert_eq!(url, "postgres://user%3Aname%2Frole@localhost/mydb");
+    }
+
+    #[test]
+    fn test_connection_to_url_preserves_literal_percent_username() {
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "user%40team".to_string(),
+            ..Default::default()
+        };
+
+        let url = entry.to_url(None);
+        assert_eq!(url, "postgres://user%2540team@localhost/mydb");
+    }
+
+    #[test]
     fn test_connection_to_url_non_default_port() {
         let entry = ConnectionEntry {
             name: "test".to_string(),
@@ -1036,6 +1083,28 @@ mod tests {
         assert_eq!(entry.user, "user");
         assert!(password.is_none());
         assert!(entry.ssl_mode.is_none());
+    }
+
+    #[test]
+    fn test_connection_from_url_decodes_encoded_username() {
+        let (entry, password) =
+            ConnectionEntry::from_url("test", "postgres://user%40domain.com@localhost/mydb")
+                .unwrap();
+
+        assert_eq!(entry.user, "user@domain.com");
+        assert!(password.is_none());
+    }
+
+    #[test]
+    fn test_connection_url_round_trip_literal_percent_username() {
+        let (entry, password) =
+            ConnectionEntry::from_url("test", "postgres://user%2540team@localhost/mydb").unwrap();
+
+        assert_eq!(entry.user, "user%40team");
+        assert!(password.is_none());
+
+        let url = entry.to_url(None);
+        assert_eq!(url, "postgres://user%2540team@localhost/mydb");
     }
 
     #[test]
