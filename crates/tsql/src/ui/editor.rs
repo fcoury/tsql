@@ -51,7 +51,7 @@ pub struct CommandPrompt {
 impl CommandPrompt {
     pub fn new() -> Self {
         let mut textarea = TextArea::new(vec![String::new()]);
-        textarea.set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
+        textarea.set_cursor_line_style(Style::default());
 
         Self {
             active: false,
@@ -62,8 +62,7 @@ impl CommandPrompt {
     pub fn open(&mut self) {
         self.active = true;
         self.textarea = TextArea::new(vec![String::new()]);
-        self.textarea
-            .set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
+        self.textarea.set_cursor_line_style(Style::default());
     }
 
     pub fn close(&mut self) {
