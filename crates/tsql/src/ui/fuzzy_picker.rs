@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
+use super::style::{selected_line, selected_row_style};
 
 /// A function that returns an optional styled prefix `(text, style)` for a picker item.
 type PrefixFn<T> = fn(&T) -> Option<(&'static str, Style)>;
@@ -519,13 +520,11 @@ impl<T: Clone> FuzzyPicker<T> {
                     }
                 }
 
-                let style = if is_selected {
-                    Style::default().bg(Color::DarkGray)
+                if is_selected {
+                    ListItem::new(selected_line(body_line)).style(selected_row_style())
                 } else {
-                    Style::default()
-                };
-
-                ListItem::new(body_line).style(style)
+                    ListItem::new(body_line)
+                }
             })
             .collect();
 
@@ -700,6 +699,9 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn test_picker_creation() {
@@ -709,6 +711,36 @@ mod tests {
         assert_eq!(picker.total_count(), 3);
         assert_eq!(picker.filtered_count(), 3);
         assert_eq!(picker.query(), "");
+    }
+
+    #[test]
+    fn test_selected_row_uses_visible_foreground_on_dark_background() {
+        let items = vec!["alpha", "beta", "gamma"];
+        let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| picker.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn test_selected_row_with_fuzzy_match_uses_visible_foreground_on_dark_background() {
+        let items = vec!["alpha", "beta", "gamma"];
+        let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
+        picker.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| picker.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
+use super::style::{selected_line, selected_primary_style, selected_row_style};
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
 /// Result of handling a key event in the connection manager.
@@ -515,9 +516,14 @@ impl ConnectionManagerModal {
 
         // Connection name with color
         let name_color = conn.color.to_ratatui_color().unwrap_or(Color::White);
+        let name_style = if is_selected {
+            selected_primary_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD)
+        };
         spans.push(Span::styled(
             format!("{:<16}", truncate_str(&conn.name, 16)),
-            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+            name_style,
         ));
         spans.push(Span::raw(" "));
 
@@ -525,15 +531,17 @@ impl ConnectionManagerModal {
         let details = conn.short_display();
         spans.push(Span::styled(details, Style::default().fg(Color::DarkGray)));
 
-        let line = Line::from(spans);
-
-        let style = if is_selected {
-            Style::default().bg(Color::DarkGray)
+        let line = if is_selected {
+            selected_line(Line::from(spans))
         } else {
-            Style::default()
+            Line::from(spans)
         };
 
-        ListItem::new(line).style(style)
+        if is_selected {
+            ListItem::new(line).style(selected_row_style())
+        } else {
+            ListItem::new(line)
+        }
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
@@ -573,6 +581,9 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::ConnectionColor;
+    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn create_test_connections() -> ConnectionsFile {
         let mut file = ConnectionsFile::new();
@@ -624,6 +635,20 @@ mod tests {
         assert_eq!(manager.connections.len(), 3);
         assert_eq!(manager.selected, 0);
         assert!(!manager.is_empty());
+    }
+
+    #[test]
+    fn test_selected_connection_row_uses_visible_foreground_on_dark_background() {
+        let file = create_test_connections();
+        let mut manager = ConnectionManagerModal::new(&file, None);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| manager.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
     }
 
     #[test]

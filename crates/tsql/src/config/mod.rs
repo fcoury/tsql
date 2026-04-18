@@ -237,7 +237,7 @@ pub fn config_dir() -> Option<PathBuf> {
 
     #[cfg(unix)]
     {
-        return unix_dot_tsql_config_dir();
+        unix_dot_tsql_config_dir()
     }
 
     #[cfg(not(unix))]
@@ -336,7 +336,7 @@ show_row_numbers = false
         std::fs::write(legacy.join("config.toml"), "[connection]\nmax_rows=100\n").unwrap();
         std::fs::write(legacy.join("connections.toml"), "connections = []\n").unwrap();
 
-        migrate_legacy_dirs(&target, &[legacy.clone()]).unwrap();
+        migrate_legacy_dirs(&target, std::slice::from_ref(&legacy)).unwrap();
 
         assert!(target.join("config.toml").exists());
         assert!(target.join("connections.toml").exists());
@@ -356,7 +356,7 @@ show_row_numbers = false
         std::fs::write(legacy.join("config.toml"), "[connection]\nmax_rows=2\n").unwrap();
         std::fs::write(legacy.join("history"), "select 1;\n").unwrap();
 
-        migrate_legacy_dirs(&target, &[legacy.clone()]).unwrap();
+        migrate_legacy_dirs(&target, std::slice::from_ref(&legacy)).unwrap();
 
         let target_config = std::fs::read_to_string(target.join("config.toml")).unwrap();
         assert!(target_config.contains("max_rows=1"));

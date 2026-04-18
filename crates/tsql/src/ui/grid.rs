@@ -15,6 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::Action;
 use crate::util::{is_uuid, looks_like_json};
 
+use super::style::selected_row_style;
+
 /// Minimum column width for display.
 const MIN_COLUMN_WIDTH: u16 = 3;
 /// Maximum column width before truncation.
@@ -1514,10 +1516,7 @@ impl<'a> Widget for DataGrid<'a> {
             let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
-                // Use Gray foreground (not DarkGray) to ensure visibility
-                // against the DarkGray background. This prevents text from
-                // disappearing when terminal foreground equals bright black.
-                Style::default().bg(Color::DarkGray).fg(Color::Gray)
+                selected_row_style()
             } else {
                 Style::default()
             };
@@ -1917,6 +1916,7 @@ fn truncate_by_display_width(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::style::assert_selected_bg_has_visible_fg;
 
     fn create_test_model() -> GridModel {
         GridModel::new(
@@ -2029,6 +2029,29 @@ mod tests {
         // Press 'h' again - should stay at 0
         state.handle_key(key, &model);
         assert_eq!(state.cursor_col, 0, "cursor_col should not go below 0");
+    }
+
+    #[test]
+    fn test_cursor_row_uses_visible_foreground_on_dark_background() {
+        let model = create_test_model();
+        let state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        let grid = DataGrid {
+            model: &model,
+            state: &state,
+            focused: true,
+            show_row_numbers: true,
+            show_scrollbar: false,
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+
+        grid.render(area, &mut buf);
+
+        assert_selected_bg_has_visible_fg(&buf);
     }
 
     #[test]

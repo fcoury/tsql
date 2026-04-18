@@ -3404,15 +3404,15 @@ impl App {
         }
 
         // Handle connection form when active - it captures all input
-        if self.connection_form.is_some() {
-            let action = self.connection_form.as_mut().unwrap().handle_key(key);
+        if let Some(form) = self.connection_form.as_mut() {
+            let action = form.handle_key(key);
             self.handle_connection_form_action(action);
             return false;
         }
 
         // Handle connection manager when active - it captures all input
-        if self.connection_manager.is_some() {
-            let action = self.connection_manager.as_mut().unwrap().handle_key(key);
+        if let Some(manager) = self.connection_manager.as_mut() {
+            let action = manager.handle_key(key);
             self.handle_connection_manager_action(action);
             return false;
         }
@@ -5404,14 +5404,12 @@ impl App {
                     } else {
                         self.execute_mongo_describe_collection(args);
                     }
+                } else if args.is_empty() {
+                    // \d without args is same as \dt
+                    self.execute_meta_query(META_QUERY_TABLES, None);
                 } else {
-                    if args.is_empty() {
-                        // \d without args is same as \dt
-                        self.execute_meta_query(META_QUERY_TABLES, None);
-                    } else {
-                        // \d <table> - describe table
-                        self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
-                    }
+                    // \d <table> - describe table
+                    self.execute_meta_query(META_QUERY_DESCRIBE, Some(args));
                 }
             }
             "\\di" | "di" => {

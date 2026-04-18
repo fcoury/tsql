@@ -4,23 +4,12 @@ use crate::config::{UpdateMode, UpdatesConfig};
 
 use super::types::{InstallMethod, UpdateCheckOutcome, UpdatePolicy};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateState {
     pub startup_check_started: bool,
     pub check_in_flight: bool,
     pub last_checked_at: Option<Instant>,
     pub last_outcome: Option<UpdateCheckOutcome>,
-}
-
-impl Default for UpdateState {
-    fn default() -> Self {
-        Self {
-            startup_check_started: false,
-            check_in_flight: false,
-            last_checked_at: None,
-            last_outcome: None,
-        }
-    }
 }
 
 impl UpdateState {

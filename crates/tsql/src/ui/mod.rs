@@ -16,6 +16,7 @@ mod password_prompt;
 mod row_detail;
 pub mod sidebar;
 mod status_line;
+mod style;
 
 pub use completion::{
     determine_context, get_word_before_cursor, ColumnInfo, CompletionContext, CompletionItem,

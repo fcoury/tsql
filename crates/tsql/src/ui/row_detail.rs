@@ -19,6 +19,8 @@ use tui_syntax::{html, json, themes, Highlighter};
 
 use crate::util::{detect_content_type, ContentType};
 
+use super::style::{on_selected_bg, selected_muted_style, selected_row_style};
+
 /// Format to use when yanking from the row detail view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YankFormat {
@@ -369,7 +371,7 @@ impl RowDetailModal {
             // Value line(s) with syntax highlighting
             let content_type = detect_content_type(&value);
             let value_style = if is_selected {
-                Style::default().bg(Color::DarkGray)
+                selected_row_style()
             } else {
                 Style::default()
             };
@@ -386,9 +388,14 @@ impl RowDetailModal {
                 } else {
                     value.clone()
                 };
+                let display_style = if is_selected {
+                    selected_muted_style()
+                } else {
+                    value_style.fg(Color::DarkGray)
+                };
                 lines.push(Line::from(vec![
                     Span::styled("    ", value_style),
-                    Span::styled(display_value, value_style.fg(Color::DarkGray)),
+                    Span::styled(display_value, display_style),
                 ]));
             } else if value_lines_count == 1 {
                 // Single line value
@@ -398,7 +405,7 @@ impl RowDetailModal {
                 let mut spans = vec![Span::styled("    ", value_style)];
                 for span in highlighted {
                     spans.push(if is_selected {
-                        Span::styled(span.content.to_string(), span.style.bg(Color::DarkGray))
+                        Span::styled(span.content.to_string(), on_selected_bg(span.style))
                     } else {
                         span
                     });
@@ -415,7 +422,7 @@ impl RowDetailModal {
                     let mut spans = vec![Span::styled("    ", value_style)];
                     for span in highlighted {
                         spans.push(if is_selected {
-                            Span::styled(span.content.to_string(), span.style.bg(Color::DarkGray))
+                            Span::styled(span.content.to_string(), on_selected_bg(span.style))
                         } else {
                             span
                         });
@@ -428,7 +435,11 @@ impl RowDetailModal {
                             Span::styled("    ", value_style),
                             Span::styled(
                                 format!("... ({} more lines)", value_lines_count - max_lines),
-                                Style::default().fg(Color::DarkGray),
+                                if is_selected {
+                                    selected_muted_style()
+                                } else {
+                                    Style::default().fg(Color::DarkGray)
+                                },
                             ),
                         ]));
                     }
@@ -525,6 +536,9 @@ fn truncate_for_display(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn create_test_modal() -> RowDetailModal {
         RowDetailModal::new(
@@ -545,6 +559,33 @@ mod tests {
         assert_eq!(modal.field_count, 3);
         assert_eq!(modal.selected_field, 0);
         assert_eq!(modal.row_index, 0);
+    }
+
+    #[test]
+    fn test_selected_plain_value_uses_visible_foreground_on_dark_background() {
+        let mut modal = create_test_modal();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| modal.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn test_selected_highlighted_value_uses_visible_foreground_on_dark_background() {
+        let mut modal = create_test_modal();
+        modal.selected_field = 2;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| modal.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
     }
 
     #[test]

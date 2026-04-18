@@ -25,6 +25,8 @@ use crate::util::{
 };
 use crate::vim::{Motion, VimCommand, VimConfig, VimHandler, VimMode};
 
+use super::style::{selected_muted_style, selected_row_style};
+
 /// The result of handling a key event in the JSON editor.
 pub enum JsonEditorAction {
     /// Continue editing, nothing special happened.
@@ -703,21 +705,20 @@ impl<'a> JsonEditorModal<'a> {
                 Span::raw(&self.command_buffer),
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             ]);
-            let status = Paragraph::new(command_line).style(Style::default().bg(Color::DarkGray));
+            let status = Paragraph::new(command_line).style(selected_row_style());
             frame.render_widget(status, status_area);
         } else {
             let help_span = match self.mode {
                 VimMode::Normal => Span::styled(
                     " i:insert  v:visual  :format  Ctrl+S:save  q/Esc:close ",
-                    Style::default().fg(Color::DarkGray),
+                    selected_muted_style(),
                 ),
-                VimMode::Insert => Span::styled(
-                    " Esc:normal  Ctrl+Enter:save ",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                VimMode::Insert => {
+                    Span::styled(" Esc:normal  Ctrl+Enter:save ", selected_muted_style())
+                }
                 VimMode::Visual => Span::styled(
                     " y:yank  d:delete  c:change  Esc:cancel ",
-                    Style::default().fg(Color::DarkGray),
+                    selected_muted_style(),
                 ),
             };
 
@@ -730,7 +731,7 @@ impl<'a> JsonEditorModal<'a> {
 
             let status_line = Line::from(spans);
 
-            let status = Paragraph::new(status_line).style(Style::default().bg(Color::DarkGray));
+            let status = Paragraph::new(status_line).style(selected_row_style());
 
             frame.render_widget(status, status_area);
         }
@@ -740,6 +741,9 @@ impl<'a> JsonEditorModal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -755,6 +759,47 @@ mod tests {
         // JSON content should be detected as JSON type
         let content_type = detect_content_type(&editor.content());
         assert_eq!(content_type, ContentType::Json);
+    }
+
+    #[test]
+    fn test_status_line_uses_visible_foreground_on_dark_background() {
+        let mut editor = JsonEditorModal::new(
+            r#"{"key": "value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| editor.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn test_command_status_line_uses_visible_foreground_on_dark_background() {
+        let mut editor = JsonEditorModal::new(
+            r#"{"key": "value"}"#.to_string(),
+            "data".to_string(),
+            "jsonb".to_string(),
+            0,
+            0,
+        );
+        editor.command_active = true;
+        editor.command_buffer = "format".to_string();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| editor.render(frame, frame.area()))
+            .unwrap();
+
+        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
     }
 
     #[test]

@@ -158,12 +158,14 @@ impl QueryEditor {
             return;
         }
 
-        if self.history_index.is_none() {
-            self.history_draft = Some(self.text());
-            self.history_index = Some(self.history.len().saturating_sub(1));
-        } else {
-            let i = self.history_index.unwrap();
-            self.history_index = Some(i.saturating_sub(1));
+        match self.history_index {
+            None => {
+                self.history_draft = Some(self.text());
+                self.history_index = Some(self.history.len().saturating_sub(1));
+            }
+            Some(i) => {
+                self.history_index = Some(i.saturating_sub(1));
+            }
         }
 
         if let Some(i) = self.history_index {
@@ -258,9 +260,7 @@ impl QueryEditor {
     fn classify_word_char(c: char, big_word: bool) -> u8 {
         if c.is_whitespace() {
             0
-        } else if big_word {
-            1
-        } else if c.is_ascii_alphanumeric() || c == '_' {
+        } else if big_word || c.is_ascii_alphanumeric() || c == '_' {
             1
         } else {
             2
