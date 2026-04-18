@@ -49,7 +49,7 @@ pub enum ConnectionManagerAction {
         /// URL to copy.
         url: String,
     },
-    /// Copy a shell-pasteable `tsql <url>` command.
+    /// Copy a shell-pasteable `tsql <connection-name>` command.
     YankCli {
         /// Command to copy.
         command: String,
@@ -870,10 +870,10 @@ mod tests {
     }
 
     #[test]
-    fn test_yank_cli_action_quotes_sanitized_url() {
+    fn test_yank_cli_action_quotes_connection_name() {
         let mut file = ConnectionsFile::new();
         file.add(ConnectionEntry {
-            name: "quoted".to_string(),
+            name: "local;dev".to_string(),
             host: "localhost".to_string(),
             port: 5432,
             database: "my db".to_string(),
@@ -887,7 +887,7 @@ mod tests {
 
         match action {
             ConnectionManagerAction::YankCli { command } => {
-                assert_eq!(command, "tsql 'postgres://postgres@localhost/my db'");
+                assert_eq!(command, "tsql 'local;dev'");
             }
             _ => panic!("Expected YankCli action"),
         }

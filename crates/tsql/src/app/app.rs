@@ -2004,7 +2004,7 @@ pub enum DbEvent {
     PasswordResolved {
         entry: Box<ConnectionEntry>,
         result: std::result::Result<Option<String>, String>,
-        reason: PasswordResolveReason,
+        password_resolve_generation: u64,
     },
 }
 
@@ -2012,6 +2012,12 @@ pub enum DbEvent {
 pub enum PasswordResolveReason {
     Startup,
     UserPicked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPasswordResolve {
+    reason: PasswordResolveReason,
+    generation: u64,
 }
 
 pub struct DbSession {
@@ -2327,8 +2333,10 @@ pub struct App {
     safe_mode: bool,
     /// Monotonic id used to ignore stale connect task completions.
     connect_generation: u64,
+    /// Monotonic id used to ignore stale saved-connection password resolves.
+    password_resolve_generation: u64,
     /// Saved connection password resolves currently running off the UI thread.
-    password_resolve_in_flight: HashMap<String, PasswordResolveReason>,
+    password_resolve_in_flight: HashMap<String, PendingPasswordResolve>,
     /// Connection picker (fuzzy picker for quick connection selection).
     pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
@@ -2523,6 +2531,7 @@ impl App {
             pending_startup_reconnect: None,
             safe_mode: false,
             connect_generation: 0,
+            password_resolve_generation: 0,
             password_resolve_in_flight: HashMap::new(),
             connection_picker: None,
             connection_manager: None,
@@ -5453,10 +5462,13 @@ impl App {
                 if args.is_empty() {
                     self.last_status = Some("Usage: :connect <connection_url>".to_string());
                 } else {
+                    self.current_connection_name = None;
                     self.start_connect(args.to_string());
                 }
             }
             "disconnect" | "dc" => {
+                self.invalidate_password_resolves();
+                self.connect_generation = self.connect_generation.wrapping_add(1);
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
@@ -5465,6 +5477,8 @@ impl App {
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
                 self.query_ui.clear();
+                self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
@@ -7511,6 +7525,7 @@ impl App {
     }
 
     pub fn start_connect(&mut self, conn_str: String) {
+        self.invalidate_password_resolves();
         self.db.status = DbStatus::Connecting;
         self.db.kind = None;
         self.db.conn_str = Some(conn_str.clone());
@@ -7730,6 +7745,8 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
+        self.invalidate_password_resolves();
+
         if entry.no_password_required {
             let url = entry.to_url(None);
             self.current_connection_name = Some(entry.name.clone());
@@ -7762,6 +7779,11 @@ impl App {
         self.safe_mode = safe;
     }
 
+    fn invalidate_password_resolves(&mut self) {
+        self.password_resolve_generation = self.password_resolve_generation.wrapping_add(1);
+        self.password_resolve_in_flight.clear();
+    }
+
     fn dispatch_pending_startup_reconnect(&mut self) {
         if self.safe_mode {
             self.pending_startup_reconnect = None;
@@ -7778,6 +7800,7 @@ impl App {
 
         match self.connections.find_by_name(&name).cloned() {
             Some(entry) => {
+                self.invalidate_password_resolves();
                 self.current_connection_name = Some(entry.name.clone());
                 self.last_status = Some(format!("Reconnecting to {}...", entry.name));
                 if entry.no_password_required {
@@ -7806,16 +7829,21 @@ impl App {
         match self.password_resolve_in_flight.entry(entry.name.clone()) {
             MapEntry::Occupied(mut slot) => {
                 if matches!(reason, PasswordResolveReason::UserPicked) {
-                    *slot.get_mut() = PasswordResolveReason::UserPicked;
+                    slot.get_mut().reason = PasswordResolveReason::UserPicked;
                 }
                 return;
             }
             MapEntry::Vacant(slot) => {
-                slot.insert(reason);
+                self.password_resolve_generation = self.password_resolve_generation.wrapping_add(1);
+                slot.insert(PendingPasswordResolve {
+                    reason,
+                    generation: self.password_resolve_generation,
+                });
             }
         }
 
         let tx = self.db_events_tx.clone();
+        let password_resolve_generation = self.password_resolve_generation;
         let onepassword_enabled = self.config.connection.enable_onepassword;
         let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
             5000
@@ -7830,7 +7858,7 @@ impl App {
             let _ = tx.send(DbEvent::PasswordResolved {
                 entry: Box::new(entry),
                 result,
-                reason,
+                password_resolve_generation,
             });
         });
     }
@@ -10040,13 +10068,18 @@ impl App {
             DbEvent::PasswordResolved {
                 entry,
                 result,
-                reason,
+                password_resolve_generation,
             } => {
                 let entry = *entry;
-                let reason = self
-                    .password_resolve_in_flight
-                    .remove(&entry.name)
-                    .unwrap_or(reason);
+                let Some(pending) = self.password_resolve_in_flight.get(&entry.name).copied()
+                else {
+                    return;
+                };
+                if pending.generation != password_resolve_generation {
+                    return;
+                }
+                self.password_resolve_in_flight.remove(&entry.name);
+                let reason = pending.reason;
 
                 if self.current_connection_name.as_deref() != Some(entry.name.as_str()) {
                     return;
@@ -12864,6 +12897,63 @@ mod tests {
         assert!(
             app.connection_manager.is_some(),
             "Connection manager should open on gm from picker"
+        );
+    }
+
+    #[test]
+    fn test_stale_password_resolve_does_not_override_new_same_name_resolve() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        let entry = ConnectionEntry {
+            name: "saved".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+
+        app.current_connection_name = Some(entry.name.clone());
+        app.password_resolve_generation = 1;
+        app.password_resolve_in_flight.insert(
+            entry.name.clone(),
+            PendingPasswordResolve {
+                reason: PasswordResolveReason::UserPicked,
+                generation: 1,
+            },
+        );
+
+        app.execute_command("disconnect");
+
+        app.current_connection_name = Some(entry.name.clone());
+        app.password_resolve_generation = app.password_resolve_generation.wrapping_add(1);
+        let fresh_generation = app.password_resolve_generation;
+        app.password_resolve_in_flight.insert(
+            entry.name.clone(),
+            PendingPasswordResolve {
+                reason: PasswordResolveReason::UserPicked,
+                generation: fresh_generation,
+            },
+        );
+
+        app.apply_db_event(DbEvent::PasswordResolved {
+            entry: Box::new(entry.clone()),
+            result: Ok(Some("old-password".to_string())),
+            password_resolve_generation: 1,
+        });
+
+        assert_eq!(app.db.status, DbStatus::Disconnected);
+        assert_eq!(app.current_connection_name, Some(entry.name.clone()));
+        assert_eq!(
+            app.password_resolve_in_flight
+                .get(&entry.name)
+                .map(|pending| pending.generation),
+            Some(fresh_generation)
         );
     }
 

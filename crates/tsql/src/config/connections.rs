@@ -344,10 +344,9 @@ impl ConnectionEntry {
 
     /// Build a shell-pasteable command for launching this connection.
     pub fn to_cli_command(&self) -> String {
-        let url = self.sanitized_url();
-        match shlex::try_quote(&url) {
+        match shlex::try_quote(&self.name) {
             Ok(quoted) => format!("tsql {}", quoted),
-            Err(_) => format!("tsql {}", url),
+            Err(_) => format!("tsql {}", self.name),
         }
     }
 
@@ -1280,9 +1279,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_command_quotes_sanitized_url() {
+    fn test_cli_command_quotes_connection_name() {
         let entry = ConnectionEntry {
-            name: "quoted".to_string(),
+            name: "local;dev".to_string(),
             host: "localhost".to_string(),
             port: 5432,
             database: "my db".to_string(),
@@ -1290,10 +1289,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
-            entry.to_cli_command(),
-            "tsql 'postgres://postgres@localhost/my db'"
-        );
+        assert_eq!(entry.to_cli_command(), "tsql 'local;dev'");
     }
 
     #[test]
