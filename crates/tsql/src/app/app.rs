@@ -215,6 +215,52 @@ fn resolve_ssl_mode(conn_str: &str) -> std::result::Result<SslMode, String> {
     Ok(default)
 }
 
+async fn probe_connection(url: &str, kind: DbKind) -> std::result::Result<(), String> {
+    if kind == DbKind::Mongo {
+        let client = mongodb::Client::with_uri_str(url)
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let ssl_mode = resolve_ssl_mode(url)?;
+    match ssl_mode {
+        SslMode::Disable => tokio_postgres::connect(url, NoTls)
+            .await
+            .map(|_| ())
+            .map_err(|e| format_pg_error(&e)),
+        SslMode::Require => {
+            let tls = make_rustls_connect_insecure();
+            tokio_postgres::connect(url, tls)
+                .await
+                .map(|_| ())
+                .map_err(|e| format_pg_error(&e))
+        }
+        SslMode::Prefer => {
+            let tls = make_rustls_connect_insecure();
+            match tokio_postgres::connect(url, tls).await {
+                Ok(_) => Ok(()),
+                Err(_) => tokio_postgres::connect(url, NoTls)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format_pg_error(&e)),
+            }
+        }
+        SslMode::VerifyCa | SslMode::VerifyFull => {
+            let tls = make_rustls_connect_verified();
+            tokio_postgres::connect(url, tls)
+                .await
+                .map(|_| ())
+                .map_err(|e| format_pg_error(&e))
+        }
+    }
+}
+
 /// Normalize the max_rows config value.
 ///
 /// If the user sets max_rows to 0 in config (or leaves it unset), this returns
@@ -1889,16 +1935,20 @@ pub enum DbEvent {
         client: SharedClient,
         cancel_token: CancelToken,
         connected_with_tls: bool,
+        connect_generation: u64,
     },
     MongoConnected {
         client: SharedMongoClient,
         database: String,
+        connect_generation: u64,
     },
     ConnectError {
         error: String,
+        connect_generation: u64,
     },
     ConnectionLost {
         error: String,
+        connect_generation: u64,
     },
     QueryFinished {
         result: QueryResult,
@@ -1950,6 +2000,18 @@ pub enum DbEvent {
         request_id: u64,
         result: std::result::Result<AiProposal, String>,
     },
+    /// Result of a background password resolution for a saved connection.
+    PasswordResolved {
+        entry: Box<ConnectionEntry>,
+        result: std::result::Result<Option<String>, String>,
+        reason: PasswordResolveReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordResolveReason {
+    Startup,
+    UserPicked,
 }
 
 pub struct DbSession {
@@ -2255,8 +2317,18 @@ pub struct App {
 
     /// Saved database connections.
     pub connections: ConnectionsFile,
-    /// Name of the currently connected connection (if from saved connections).
+    /// Name of the pending or currently connected saved connection.
     pub current_connection_name: Option<String>,
+    /// Name of the saved connection that is actually connected.
+    active_connection_name: Option<String>,
+    /// Saved connection name to reconnect after the first TUI frame.
+    pending_startup_reconnect: Option<String>,
+    /// Skip startup side effects that can block or touch the network.
+    safe_mode: bool,
+    /// Monotonic id used to ignore stale connect task completions.
+    connect_generation: u64,
+    /// Saved connection password resolves currently running off the UI thread.
+    password_resolve_in_flight: HashMap<String, PasswordResolveReason>,
     /// Connection picker (fuzzy picker for quick connection selection).
     pub connection_picker: Option<FuzzyPicker<ConnectionEntry>>,
     /// Connection manager modal (when open).
@@ -2447,6 +2519,11 @@ impl App {
 
             connections: ConnectionsFile::new(),
             current_connection_name: None,
+            active_connection_name: None,
+            pending_startup_reconnect: None,
+            safe_mode: false,
+            connect_generation: 0,
+            password_resolve_in_flight: HashMap::new(),
             connection_picker: None,
             connection_manager: None,
             connection_form: None,
@@ -2482,7 +2559,7 @@ impl App {
             if !url.contains("://") {
                 // Try to find a connection by name
                 if let Some(entry) = app.connections.find_by_name(&url) {
-                    app.connect_to_entry(entry.clone());
+                    app.pending_startup_reconnect = Some(entry.name.clone());
                 } else {
                     app.last_error = Some(format!("Unknown connection: {}", url));
                     // Open connection picker so user can select (falls back to manager if empty)
@@ -2502,7 +2579,11 @@ impl App {
     /// Capture current session state for persistence.
     pub fn capture_session_state(&self) -> SessionState {
         SessionState {
-            connection_name: self.current_connection_name.clone(),
+            connection_name: if self.db.status == DbStatus::Connected {
+                self.active_connection_name.clone()
+            } else {
+                None
+            },
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
             sidebar_visible: self.sidebar_visible,
@@ -2609,6 +2690,7 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let mut first_draw = true;
         loop {
             self.drain_db_events();
 
@@ -2617,7 +2699,9 @@ impl App {
                 self.query_ui.tick();
             }
 
-            self.maybe_start_scheduled_update_check();
+            if !self.safe_mode {
+                self.maybe_start_scheduled_update_check();
+            }
 
             // Pre-compute highlighted lines before the draw closure
             let query_text = self.editor.text();
@@ -3326,6 +3410,11 @@ impl App {
                 }
             })?;
 
+            if first_draw {
+                first_draw = false;
+                self.dispatch_pending_startup_reconnect();
+            }
+
             // Mark hint as shown after rendering (must be outside draw closure)
             if show_key_hint && !self.key_sequence.is_hint_shown() {
                 self.key_sequence.mark_hint_shown();
@@ -3413,6 +3502,7 @@ impl App {
                     return false;
                 }
                 PasswordPromptResult::Cancelled => {
+                    self.current_connection_name = self.active_connection_name.clone();
                     self.last_status = Some("Connection cancelled".to_string());
                     return false;
                 }
@@ -7432,6 +7522,8 @@ impl App {
         self.db.connected_with_tls = false;
 
         self.last_status = Some("Connecting...".to_string());
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        let connect_generation = self.connect_generation;
 
         let tx = self.db_events_tx.clone();
         let rt = self.rt.clone();
@@ -7446,17 +7538,20 @@ impl App {
                         if let Err(e) = ping_db.run_command(doc! { "ping": 1 }).await {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format!("Mongo connection error: {e}"),
+                                connect_generation,
                             });
                             return;
                         }
                         let _ = tx.send(DbEvent::MongoConnected {
                             client: Arc::new(client),
                             database: db_name,
+                            connect_generation,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(DbEvent::ConnectError {
                             error: format!("Mongo connection error: {e}"),
+                            connect_generation,
                         });
                     }
                 }
@@ -7466,7 +7561,10 @@ impl App {
             let ssl_mode = match resolve_ssl_mode(&conn_str) {
                 Ok(m) => m,
                 Err(msg) => {
-                    let _ = tx.send(DbEvent::ConnectError { error: msg });
+                    let _ = tx.send(DbEvent::ConnectError {
+                        error: msg,
+                        connect_generation,
+                    });
                     return;
                 }
             };
@@ -7480,6 +7578,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation,
                                     });
                                 }
                             });
@@ -7490,11 +7589,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: false,
+                                connect_generation,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation,
                             });
                         }
                     }
@@ -7509,6 +7610,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation,
                                     });
                                 }
                             });
@@ -7519,11 +7621,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation,
                             });
                         }
                     }
@@ -7538,6 +7642,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation,
                                     });
                                 }
                             });
@@ -7548,6 +7653,7 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation,
                             });
                         }
                         Err(e) => {
@@ -7559,6 +7665,7 @@ impl App {
                                         if let Err(e) = connection.await {
                                             let _ = tx2.send(DbEvent::ConnectionLost {
                                                 error: format_pg_error(&e),
+                                                connect_generation,
                                             });
                                         }
                                     });
@@ -7569,6 +7676,7 @@ impl App {
                                         client: shared,
                                         cancel_token: token,
                                         connected_with_tls: false,
+                                        connect_generation,
                                     });
                                 }
                                 Err(e) => {
@@ -7577,6 +7685,7 @@ impl App {
                                         error: format!(
                                             "{tls_error}\n\nTLS failed (sslmode=prefer), then plain connect failed:\n{plain_error}"
                                         ),
+                                        connect_generation,
                                     });
                                 }
                             }
@@ -7593,6 +7702,7 @@ impl App {
                                 if let Err(e) = connection.await {
                                     let _ = tx2.send(DbEvent::ConnectionLost {
                                         error: format_pg_error(&e),
+                                        connect_generation,
                                     });
                                 }
                             });
@@ -7603,11 +7713,13 @@ impl App {
                                 client: shared,
                                 cancel_token: token,
                                 connected_with_tls: true,
+                                connect_generation,
                             });
                         }
                         Err(e) => {
                             let _ = tx.send(DbEvent::ConnectError {
                                 error: format_pg_error(&e),
+                                connect_generation,
                             });
                         }
                     }
@@ -7618,41 +7730,116 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
-        // Try to get the password from keychain / env var / 1Password.
-        // Give 1Password more time since it shells out to `op`.
+        if entry.no_password_required {
+            let url = entry.to_url(None);
+            self.current_connection_name = Some(entry.name.clone());
+            self.start_connect(url);
+            return;
+        }
+
+        let op_configured =
+            self.config.connection.enable_onepassword && entry.password_onepassword.is_some();
+        let env_configured = entry.password_env.is_some();
+        if !entry.password_in_keychain && !op_configured && !env_configured {
+            self.last_error = None;
+            self.current_connection_name = Some(entry.name.clone());
+            self.password_prompt = Some(PasswordPrompt::new(entry));
+            return;
+        }
+
+        self.current_connection_name = Some(entry.name.clone());
+        self.last_status = Some(format!("Resolving credentials for {}...", entry.name));
+        self.begin_password_resolve(entry, PasswordResolveReason::UserPicked);
+    }
+
+    /// Queue a session auto-reconnect that will be dispatched after first draw.
+    pub fn set_pending_startup_reconnect(&mut self, name: Option<String>) {
+        self.pending_startup_reconnect = name;
+    }
+
+    /// Enable safe mode: skip startup reconnects and scheduled update checks.
+    pub fn set_safe_mode(&mut self, safe: bool) {
+        self.safe_mode = safe;
+    }
+
+    fn dispatch_pending_startup_reconnect(&mut self) {
+        if self.safe_mode {
+            self.pending_startup_reconnect = None;
+            return;
+        }
+
+        let Some(name) = self.pending_startup_reconnect.take() else {
+            return;
+        };
+
+        if let Ok(connections) = load_connections() {
+            self.connections = connections;
+        }
+
+        match self.connections.find_by_name(&name).cloned() {
+            Some(entry) => {
+                self.current_connection_name = Some(entry.name.clone());
+                self.last_status = Some(format!("Reconnecting to {}...", entry.name));
+                if entry.no_password_required {
+                    self.start_connect(entry.to_url(None));
+                } else {
+                    self.begin_password_resolve(entry, PasswordResolveReason::Startup);
+                }
+            }
+            None => {
+                self.last_status = Some(format!(
+                    "Previous connection '{}' no longer exists; pick a connection",
+                    name
+                ));
+                self.open_connection_picker();
+            }
+        }
+    }
+
+    pub fn begin_password_resolve(
+        &mut self,
+        entry: ConnectionEntry,
+        reason: PasswordResolveReason,
+    ) {
+        use std::collections::hash_map::Entry as MapEntry;
+
+        match self.password_resolve_in_flight.entry(entry.name.clone()) {
+            MapEntry::Occupied(mut slot) => {
+                if matches!(reason, PasswordResolveReason::UserPicked) {
+                    *slot.get_mut() = PasswordResolveReason::UserPicked;
+                }
+                return;
+            }
+            MapEntry::Vacant(slot) => {
+                slot.insert(reason);
+            }
+        }
+
+        let tx = self.db_events_tx.clone();
         let onepassword_enabled = self.config.connection.enable_onepassword;
         let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
             5000
         } else {
             500
         };
-        let password =
-            match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
-                Ok(Some(pwd)) => Some(pwd),
-                Ok(None) => None,
-                Err(e) => {
-                    self.last_error = None;
-                    self.last_status = Some(format!(
-                        "Password lookup failed ({}); enter password manually",
-                        e
-                    ));
-                    None
-                }
-            };
 
-        // Determine if we need to prompt for password:
-        // - If we have a password from keychain/env, use it
-        // - If no_password_required is true, connect without password
-        // - Otherwise, prompt for password
-        if password.is_some() || entry.no_password_required {
-            // We have a password or don't need one - connect directly
-            let url = entry.to_url(password.as_deref());
-            self.current_connection_name = Some(entry.name.clone());
-            self.start_connect(url);
+        self.rt.spawn_blocking(move || {
+            let result = entry
+                .get_password_with_timeout_and_options(timeout_ms, onepassword_enabled)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(DbEvent::PasswordResolved {
+                entry: Box::new(entry),
+                result,
+                reason,
+            });
+        });
+    }
+
+    fn record_successful_connect(&mut self) {
+        if let Some(name) = self.current_connection_name.clone() {
+            self.active_connection_name = Some(name);
         } else {
-            // Need to prompt for password
-            self.last_error = None;
-            self.password_prompt = Some(PasswordPrompt::new(entry));
+            self.active_connection_name = None;
         }
     }
 
@@ -8054,6 +8241,18 @@ impl App {
                         self.config.connection.enable_onepassword,
                     ));
             }
+            ConnectionManagerAction::YankUrl { url } => {
+                self.copy_to_clipboard(&url);
+                self.last_status = Some("Connection URL copied (password stripped)".to_string());
+            }
+            ConnectionManagerAction::YankCli { command } => {
+                self.copy_to_clipboard(&command);
+                self.last_status = Some("tsql command copied".to_string());
+            }
+            ConnectionManagerAction::TestConnection { entry } => {
+                self.last_status = Some(format!("Testing connection to {}...", entry.name));
+                self.test_entry_in_background(entry);
+            }
             ConnectionManagerAction::Delete { name } => {
                 // Show confirmation for delete
                 self.confirm_prompt = Some(ConfirmPrompt::new(
@@ -8085,6 +8284,61 @@ impl App {
                 self.last_status = Some(msg);
             }
         }
+    }
+
+    fn test_entry_in_background(&mut self, entry: ConnectionEntry) {
+        if entry.no_password_required {
+            self.handle_connection_form_action(ConnectionFormAction::TestConnection {
+                entry,
+                password: None,
+            });
+            return;
+        }
+
+        let tx = self.db_events_tx.clone();
+        let onepassword_enabled = self.config.connection.enable_onepassword;
+        let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
+            5000
+        } else {
+            500
+        };
+
+        self.rt.spawn_blocking(move || {
+            let password = entry
+                .get_password_with_timeout_and_options(timeout_ms, onepassword_enabled)
+                .ok()
+                .flatten();
+            let url = entry.to_url(password.as_deref());
+
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = tx.send(DbEvent::TestConnectionResult {
+                    success: false,
+                    message: format!(
+                        "Connection failed: could not start test runtime for {}",
+                        entry.name
+                    ),
+                });
+                return;
+            };
+
+            rt.block_on(async move {
+                let result = probe_connection(&url, entry.kind).await;
+                let event = match result {
+                    Ok(()) => DbEvent::TestConnectionResult {
+                        success: true,
+                        message: format!("Test OK: {} is reachable", entry.name),
+                    },
+                    Err(error) => DbEvent::TestConnectionResult {
+                        success: false,
+                        message: format!("Test failed for {}: {}", entry.name, error),
+                    },
+                };
+                let _ = tx.send(event);
+            });
+        });
     }
 
     /// Handle sidebar actions (from mouse clicks or keyboard).
@@ -9511,7 +9765,11 @@ impl App {
                 client,
                 cancel_token,
                 connected_with_tls,
+                connect_generation,
             } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Connected;
                 self.db.kind = Some(DbKind::Postgres);
                 self.db.client = Some(client);
@@ -9522,10 +9780,18 @@ impl App {
                 self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
+                self.record_successful_connect();
                 // Load schema for completion
                 self.load_schema();
             }
-            DbEvent::MongoConnected { client, database } => {
+            DbEvent::MongoConnected {
+                client,
+                database,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Connected;
                 self.db.kind = Some(DbKind::Mongo);
                 self.db.client = None;
@@ -9539,9 +9805,16 @@ impl App {
                 self.last_status = Some(format!(
                     "Connected to Mongo ({database}), loading schema..."
                 ));
+                self.record_successful_connect();
                 self.load_schema();
             }
-            DbEvent::ConnectError { error } => {
+            DbEvent::ConnectError {
+                error,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -9550,10 +9823,17 @@ impl App {
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
-            DbEvent::ConnectionLost { error } => {
+            DbEvent::ConnectionLost {
+                error,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -9562,6 +9842,7 @@ impl App {
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
+                self.active_connection_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
@@ -9753,6 +10034,59 @@ impl App {
                     Err(error) => {
                         self.last_error = Some(error);
                         self.last_status = Some("Update apply failed (see error)".to_string());
+                    }
+                }
+            }
+            DbEvent::PasswordResolved {
+                entry,
+                result,
+                reason,
+            } => {
+                let entry = *entry;
+                let reason = self
+                    .password_resolve_in_flight
+                    .remove(&entry.name)
+                    .unwrap_or(reason);
+
+                if self.current_connection_name.as_deref() != Some(entry.name.as_str()) {
+                    return;
+                }
+
+                match result {
+                    Ok(Some(password)) => {
+                        self.last_error = None;
+                        self.last_status = Some(format!("Connecting to {}...", entry.name));
+                        self.start_connect(entry.to_url(Some(&password)));
+                    }
+                    Ok(None) => {
+                        self.current_connection_name = self.active_connection_name.clone();
+                        match reason {
+                            PasswordResolveReason::UserPicked => {
+                                self.last_error = None;
+                                self.last_status = None;
+                                self.password_prompt = Some(PasswordPrompt::new(entry));
+                            }
+                            PasswordResolveReason::Startup => {
+                                self.last_status = Some(format!(
+                                    "Saved credentials for '{}' unavailable; pick a connection",
+                                    entry.name
+                                ));
+                                self.open_connection_picker();
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.current_connection_name = self.active_connection_name.clone();
+                        self.last_error = None;
+                        self.last_status = Some(format!("Password lookup failed: {}", error));
+                        match reason {
+                            PasswordResolveReason::UserPicked => {
+                                self.password_prompt = Some(PasswordPrompt::new(entry));
+                            }
+                            PasswordResolveReason::Startup => {
+                                self.open_connection_picker();
+                            }
+                        }
                     }
                 }
             }
@@ -12253,11 +12587,11 @@ mod tests {
             app.current_connection_name.clone(),
         ));
 
-        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
 
         assert!(
             app.connection_form.is_some(),
-            "Connection form should open after pressing 'y'"
+            "Connection form should open after pressing 'D'"
         );
 
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));

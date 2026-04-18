@@ -111,6 +111,22 @@ const SIDEBAR_CONNECTIONS: HelpSection = HelpSection::new(
     ],
 );
 
+const CONNECTION_MANAGER: HelpSection = HelpSection::new(
+    "Connection Manager",
+    &[
+        KeyBinding::new("j/k or arrows", "Navigate connections"),
+        KeyBinding::new("Enter", "Connect to selected"),
+        KeyBinding::new("a / e", "Add/edit connection"),
+        KeyBinding::new("D", "Duplicate connection"),
+        KeyBinding::new("y", "Copy URL without password"),
+        KeyBinding::new("c", "Copy `tsql` command"),
+        KeyBinding::new("t", "Test connection"),
+        KeyBinding::new("d", "Delete connection"),
+        KeyBinding::new("f", "Set favorite"),
+        KeyBinding::new("q / Esc", "Close connection manager"),
+    ],
+);
+
 const SIDEBAR_SCHEMA: HelpSection = HelpSection::new(
     "Sidebar - Schema",
     &[
@@ -288,6 +304,7 @@ const ALL_SECTIONS: &[HelpSection] = &[
     GLOBAL,
     GOTO,
     SIDEBAR_CONNECTIONS,
+    CONNECTION_MANAGER,
     SIDEBAR_SCHEMA,
     QUERY_NAVIGATION,
     QUERY_EDITING,
