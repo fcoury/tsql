@@ -2173,7 +2173,7 @@ pub enum DbEvent {
     PasswordResolved {
         entry: Box<ConnectionEntry>,
         result: std::result::Result<Option<String>, String>,
-        reason: PasswordResolveReason,
+        password_resolve_generation: u64,
     },
 }
 
@@ -2181,6 +2181,18 @@ pub enum DbEvent {
 pub enum PasswordResolveReason {
     Startup,
     UserPicked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPasswordResolve {
+    reason: PasswordResolveReason,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStartupReconnect {
+    name: String,
+    automatic: bool,
 }
 
 pub struct DbSession {
@@ -2490,19 +2502,20 @@ pub struct App {
     pub current_connection_name: Option<String>,
     /// Name of the saved connection that is actually connected.
     active_connection_name: Option<String>,
-    /// Saved connection name to reconnect after the first TUI frame.
-    pending_startup_reconnect: Option<String>,
-    /// True when the pending reconnect came from an explicit CLI saved-name
-    /// argument rather than persisted session state.
-    pending_startup_reconnect_explicit: bool,
+    /// Saved connection to connect after the first TUI frame.
+    pending_startup_reconnect: Option<PendingStartupReconnect>,
     /// Skip startup side effects that can block or touch the network.
     safe_mode: bool,
     /// Monotonic id used to ignore stale connect task completions.
     connect_generation: u64,
+    /// Saved connection name associated with the current connect generation.
+    connect_generation_name: Option<String>,
     /// Source entry for a duplicate form so non-form fields survive save.
     pending_duplicate_donor: Option<Box<ConnectionEntry>>,
+    /// Monotonic id used to ignore stale saved-connection password resolves.
+    password_resolve_generation: u64,
     /// Saved connection password resolves currently running off the UI thread.
-    password_resolve_in_flight: HashMap<String, PasswordResolveReason>,
+    password_resolve_in_flight: HashMap<String, PendingPasswordResolve>,
     /// Last time usage stats were written for each saved connection.
     last_touch_save: HashMap<String, Instant>,
     /// Connection picker (fuzzy picker for quick connection selection).
@@ -2630,7 +2643,8 @@ impl App {
             History::new_empty(config.editor.max_history)
         });
 
-        // Determine connection string: CLI arg > config > env var
+        // Determine connection string: CLI arg > config.
+        let explicit_conn_str = conn_str.is_some();
         let effective_conn_str = conn_str.or_else(|| config.connection.default_url.clone());
 
         // Build keymaps from defaults + config overrides
@@ -2697,10 +2711,11 @@ impl App {
             current_connection_name: None,
             active_connection_name: None,
             pending_startup_reconnect: None,
-            pending_startup_reconnect_explicit: false,
             safe_mode: false,
             connect_generation: 0,
+            connect_generation_name: None,
             pending_duplicate_donor: None,
+            password_resolve_generation: 0,
             password_resolve_in_flight: HashMap::new(),
             last_touch_save: HashMap::new(),
             connection_picker: None,
@@ -2738,8 +2753,10 @@ impl App {
             if !url.contains("://") {
                 // Try to find a connection by name
                 if let Some(entry) = app.connections.find_by_name(&url) {
-                    app.pending_startup_reconnect = Some(entry.name.clone());
-                    app.pending_startup_reconnect_explicit = true;
+                    app.pending_startup_reconnect = Some(PendingStartupReconnect {
+                        name: entry.name.clone(),
+                        automatic: !explicit_conn_str,
+                    });
                 } else {
                     app.last_error = Some(format!("Unknown connection: {}", url));
                     // Open connection picker so user can select (falls back to manager if empty)
@@ -4734,18 +4751,18 @@ impl App {
         }
     }
 
-    fn copy_to_clipboard(&mut self, text: &str) {
+    fn copy_to_clipboard(&mut self, text: &str) -> bool {
         if self.config.clipboard.backend == ClipboardBackend::Disabled {
             self.last_error = None;
             self.last_status = Some("Clipboard disabled".to_string());
-            return;
+            return false;
         }
 
         let choice = match crate::clipboard::choose_backend(&self.config.clipboard) {
             Ok(choice) => choice,
             Err(e) => {
                 self.last_error = Some(e.to_string());
-                return;
+                return false;
             }
         };
 
@@ -4755,18 +4772,22 @@ impl App {
             crate::clipboard::ClipboardBackendChoice::Disabled => {
                 self.last_error = None;
                 self.last_status = Some("Clipboard disabled".to_string());
+                false
             }
             crate::clipboard::ClipboardBackendChoice::Arboard => {
                 if let Err(e) = self.copy_to_clipboard_with_arboard(text) {
                     self.last_error = Some(format!("Failed to copy: {}", e));
+                    false
                 } else {
                     self.set_copied_status(text);
+                    true
                 }
             }
             crate::clipboard::ClipboardBackendChoice::WlCopy { cmd } => {
                 match crate::clipboard::copy_with_wl_copy(text, &self.config.clipboard, &cmd) {
                     Ok(()) => {
                         self.set_copied_status(text);
+                        true
                     }
                     Err(e) => {
                         if self.config.clipboard.backend == ClipboardBackend::Auto {
@@ -4776,11 +4797,14 @@ impl App {
                                     "wl-copy failed: {}; arboard failed: {}",
                                     e, arboard_err
                                 ));
+                                false
                             } else {
                                 self.set_copied_status(text);
+                                true
                             }
                         } else {
                             self.last_error = Some(format!("Failed to copy: {}", e));
+                            false
                         }
                     }
                 }
@@ -7794,6 +7818,7 @@ impl App {
     }
 
     pub fn start_connect(&mut self, conn_str: String) {
+        self.invalidate_password_resolves();
         self.db.status = DbStatus::Connecting;
         self.db.kind = None;
         self.db.conn_str = Some(conn_str.clone());
@@ -7807,6 +7832,7 @@ impl App {
         self.last_status = Some("Connecting...".to_string());
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let connect_generation = self.connect_generation;
+        self.connect_generation_name = self.current_connection_name.clone();
 
         let tx = self.db_events_tx.clone();
         let rt = self.rt.clone();
@@ -8013,6 +8039,8 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
+        self.invalidate_password_resolves();
+
         if entry.no_password_required {
             let url = entry.to_url(None);
             self.current_connection_name = Some(entry.name.clone());
@@ -8037,8 +8065,10 @@ impl App {
 
     /// Queue a session auto-reconnect that will be dispatched after first draw.
     pub fn set_pending_startup_reconnect(&mut self, name: Option<String>) {
-        self.pending_startup_reconnect = name;
-        self.pending_startup_reconnect_explicit = false;
+        self.pending_startup_reconnect = name.map(|name| PendingStartupReconnect {
+            name,
+            automatic: true,
+        });
     }
 
     /// Enable safe mode: skip startup reconnects and scheduled update checks.
@@ -8046,17 +8076,19 @@ impl App {
         self.safe_mode = safe;
     }
 
-    fn dispatch_pending_startup_reconnect(&mut self) {
-        if self.safe_mode && !self.pending_startup_reconnect_explicit {
-            self.pending_startup_reconnect = None;
-            return;
-        }
+    fn invalidate_password_resolves(&mut self) {
+        self.password_resolve_generation = self.password_resolve_generation.wrapping_add(1);
+        self.password_resolve_in_flight.clear();
+    }
 
-        let Some(name) = self.pending_startup_reconnect.take() else {
-            self.pending_startup_reconnect_explicit = false;
+    fn dispatch_pending_startup_reconnect(&mut self) {
+        let Some(pending) = self.pending_startup_reconnect.take() else {
             return;
         };
-        self.pending_startup_reconnect_explicit = false;
+        if self.safe_mode && pending.automatic {
+            return;
+        }
+        let name = pending.name;
 
         if let Ok(connections) = load_connections() {
             self.connections = connections;
@@ -8064,12 +8096,18 @@ impl App {
 
         match self.connections.find_by_name(&name).cloned() {
             Some(entry) => {
+                self.invalidate_password_resolves();
                 self.current_connection_name = Some(entry.name.clone());
                 self.last_status = Some(format!("Reconnecting to {}...", entry.name));
                 if entry.no_password_required {
                     self.start_connect(entry.to_url(None));
                 } else {
-                    self.begin_password_resolve(entry, PasswordResolveReason::Startup);
+                    let reason = if pending.automatic {
+                        PasswordResolveReason::Startup
+                    } else {
+                        PasswordResolveReason::UserPicked
+                    };
+                    self.begin_password_resolve(entry, reason);
                 }
             }
             None => {
@@ -8092,16 +8130,21 @@ impl App {
         match self.password_resolve_in_flight.entry(entry.name.clone()) {
             MapEntry::Occupied(mut slot) => {
                 if matches!(reason, PasswordResolveReason::UserPicked) {
-                    *slot.get_mut() = PasswordResolveReason::UserPicked;
+                    slot.get_mut().reason = PasswordResolveReason::UserPicked;
                 }
                 return;
             }
             MapEntry::Vacant(slot) => {
-                slot.insert(reason);
+                self.password_resolve_generation = self.password_resolve_generation.wrapping_add(1);
+                slot.insert(PendingPasswordResolve {
+                    reason,
+                    generation: self.password_resolve_generation,
+                });
             }
         }
 
         let tx = self.db_events_tx.clone();
+        let password_resolve_generation = self.password_resolve_generation;
         let onepassword_enabled = self.config.connection.enable_onepassword;
         let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
             5000
@@ -8116,18 +8159,18 @@ impl App {
             let _ = tx.send(DbEvent::PasswordResolved {
                 entry: Box::new(entry),
                 result,
-                reason,
+                password_resolve_generation,
             });
         });
     }
 
-    fn record_successful_connect(&mut self) {
-        let Some(name) = self.current_connection_name.clone() else {
+    fn record_successful_connect(&mut self, connection_name: Option<String>) {
+        self.active_connection_name = connection_name.clone();
+        let Some(name) = connection_name else {
             self.active_connection_name = None;
             return;
         };
 
-        self.active_connection_name = Some(name.clone());
         if !self.connections.touch_use(&name) {
             return;
         }
@@ -8564,19 +8607,21 @@ impl App {
                 self.connection_form = Some(form);
             }
             ConnectionManagerAction::YankUrl { url } => {
-                self.copy_to_clipboard(&url);
-                let msg = format!("URL copied (password stripped, {})", yank_size_hint(&url));
-                self.last_status = Some(msg.clone());
-                if let Some(ref mut manager) = self.connection_manager {
-                    manager.set_toast(msg);
+                if self.copy_to_clipboard(&url) {
+                    let msg = format!("URL copied (password stripped, {})", yank_size_hint(&url));
+                    self.last_status = Some(msg.clone());
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.set_toast(msg);
+                    }
                 }
             }
             ConnectionManagerAction::YankCli { command } => {
-                self.copy_to_clipboard(&command);
-                let msg = format!("tsql command copied ({})", yank_size_hint(&command));
-                self.last_status = Some(msg.clone());
-                if let Some(ref mut manager) = self.connection_manager {
-                    manager.set_toast(msg);
+                if self.copy_to_clipboard(&command) {
+                    let msg = format!("tsql command copied ({})", yank_size_hint(&command));
+                    self.last_status = Some(msg.clone());
+                    if let Some(ref mut manager) = self.connection_manager {
+                        manager.set_toast(msg);
+                    }
                 }
             }
             ConnectionManagerAction::Reorder { name, delta } => {
@@ -10145,7 +10190,7 @@ impl App {
                 self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
-                self.record_successful_connect();
+                self.record_successful_connect(self.connect_generation_name.clone());
                 // Load schema for completion
                 self.load_schema();
             }
@@ -10170,7 +10215,7 @@ impl App {
                 self.last_status = Some(format!(
                     "Connected to Mongo ({database}), loading schema..."
                 ));
-                self.record_successful_connect();
+                self.record_successful_connect(self.connect_generation_name.clone());
                 self.load_schema();
             }
             DbEvent::ConnectError {
@@ -10189,6 +10234,7 @@ impl App {
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
+                self.connect_generation_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
@@ -10208,6 +10254,7 @@ impl App {
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
+                self.connect_generation_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
@@ -10405,22 +10452,24 @@ impl App {
             DbEvent::PasswordResolved {
                 entry,
                 result,
-                reason,
+                password_resolve_generation,
             } => {
                 let entry = *entry;
-                let reason = self
-                    .password_resolve_in_flight
-                    .remove(&entry.name)
-                    .unwrap_or(reason);
-
-                if self.current_connection_name.as_deref() != Some(entry.name.as_str()) {
+                let Some(pending) = self.password_resolve_in_flight.get(&entry.name).copied()
+                else {
+                    return;
+                };
+                if pending.generation != password_resolve_generation {
                     return;
                 }
+                self.password_resolve_in_flight.remove(&entry.name);
+                let reason = pending.reason;
 
                 match result {
                     Ok(Some(password)) => {
                         self.last_error = None;
                         self.last_status = Some(format!("Connecting to {}...", entry.name));
+                        self.current_connection_name = Some(entry.name.clone());
                         self.start_connect(entry.to_url(Some(&password)));
                     }
                     Ok(None) => {

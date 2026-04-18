@@ -124,7 +124,7 @@ const CONNECTION_MANAGER: HelpSection = HelpSection::new(
         KeyBinding::new("s", "Cycle persisted sort mode"),
         KeyBinding::new("Ctrl+K / Ctrl+J", "Move selected up / down"),
         KeyBinding::new("y", "Yank URL without password"),
-        KeyBinding::new("c", "Copy tsql <url> command"),
+        KeyBinding::new("c", "Copy `tsql` command"),
         KeyBinding::new("Ctrl+S / Ctrl+T (form)", "Save / test"),
         KeyBinding::new("Ctrl+U / Ctrl+W (form)", "Clear field / delete word"),
         KeyBinding::new("q / Esc", "Close connection manager"),

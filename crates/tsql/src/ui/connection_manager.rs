@@ -62,7 +62,7 @@ pub enum ConnectionManagerAction {
         /// The URL text to copy
         url: String,
     },
-    /// Yank a `tsql <url>` CLI command for the selected entry.
+    /// Yank a `tsql <connection-name>` CLI command for the selected entry.
     YankCli {
         /// The CLI command to copy
         command: String,
@@ -420,7 +420,7 @@ impl ConnectionManagerModal {
             (KeyCode::Char('y'), KeyModifiers::NONE) => {
                 if let Some(entry) = self.selected_connection() {
                     ConnectionManagerAction::YankUrl {
-                        url: entry.to_url(None),
+                        url: entry.sanitized_url(),
                     }
                 } else {
                     ConnectionManagerAction::Continue
