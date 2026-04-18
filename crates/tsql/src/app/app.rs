@@ -8781,7 +8781,8 @@ impl App {
                 } else {
                     if let Some(donor) = self.pending_duplicate_donor.as_deref() {
                         merge_edit_preserving_non_form_fields(&mut entry_to_store, donor);
-                        entry_to_store.no_password_required = donor.no_password_required;
+                        entry_to_store.no_password_required =
+                            entry_to_store.no_password_required && donor.no_password_required;
                         entry_to_store.favorite = None;
                         entry_to_store.last_used_at = None;
                         entry_to_store.use_count = 0;
@@ -13017,6 +13018,63 @@ mod tests {
         assert!(
             !duplicate.password_in_keychain,
             "duplicate should not point at the source connection's keychain entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_duplicate_no_password_connection_preserves_new_onepassword_ref() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = Config::default();
+        config.connection.enable_onepassword = true;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "local".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            no_password_required: true,
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry).unwrap();
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        for _ in 0..4 {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        type_string(&mut app, "op://vault/item/password");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let duplicate = app.connections.find_by_name("local-copy").unwrap();
+        assert!(
+            !duplicate.no_password_required,
+            "new credentials entered in the duplicate form must override donor passwordless state"
+        );
+        assert_eq!(
+            duplicate.password_onepassword.as_deref(),
+            Some("op://vault/item/password")
         );
     }
 

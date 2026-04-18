@@ -411,6 +411,7 @@ impl ConnectionFormModal {
         // Force dirty state so the unsaved-changes prompt fires on Esc
         // without the user having to touch any field first.
         self.modified = true;
+        self.password_persist_acknowledged = false;
     }
 
     /// Check if the form has unsaved changes.
@@ -1793,6 +1794,30 @@ mod tests {
         assert!(form.original_name.is_none());
         assert!(form.original_values.is_none());
         assert!(form.is_modified());
+    }
+
+    #[test]
+    fn test_mark_as_new_reenables_password_persistence_warning() {
+        let entry = ConnectionEntry {
+            name: "src".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "db".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+        let mut form = ConnectionFormModal::edit(&entry, None);
+        form.mark_as_new("Duplicate: src-copy");
+        form.name = "src-copy".to_string();
+        form.password = "secret".to_string();
+
+        match form.try_save() {
+            ConnectionFormAction::StatusMessage(msg) => {
+                assert!(msg.contains("Password won't be remembered"));
+                assert!(form.save_password);
+            }
+            other => panic!("expected password persistence warning, got {other:?}"),
+        }
     }
 
     #[test]
