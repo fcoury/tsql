@@ -16,11 +16,14 @@ body = """
 {%- endfor %}
 
 {% endfor %}
-{% if github.contributors %}
+{% if github.contributors or version == "v0.6.0" %}
 ## Contributors
 {% for contributor in github.contributors %}
 - @{{ contributor.username }}{% if contributor.pr_number %} in #{{ contributor.pr_number }}{% endif %}{% if contributor.is_first_time %} (first-time contributor){% endif %}
 {%- endfor %}
+{%- if version == "v0.6.0" %}
+- @rekurt in #37 (first-time contributor)
+{% endif %}
 {% endif %}
 """
 trim = true
