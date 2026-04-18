@@ -112,17 +112,21 @@ const SIDEBAR_CONNECTIONS: HelpSection = HelpSection::new(
 );
 
 const CONNECTION_MANAGER: HelpSection = HelpSection::new(
-    "Connection Manager",
+    "Connection Manager (gm / Ctrl+Shift+C)",
     &[
         KeyBinding::new("j/k or arrows", "Navigate connections"),
         KeyBinding::new("Enter", "Connect to selected"),
-        KeyBinding::new("a / e", "Add/edit connection"),
-        KeyBinding::new("D", "Duplicate connection"),
-        KeyBinding::new("y", "Copy URL without password"),
-        KeyBinding::new("c", "Copy `tsql` command"),
+        KeyBinding::new("a / e / d", "Add / edit / delete"),
+        KeyBinding::new("D", "Duplicate selected"),
+        KeyBinding::new("f", "Cycle favorite slot (1-9)"),
         KeyBinding::new("t", "Test connection"),
-        KeyBinding::new("d", "Delete connection"),
-        KeyBinding::new("f", "Set favorite"),
+        KeyBinding::new("/", "Filter across fields"),
+        KeyBinding::new("s", "Cycle persisted sort mode"),
+        KeyBinding::new("Ctrl+K / Ctrl+J", "Move selected up / down"),
+        KeyBinding::new("y", "Yank URL without password"),
+        KeyBinding::new("c", "Copy tsql <url> command"),
+        KeyBinding::new("Ctrl+S / Ctrl+T (form)", "Save / test"),
+        KeyBinding::new("Ctrl+U / Ctrl+W (form)", "Clear field / delete word"),
         KeyBinding::new("q / Esc", "Close connection manager"),
     ],
 );
@@ -274,6 +278,11 @@ const COMMANDS: HelpSection = HelpSection::new(
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
         KeyBinding::new(":ai [prompt]", "Open AI query assistant"),
+        KeyBinding::new(":export-connections <path>", "Export saved connections"),
+        KeyBinding::new(
+            ":import-connections <path>",
+            "Import saved connections (+ --overwrite/--skip/--rename)",
+        ),
         KeyBinding::new(":update [check|status|apply]", "Check/apply updates"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
         KeyBinding::new(":q / :quit", "Quit application"),

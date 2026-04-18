@@ -4,7 +4,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
@@ -120,9 +120,25 @@ impl Sidebar {
 
         let sorted = connections.sorted();
         if sorted.is_empty() {
-            let empty = Paragraph::new("No connections.\nPress 'a' to add")
-                .block(block)
-                .style(Style::default().fg(Color::DarkGray));
+            let empty = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No saved connections yet",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled("a", Style::default().fg(Color::Yellow)),
+                    Span::raw(" to add one, or"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Ctrl+Shift+C", Style::default().fg(Color::Yellow)),
+                    Span::raw(" for the full manager."),
+                ]),
+            ])
+            .block(block)
+            .wrap(Wrap { trim: true });
             frame.render_widget(empty, area);
             return;
         }
@@ -215,13 +231,22 @@ impl Sidebar {
             Style::default().fg(Color::Yellow)
         };
 
-        let tree = Tree::new(schema_items)
-            .expect("valid tree items")
-            .block(block)
-            .highlight_style(highlight_style)
-            .highlight_symbol("› ");
-
-        frame.render_stateful_widget(tree, area, &mut self.schema_state);
+        match Tree::new(schema_items) {
+            Ok(tree) => {
+                let tree = tree
+                    .block(block)
+                    .highlight_style(highlight_style)
+                    .highlight_symbol("› ");
+                frame.render_stateful_widget(tree, area, &mut self.schema_state);
+            }
+            Err(e) => {
+                let err =
+                    Paragraph::new(format!("Schema tree build failed: {}\n(retry with `r`)", e))
+                        .block(block)
+                        .style(Style::default().fg(Color::Red));
+                frame.render_widget(err, area);
+            }
+        }
     }
 
     /// Move selection up in connections list by the specified amount.

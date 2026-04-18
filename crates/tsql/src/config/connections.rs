@@ -7,8 +7,10 @@
 //! - Connection entry validation
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use url::Url;
 
 /// Service name for keyring storage
@@ -215,39 +217,87 @@ pub struct ConnectionEntry {
     /// SSL mode (for Phase 7)
     #[serde(default)]
     pub ssl_mode: Option<SslMode>,
+
+    // --- v2 metadata fields (all serde(default) for backward compatibility) ---
+    /// Free-form description shown in the manager detail pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// User-provided tags used for filtering / grouping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Optional folder / group label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+
+    /// Postgres application_name connection parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+
+    /// Per-connection override for `config.connection.connect_timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// PG sslrootcert path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_root_cert: Option<PathBuf>,
+
+    /// PG sslcert path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_client_cert: Option<PathBuf>,
+
+    /// PG sslkey path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_client_key: Option<PathBuf>,
+
+    /// Timestamp of the last successful connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+
+    /// Number of successful connects using this entry.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub use_count: u64,
+
+    /// Manual ordering offset for non-favorite entries (smaller = higher).
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub order: i32,
 }
 
-fn sanitize_connection_url(raw: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(raw) {
-        if parsed.password().is_some() {
-            let _ = parsed.set_password(None);
-            return parsed.to_string();
+/// Best-effort sanitiser for Mongo URIs that didn't round-trip through
+/// `Url::parse`. Strips any `user:password@` userinfo by replacing it
+/// with a bare `@`, so a malformed URI can't end up on screen with
+/// credentials attached. Kept separate from `sanitize_url` (which
+/// relies on the url crate) for exactly this fallback case.
+fn sanitize_mongo_uri_fallback(uri: &str) -> String {
+    // Find the first `://` so we don't touch anything before the
+    // scheme, then look for `user[:password]@` up to the first `/` or
+    // `?` after that.
+    let Some(scheme_end) = uri.find("://") else {
+        return uri.to_string();
+    };
+    let after = scheme_end + 3;
+    let tail = &uri[after..];
+    let stop = tail.find(['/', '?']).unwrap_or(tail.len());
+    let authority = &tail[..stop];
+    match authority.rfind('@') {
+        Some(at) => {
+            let mut out = String::with_capacity(uri.len());
+            out.push_str(&uri[..after]);
+            out.push_str(&authority[at..]); // includes the `@`
+            out.push_str(&tail[stop..]);
+            out
         }
-        return raw.to_string();
+        None => uri.to_string(),
     }
+}
 
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_string();
-    };
-    let authority_start = scheme_end + 3;
-    let tail = &raw[authority_start..];
-    let authority_len = tail.find(['/', '?']).unwrap_or(tail.len());
-    let authority = &tail[..authority_len];
-    let Some(at) = authority.rfind('@') else {
-        return raw.to_string();
-    };
-    let userinfo = &authority[..at];
-    let Some((username, _)) = userinfo.split_once(':') else {
-        return raw.to_string();
-    };
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
 
-    let mut sanitized = String::with_capacity(raw.len());
-    sanitized.push_str(&raw[..authority_start]);
-    sanitized.push_str(username);
-    sanitized.push('@');
-    sanitized.push_str(&authority[at + 1..]);
-    sanitized.push_str(&tail[authority_len..]);
-    sanitized
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 fn default_port() -> u16 {
@@ -272,6 +322,17 @@ impl Default for ConnectionEntry {
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode: None,
+            description: None,
+            tags: Vec::new(),
+            folder: None,
+            application_name: None,
+            connect_timeout_secs: None,
+            ssl_root_cert: None,
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            last_used_at: None,
+            use_count: 0,
+            order: 0,
         }
     }
 }
@@ -301,7 +362,20 @@ impl ConnectionEntry {
                         }
                     }
                 }
-                return uri.clone();
+                // No password supplied — the stored URI may still carry
+                // one (imported files or manual edits can embed
+                // `mongodb://user:password@host/…`). Strip it so yank /
+                // copy-as-CLI never leaks credentials to the clipboard,
+                // even when the URI doesn't round-trip through the url
+                // crate (the fallback handles that).
+                if let Ok(mut parsed) = Url::parse(uri) {
+                    if parsed.password().is_some() {
+                        let _ = parsed.set_password(None);
+                        return parsed.to_string();
+                    }
+                    return uri.clone();
+                }
+                return sanitize_mongo_uri_fallback(uri);
             }
             return "mongodb://localhost".to_string();
         }
@@ -329,26 +403,49 @@ impl ConnectionEntry {
         url.push('/');
         url.push_str(&self.database);
 
+        // Collect query parameters the user configured at entry level.
+        // Without threading these through, the values the UI captures
+        // would be inert and silently ignored at connect time.
+        let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(mode) = self.ssl_mode {
-            url.push_str("?sslmode=");
-            url.push_str(mode.as_str());
+            query.push(("sslmode", mode.as_str().to_string()));
+        }
+        if let Some(secs) = self.connect_timeout_secs {
+            // libpq / tokio-postgres accept `connect_timeout` in seconds.
+            query.push(("connect_timeout", secs.to_string()));
+        }
+        if let Some(app) = self.application_name.as_deref() {
+            let trimmed = app.trim();
+            if !trimmed.is_empty() {
+                query.push(("application_name", trimmed.to_string()));
+            }
+        }
+        // SSL cert paths: libpq-compatible `sslrootcert` / `sslcert` /
+        // `sslkey`. Without these, saved TLS-configured entries would
+        // connect anyway but without the user's CA / client cert,
+        // silently failing handshakes or skipping verification.
+        if let Some(p) = self.ssl_root_cert.as_ref() {
+            query.push(("sslrootcert", p.to_string_lossy().into_owned()));
+        }
+        if let Some(p) = self.ssl_client_cert.as_ref() {
+            query.push(("sslcert", p.to_string_lossy().into_owned()));
+        }
+        if let Some(p) = self.ssl_client_key.as_ref() {
+            query.push(("sslkey", p.to_string_lossy().into_owned()));
+        }
+        if !query.is_empty() {
+            url.push('?');
+            for (i, (k, v)) in query.iter().enumerate() {
+                if i > 0 {
+                    url.push('&');
+                }
+                url.push_str(k);
+                url.push('=');
+                url.push_str(&urlencoding::encode(v));
+            }
         }
 
         url
-    }
-
-    /// Build a display/copy-safe URL that never includes an embedded password.
-    pub fn sanitized_url(&self) -> String {
-        sanitize_connection_url(&self.to_url(None))
-    }
-
-    /// Build a shell-pasteable command for launching this connection.
-    pub fn to_cli_command(&self) -> String {
-        let url = self.sanitized_url();
-        match shlex::try_quote(&url) {
-            Ok(quoted) => format!("tsql {}", quoted),
-            Err(_) => format!("tsql {}", url),
-        }
     }
 
     /// Parse a URL and create a ConnectionEntry.
@@ -436,6 +533,7 @@ impl ConnectionEntry {
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode,
+            ..Default::default()
         };
 
         Ok((entry, password))
@@ -656,13 +754,103 @@ impl ConnectionEntry {
         }
     }
 
+    /// Human-friendly label for the password source.
+    pub fn password_source_label(&self) -> &'static str {
+        if self.no_password_required {
+            "none required"
+        } else if self.password_in_keychain {
+            "keychain"
+        } else if self.password_env.is_some() {
+            "env var"
+        } else if self.password_onepassword.is_some() {
+            "1Password"
+        } else {
+            "prompt"
+        }
+    }
+
+    /// Short relative-time description for `last_used_at` (e.g. "2m ago").
+    pub fn last_used_label(&self) -> String {
+        match self.last_used_at {
+            None => "never".to_string(),
+            Some(ts) => {
+                let now = Utc::now();
+                let delta = now.signed_duration_since(ts);
+                let secs = delta.num_seconds();
+                if secs < 0 {
+                    return "just now".to_string();
+                }
+                if secs < 60 {
+                    return format!("{}s ago", secs);
+                }
+                let mins = secs / 60;
+                if mins < 60 {
+                    return format!("{}m ago", mins);
+                }
+                let hours = mins / 60;
+                if hours < 24 {
+                    return format!("{}h ago", hours);
+                }
+                let days = hours / 24;
+                if days < 30 {
+                    return format!("{}d ago", days);
+                }
+                ts.format("%Y-%m-%d").to_string()
+            }
+        }
+    }
+
+    /// Sanitised `tsql <url>` CLI form for yanking to clipboard.
+    pub fn to_cli_command(&self) -> String {
+        // Shell-quote the URL so characters like `&` (common in Mongo
+        // query strings, e.g. `?replicaSet=rs0&ssl=true`) don't get
+        // interpreted by the user's shell when they paste the command.
+        let url = self.to_url(None);
+        let quoted = shlex::try_quote(&url)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| format!("'{}'", url.replace('\'', "'\\''")));
+        format!("tsql {}", quoted)
+    }
+
+    /// Parse and normalise a comma-separated tag string. Whitespace trimmed;
+    /// empty tags dropped; duplicates collapsed preserving order.
+    pub fn parse_tags(input: &str) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        input
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                let t = s.to_string();
+                if seen.insert(t.clone()) {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Format connection for display (without password)
     pub fn display_string(&self) -> String {
         if self.kind == DbKind::Mongo {
-            return self
-                .uri
-                .clone()
-                .unwrap_or_else(|| "mongodb://localhost".to_string());
+            // Imported / hand-edited entries can embed credentials in
+            // `uri`. The detail pane and status line call into this
+            // directly, so strip the password before handing the string
+            // back — otherwise opening the connection manager on a
+            // wide terminal would render plaintext credentials. Cover
+            // the Url::parse success branch AND the unparseable
+            // fallback: a slightly-off URI (e.g. literal space in the
+            // host) was still going through verbatim and leaking.
+            let uri = self.uri.as_deref().unwrap_or("mongodb://localhost");
+            if let Ok(mut parsed) = Url::parse(uri) {
+                if parsed.password().is_some() {
+                    let _ = parsed.set_password(None);
+                    return parsed.to_string();
+                }
+                return uri.to_string();
+            }
+            return sanitize_mongo_uri_fallback(uri);
         }
         format!(
             "{}@{}:{}/{}",
@@ -686,7 +874,10 @@ impl ConnectionEntry {
                 }
                 return format!("mongodb://{}/{}", host, db);
             }
-            return uri;
+            // Unparseable fallback: strip anything that looks like
+            // `user:password@` so a malformed-but-credential-bearing
+            // URI doesn't end up on screen verbatim.
+            return sanitize_mongo_uri_fallback(&uri);
         }
         if self.port == 5432 {
             format!("{}@{}/{}", self.user, self.host, self.database)
@@ -798,6 +989,14 @@ pub struct ConnectionsFile {
     /// List of saved connections
     #[serde(default, rename = "connection")]
     pub connections: Vec<ConnectionEntry>,
+    /// Sort mode last chosen in the connection manager. Persisted so the
+    /// user's preference survives restarts.
+    #[serde(default, skip_serializing_if = "is_default_sort")]
+    pub last_sort_mode: SortMode,
+}
+
+fn is_default_sort(mode: &SortMode) -> bool {
+    *mode == SortMode::default()
 }
 
 impl ConnectionsFile {
@@ -805,6 +1004,7 @@ impl ConnectionsFile {
     pub fn new() -> Self {
         Self {
             connections: Vec::new(),
+            last_sort_mode: SortMode::default(),
         }
     }
 
@@ -844,6 +1044,26 @@ impl ConnectionsFile {
                     fav,
                     existing.name
                 ));
+            }
+        }
+
+        let mut entry = entry;
+        // Once the user has manually reordered any non-favorite entry,
+        // some `order` values become > 0. A freshly added / imported
+        // entry defaults to `order = 0` and would otherwise jump to
+        // the top of the manual list — surprising behaviour after
+        // every `:import-connections` or "add" click. Append to the
+        // bottom instead when anyone else has been reordered.
+        if entry.favorite.is_none() && entry.order == 0 {
+            let max_order = self
+                .connections
+                .iter()
+                .filter(|c| c.favorite.is_none())
+                .map(|c| c.order)
+                .max()
+                .unwrap_or(0);
+            if max_order > 0 {
+                entry.order = max_order.saturating_add(1);
             }
         }
 
@@ -932,15 +1152,193 @@ impl ConnectionsFile {
 
     /// Get connections sorted by favorite first, then alphabetically
     pub fn sorted(&self) -> Vec<&ConnectionEntry> {
+        self.sorted_by(SortMode::FavoritesAlpha)
+    }
+
+    /// Get connections sorted by the given mode.
+    pub fn sorted_by(&self, mode: SortMode) -> Vec<&ConnectionEntry> {
         let mut sorted: Vec<_> = self.connections.iter().collect();
-        sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
-            (Some(fa), Some(fb)) => fa.cmp(&fb),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        });
+        match mode {
+            SortMode::FavoritesAlpha => {
+                sorted.sort_by(|a, b| match (a.favorite, b.favorite) {
+                    (Some(fa), Some(fb)) => fa.cmp(&fb),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a
+                        .order
+                        .cmp(&b.order)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                });
+            }
+            SortMode::Recent => {
+                sorted.sort_by(|a, b| {
+                    b.last_used_at
+                        .cmp(&a.last_used_at)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+            SortMode::MostUsed => {
+                sorted.sort_by(|a, b| {
+                    b.use_count
+                        .cmp(&a.use_count)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+            SortMode::Alpha => {
+                sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            SortMode::Folder => {
+                sorted.sort_by(|a, b| {
+                    let fa = a.folder.as_deref().unwrap_or("~");
+                    let fb = b.folder.as_deref().unwrap_or("~");
+                    fa.to_lowercase()
+                        .cmp(&fb.to_lowercase())
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+            }
+        }
         sorted
     }
+
+    /// Touch an entry to record a successful use. Returns whether the entry
+    /// was found. Caller should persist via `save_connections_debounced`.
+    pub fn touch_use(&mut self, name: &str) -> bool {
+        if let Some(entry) = self.find_by_name_mut(name) {
+            entry.last_used_at = Some(Utc::now());
+            entry.use_count = entry.use_count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return all distinct folder labels in insertion order.
+    pub fn folders(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for c in &self.connections {
+            if let Some(f) = c.folder.as_deref() {
+                let f = f.to_string();
+                if seen.insert(f.clone()) {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Return all distinct tag labels across entries.
+    pub fn all_tags(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for c in &self.connections {
+            for t in &c.tags {
+                if seen.insert(t.clone()) {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Filter entries by a lowercase needle across name / host / database /
+    /// tags / description / folder. Empty needle returns all.
+    pub fn filtered(&self, needle: &str) -> Vec<&ConnectionEntry> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.connections.iter().collect();
+        }
+        self.connections
+            .iter()
+            .filter(|c| entry_matches(c, &needle))
+            .collect()
+    }
+}
+
+fn entry_matches(c: &ConnectionEntry, needle_lc: &str) -> bool {
+    if c.name.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.host.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.database.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if c.user.to_lowercase().contains(needle_lc) {
+        return true;
+    }
+    if let Some(f) = &c.folder {
+        if f.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    if let Some(d) = &c.description {
+        if d.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    for t in &c.tags {
+        if t.to_lowercase().contains(needle_lc) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sort modes available in the connection manager. Persisted across
+/// restarts via `ConnectionsFile.last_sort_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortMode {
+    /// Favorites first (by slot), then manual order, then alphabetical.
+    #[default]
+    FavoritesAlpha,
+    /// Most recently used first.
+    Recent,
+    /// Highest use_count first.
+    MostUsed,
+    /// Pure alphabetical order by name.
+    Alpha,
+    /// Grouped by folder, then alphabetical.
+    Folder,
+}
+
+impl SortMode {
+    /// Short label shown in UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::FavoritesAlpha => "favorites",
+            SortMode::Recent => "recent",
+            SortMode::MostUsed => "most used",
+            SortMode::Alpha => "alpha",
+            SortMode::Folder => "folder",
+        }
+    }
+
+    /// Cycle to the next sort mode.
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::FavoritesAlpha => SortMode::Recent,
+            SortMode::Recent => SortMode::MostUsed,
+            SortMode::MostUsed => SortMode::Alpha,
+            SortMode::Alpha => SortMode::Folder,
+            SortMode::Folder => SortMode::FavoritesAlpha,
+        }
+    }
+}
+
+/// Conflict-resolution strategy when importing an entry whose name already
+/// exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportConflict {
+    /// Skip the incoming entry.
+    Skip,
+    /// Overwrite the existing entry in place.
+    Overwrite,
+    /// Rename the incoming entry by appending " (imported)".
+    Rename,
 }
 
 /// Returns the connections file path (inside `config_dir()`).
@@ -962,11 +1360,16 @@ pub fn load_connections() -> Result<ConnectionsFile> {
     Ok(ConnectionsFile::new())
 }
 
-/// Save connections to the default path
+/// Save connections to the default path (atomic: writes to a tmp file and
+/// renames into place so a crash mid-write cannot corrupt the store).
 pub fn save_connections(file: &ConnectionsFile) -> Result<()> {
     let path = connections_path().ok_or_else(|| anyhow!("Could not determine config directory"))?;
+    write_connections_atomic(&path, file)
+}
 
-    // Ensure parent directory exists
+/// Write a `ConnectionsFile` to a specific path atomically. Public so tests
+/// and import/export can reuse the write path.
+pub fn write_connections_atomic(path: &Path, file: &ConnectionsFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
@@ -974,10 +1377,145 @@ pub fn save_connections(file: &ConnectionsFile) -> Result<()> {
 
     let content = toml::to_string_pretty(file).context("Failed to serialize connections")?;
 
-    std::fs::write(&path, content)
-        .with_context(|| format!("Failed to write connections file: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create tempfile in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())
+        .context("Failed to write connections temp file")?;
+    tmp.as_file()
+        .sync_all()
+        .context("Failed to fsync connections temp file")?;
+
+    // `std::fs::rename` on modern Rust uses `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING` on Windows, so it should overwrite
+    // an existing target. But older Windows versions, FAT32 volumes,
+    // and some network shares still reject replace-rename with
+    // `AlreadyExists` / `PermissionDenied`. Fall back to explicit
+    // `remove_file` + `rename` on those — not atomic, but lets the
+    // save succeed where it would otherwise wedge the config file.
+    let tmp_path = tmp.into_temp_path();
+    std::fs::rename(&tmp_path, path)
+        .or_else(|e| {
+            if cfg!(windows)
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                )
+            {
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&tmp_path, path)
+            } else {
+                Err(e)
+            }
+        })
+        .with_context(|| {
+            format!(
+                "Failed to rename temp connections file into place at {}",
+                path.display()
+            )
+        })?;
+    // rename consumed the inode but the TempPath still points at the
+    // old location — detach it so its Drop doesn't try to unlink a
+    // path that no longer exists.
+    let _ = tmp_path.keep();
 
     Ok(())
+}
+
+/// Export a subset of entries to a TOML file at the given path (atomic).
+pub fn export_to_path(path: &Path, entries: Vec<ConnectionEntry>) -> Result<()> {
+    let file = ConnectionsFile {
+        connections: entries,
+        last_sort_mode: SortMode::default(),
+    };
+    write_connections_atomic(path, &file)
+}
+
+/// Summary returned from an import operation.
+#[derive(Debug, Default, Clone)]
+pub struct ImportSummary {
+    pub imported: usize,
+    pub renamed: usize,
+    pub overwritten: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Import connections from a TOML file at `path`, merging into `target`
+/// using the given conflict strategy. Does NOT persist — caller must call
+/// `save_connections` afterwards.
+pub fn import_from_path(
+    target: &mut ConnectionsFile,
+    path: &Path,
+    strategy: ImportConflict,
+) -> Result<ImportSummary> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+    let incoming: ConnectionsFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse import file: {}", path.display()))?;
+
+    let mut summary = ImportSummary::default();
+
+    for mut entry in incoming.connections.into_iter() {
+        // Drop favorite slot to avoid collisions on import; the user can
+        // reassign after review.
+        entry.favorite = None;
+
+        if entry.validate().is_err() {
+            summary
+                .errors
+                .push(format!("Skipped invalid entry '{}'", entry.name));
+            summary.skipped += 1;
+            continue;
+        }
+
+        if target.find_by_name(&entry.name).is_some() {
+            match strategy {
+                ImportConflict::Skip => {
+                    summary.skipped += 1;
+                    continue;
+                }
+                ImportConflict::Overwrite => {
+                    let name = entry.name.clone();
+                    match target.update(&name, entry) {
+                        Ok(()) => summary.overwritten += 1,
+                        Err(e) => {
+                            summary.errors.push(format!("{}: {}", name, e));
+                            summary.skipped += 1;
+                        }
+                    }
+                }
+                ImportConflict::Rename => {
+                    // Must not contain whitespace (connection names are
+                    // validated against that), so we use '-' separators.
+                    let mut candidate = format!("{}-imported", entry.name);
+                    let mut n = 2;
+                    while target.find_by_name(&candidate).is_some() {
+                        candidate = format!("{}-imported-{}", entry.name, n);
+                        n += 1;
+                    }
+                    entry.name = candidate;
+                    match target.add(entry) {
+                        Ok(()) => summary.renamed += 1,
+                        Err(e) => {
+                            summary.errors.push(e.to_string());
+                            summary.skipped += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            match target.add(entry) {
+                Ok(()) => summary.imported += 1,
+                Err(e) => {
+                    summary.errors.push(e.to_string());
+                    summary.skipped += 1;
+                }
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -993,6 +1531,436 @@ mod tests {
         assert_eq!(entry.color, ConnectionColor::None);
         assert!(entry.favorite.is_none());
         assert!(entry.ssl_mode.is_none());
+        assert!(entry.description.is_none());
+        assert!(entry.tags.is_empty());
+        assert!(entry.folder.is_none());
+        assert_eq!(entry.use_count, 0);
+        assert!(entry.last_used_at.is_none());
+        assert_eq!(entry.order, 0);
+    }
+
+    #[test]
+    fn test_metadata_fields_round_trip_via_toml() {
+        let mut entry = ConnectionEntry::new("prod-db");
+        entry.host = "db.internal".to_string();
+        entry.database = "main".to_string();
+        entry.user = "app".to_string();
+        entry.description = Some("Production — be careful".to_string());
+        entry.tags = vec!["prod".to_string(), "critical".to_string()];
+        entry.folder = Some("Production".to_string());
+        entry.application_name = Some("tsql-cli".to_string());
+        entry.connect_timeout_secs = Some(15);
+        entry.use_count = 42;
+        let mut file = ConnectionsFile::new();
+        file.add(entry.clone()).unwrap();
+        let toml_str = toml::to_string_pretty(&file).unwrap();
+        let reparsed: ConnectionsFile = toml::from_str(&toml_str).unwrap();
+        let got = reparsed.find_by_name("prod-db").unwrap();
+        assert_eq!(got.description.as_deref(), Some("Production — be careful"));
+        assert_eq!(got.tags, vec!["prod", "critical"]);
+        assert_eq!(got.folder.as_deref(), Some("Production"));
+        assert_eq!(got.application_name.as_deref(), Some("tsql-cli"));
+        assert_eq!(got.connect_timeout_secs, Some(15));
+        assert_eq!(got.use_count, 42);
+    }
+
+    #[test]
+    fn test_legacy_toml_loads_with_defaults_for_new_fields() {
+        // Simulates an existing connections.toml written before v2.
+        let toml_str = r#"
+[[connection]]
+kind = "postgres"
+name = "old"
+host = "localhost"
+port = 5432
+database = "db"
+user = "me"
+"#;
+        let parsed: ConnectionsFile = toml::from_str(toml_str).unwrap();
+        let entry = parsed.find_by_name("old").unwrap();
+        assert!(entry.description.is_none());
+        assert!(entry.tags.is_empty());
+        assert_eq!(entry.use_count, 0);
+    }
+
+    #[test]
+    fn test_mongo_display_string_strips_password() {
+        // Regression: the detail pane renders `display_string()` for
+        // the "Target" row. If the stored URI embedded credentials
+        // (imported / hand-edited), the password used to appear on
+        // screen when the user opened the manager.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:topsecret@host:27017/db".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let display = entry.display_string();
+        assert!(!display.contains("topsecret"), "leaked: {display}");
+        assert!(display.contains("user"));
+        assert!(display.contains("host"));
+    }
+
+    #[test]
+    fn test_sanitize_mongo_uri_fallback_strips_userinfo() {
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://user:pw@host/db"),
+            "mongodb://@host/db"
+        );
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://host/db"),
+            "mongodb://host/db"
+        );
+        assert_eq!(
+            sanitize_mongo_uri_fallback("mongodb://host/db?ssl=true"),
+            "mongodb://host/db?ssl=true"
+        );
+        assert_eq!(sanitize_mongo_uri_fallback("not a url"), "not a url");
+    }
+
+    #[test]
+    fn test_add_appends_new_entry_below_manually_ordered_list() {
+        // Regression: after the user reorders manually (bumping some
+        // `order` values > 0), adding a new entry with default
+        // `order = 0` would put it at the top of the visible list.
+        // `add()` must now append to the bottom in that case.
+        let mut file = ConnectionsFile::new();
+        for name in ["a", "b", "c"] {
+            file.add(ConnectionEntry {
+                name: name.to_string(),
+                host: "h".to_string(),
+                database: "d".to_string(),
+                user: "u".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        // Simulate user reordering: b bumped to 1, c bumped to 2.
+        // Everyone was at 0, so now the list has mixed orders.
+        file.find_by_name_mut("b").unwrap().order = 1;
+        file.find_by_name_mut("c").unwrap().order = 2;
+
+        // Add a new entry. Default order = 0 would have sorted first
+        // (`a:0, d:0, b:1, c:2` — actually alphabetically among zeros,
+        // so `a, d, b, c`). We want append-to-bottom semantics.
+        file.add(ConnectionEntry {
+            name: "d".to_string(),
+            host: "h".to_string(),
+            database: "x".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let sorted: Vec<&str> = file
+            .sorted_by(SortMode::FavoritesAlpha)
+            .into_iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            sorted.last().copied(),
+            Some("d"),
+            "new entry must land at the bottom after the user has manually reordered; got {sorted:?}"
+        );
+    }
+
+    #[test]
+    fn test_add_leaves_order_zero_when_nobody_has_reordered() {
+        // Fresh file with no manual ordering — new entries stay at
+        // the default 0 so the alphabetical tiebreak keeps working.
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "alpha".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        file.add(ConnectionEntry {
+            name: "bravo".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(file.find_by_name("alpha").unwrap().order, 0);
+        assert_eq!(file.find_by_name("bravo").unwrap().order, 0);
+    }
+
+    #[test]
+    fn test_mongo_display_string_strips_password_when_uri_not_parseable() {
+        // Regression: `display_string` used to `return uri.to_string()`
+        // unchanged if Url::parse failed, leaking embedded credentials
+        // in the connection-manager detail pane.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:topsecret@bad host/db".to_string()),
+            host: "bad host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let display = entry.display_string();
+        assert!(!display.contains("topsecret"), "leaked: {display}");
+    }
+
+    #[test]
+    fn test_mongo_to_url_none_strips_password_even_when_uri_not_parseable() {
+        // Regression: `Url::parse` could reject a hand-edited URI
+        // while still carrying credentials; the previous fallback
+        // returned it verbatim, so yank/copy-as-CLI leaked the
+        // password for those inputs.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            // Intentionally crafted to look malformed to url crate
+            // (the space in the host breaks parsing) yet still embed
+            // credentials in the `userinfo@` prefix.
+            uri: Some("mongodb://user:topsecret@bad host/db".to_string()),
+            host: "bad host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(!url.contains("topsecret"), "leaked: {url}");
+    }
+
+    #[test]
+    fn test_mongo_to_url_none_strips_password_from_stored_uri() {
+        // Regression: imported/manually-edited connections.toml entries
+        // can carry passwords embedded in the `uri`. `to_url(None)` is
+        // used by yank and copy-as-CLI actions, which advertise "no
+        // password". Ensure the password is actually stripped.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://user:secret@host:27017/db".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: "user".to_string(),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(!url.contains("secret"), "leaked password: {url}");
+        assert!(url.contains("user"));
+        assert!(url.contains("host"));
+    }
+
+    #[test]
+    fn test_to_cli_command_quotes_url_with_shell_meta_chars() {
+        // Regression: URLs with `&`, `?`, `*`, etc. (common in Mongo
+        // query strings like `?replicaSet=rs0&ssl=true`) must be
+        // shell-escaped or the pasted command breaks / runs unintended
+        // things.
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "m".to_string(),
+            uri: Some("mongodb://host/db?replicaSet=rs0&ssl=true".to_string()),
+            host: "host".to_string(),
+            port: 27017,
+            database: "db".to_string(),
+            user: String::new(),
+            ..Default::default()
+        };
+        let cmd = entry.to_cli_command();
+        // The URL must be inside quotes (single or double), i.e. the
+        // command should NOT be just `tsql mongodb://…&…`.
+        assert!(
+            cmd.starts_with("tsql '") || cmd.starts_with("tsql \""),
+            "cli command not quoted: {cmd}",
+        );
+        assert!(cmd.contains("mongodb://host/db?replicaSet=rs0&ssl=true"));
+    }
+
+    #[test]
+    fn test_parse_tags_trims_dedupes_and_drops_empty() {
+        let got = ConnectionEntry::parse_tags(" prod ,  , staging, prod, ");
+        assert_eq!(got, vec!["prod".to_string(), "staging".to_string()]);
+    }
+
+    #[test]
+    fn test_touch_use_bumps_counter_and_timestamp() {
+        let mut file = ConnectionsFile::new();
+        let entry = ConnectionEntry {
+            name: "x".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        };
+        file.add(entry).unwrap();
+        assert!(file.touch_use("x"));
+        assert_eq!(file.find_by_name("x").unwrap().use_count, 1);
+        assert!(file.find_by_name("x").unwrap().last_used_at.is_some());
+        assert!(file.touch_use("x"));
+        assert_eq!(file.find_by_name("x").unwrap().use_count, 2);
+        assert!(!file.touch_use("missing"));
+    }
+
+    #[test]
+    fn test_sort_modes_differ() {
+        let mut file = ConnectionsFile::new();
+        let mut a = ConnectionEntry::new("alpha");
+        a.host = "h".into();
+        a.database = "d".into();
+        a.user = "u".into();
+        a.use_count = 1;
+        let mut b = ConnectionEntry::new("bravo");
+        b.host = "h".into();
+        b.database = "d".into();
+        b.user = "u".into();
+        b.use_count = 10;
+        b.last_used_at = Some(Utc::now());
+        file.add(a).unwrap();
+        file.add(b).unwrap();
+
+        let by_alpha: Vec<&str> = file
+            .sorted_by(SortMode::Alpha)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_alpha, vec!["alpha", "bravo"]);
+
+        let by_most_used: Vec<&str> = file
+            .sorted_by(SortMode::MostUsed)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_most_used, vec!["bravo", "alpha"]);
+
+        let by_recent: Vec<&str> = file
+            .sorted_by(SortMode::Recent)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(by_recent, vec!["bravo", "alpha"]);
+
+        assert_eq!(SortMode::FavoritesAlpha.next(), SortMode::Recent);
+    }
+
+    #[test]
+    fn test_filtered_matches_across_fields() {
+        let mut file = ConnectionsFile::new();
+        let mut a = ConnectionEntry::new("alpha");
+        a.host = "prod-host".into();
+        a.database = "sales".into();
+        a.user = "u".into();
+        a.tags = vec!["prod".into()];
+        a.description = Some("Main read replica".into());
+        let mut b = ConnectionEntry::new("bravo");
+        b.host = "staging".into();
+        b.database = "sandbox".into();
+        b.user = "u".into();
+        b.folder = Some("Staging".into());
+        file.add(a).unwrap();
+        file.add(b).unwrap();
+
+        let hits: Vec<&str> = file
+            .filtered("prod")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["alpha"]);
+
+        let hits: Vec<&str> = file
+            .filtered("Staging")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["bravo"]);
+
+        let hits: Vec<&str> = file
+            .filtered("")
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn test_write_connections_atomic_overwrites_existing_target() {
+        // Regression: `write_connections_atomic` must succeed when the
+        // target already exists. Every save after the first one hits
+        // this path, so a failure here would wedge the config file.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+
+        // First write creates the file.
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "one".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        assert!(path.exists());
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("one"));
+
+        // Second write must overwrite in place, not error.
+        file.add(ConnectionEntry {
+            name: "two".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.contains("one"));
+        assert!(second.contains("two"));
+    }
+
+    #[test]
+    fn test_atomic_write_and_import_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+
+        let mut file = ConnectionsFile::new();
+        let entry = ConnectionEntry {
+            name: "alpha".to_string(),
+            host: "h".to_string(),
+            database: "d".to_string(),
+            user: "u".to_string(),
+            tags: vec!["prod".to_string()],
+            ..Default::default()
+        };
+        file.add(entry).unwrap();
+        write_connections_atomic(&path, &file).unwrap();
+        assert!(path.exists());
+
+        // Import into a fresh file: should come in clean.
+        let mut target = ConnectionsFile::new();
+        let summary = import_from_path(&mut target, &path, ImportConflict::Rename).unwrap();
+        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.renamed, 0);
+        assert_eq!(target.find_by_name("alpha").unwrap().tags, vec!["prod"]);
+
+        // Re-import into same target with Rename strategy: should
+        // produce a renamed copy.
+        let summary2 = import_from_path(&mut target, &path, ImportConflict::Rename).unwrap();
+        assert_eq!(summary2.renamed, 1);
+        assert!(target.find_by_name("alpha-imported").is_some());
+
+        // Skip strategy: no-op on collision.
+        let summary3 = import_from_path(&mut target, &path, ImportConflict::Skip).unwrap();
+        assert_eq!(summary3.skipped, 1);
+        assert_eq!(summary3.imported, 0);
     }
 
     #[test]
@@ -1039,6 +2007,56 @@ mod tests {
 
         let url = entry.to_url(None);
         assert_eq!(url, "postgres://postgres@localhost/mydb?sslmode=require");
+    }
+
+    #[test]
+    fn test_connection_to_url_threads_ssl_cert_paths() {
+        // Regression: saved per-entry SSL cert paths were inert at
+        // connect / test time because `to_url` never emitted them
+        // as `sslrootcert` / `sslcert` / `sslkey` query params.
+        use std::path::PathBuf;
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_root_cert: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            ssl_client_cert: Some(PathBuf::from("/etc/ssl/client.pem")),
+            ssl_client_key: Some(PathBuf::from("/etc/ssl/client.key")),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(url.contains("sslmode=verify-full"), "url: {url}");
+        assert!(
+            url.contains("sslrootcert=") && (url.contains("ca.pem") || url.contains("ca%2Epem")),
+            "url: {url}"
+        );
+        assert!(url.contains("sslcert="), "url: {url}");
+        assert!(url.contains("sslkey="), "url: {url}");
+    }
+
+    #[test]
+    fn test_connection_to_url_threads_timeout_and_app_name() {
+        // Regression: per-entry `connect_timeout_secs` and
+        // `application_name` must end up as query params, otherwise
+        // setting them in the UI is silently inert.
+        let entry = ConnectionEntry {
+            name: "test".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            connect_timeout_secs: Some(5),
+            application_name: Some("tsql-prod".to_string()),
+            ssl_mode: Some(SslMode::Require),
+            ..Default::default()
+        };
+        let url = entry.to_url(None);
+        assert!(url.contains("sslmode=require"), "url: {url}");
+        assert!(url.contains("connect_timeout=5"), "url: {url}");
+        assert!(url.contains("application_name=tsql-prod"), "url: {url}");
     }
 
     #[test]
@@ -1239,61 +2257,6 @@ mod tests {
         };
         let url = entry.to_url(Some("secret"));
         assert_eq!(url, "mongodb://admin:secret@mongo.example.com:27018/sample");
-    }
-
-    #[test]
-    fn test_sanitized_url_strips_postgres_password() {
-        let entry = ConnectionEntry {
-            name: "pg".to_string(),
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "mydb".to_string(),
-            user: "postgres".to_string(),
-            ..Default::default()
-        };
-
-        let runtime_url = entry.to_url(Some("secret"));
-        assert_eq!(sanitize_connection_url(&runtime_url), entry.sanitized_url());
-        assert_eq!(entry.sanitized_url(), "postgres://postgres@localhost/mydb");
-    }
-
-    #[test]
-    fn test_sanitized_url_strips_mongo_password() {
-        let entry = ConnectionEntry {
-            kind: DbKind::Mongo,
-            name: "mongo".to_string(),
-            uri: Some(
-                "mongodb://admin:secret@mongo.example.com:27018/sample?authSource=admin"
-                    .to_string(),
-            ),
-            host: "mongo.example.com".to_string(),
-            port: 27018,
-            database: "sample".to_string(),
-            user: "admin".to_string(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            entry.sanitized_url(),
-            "mongodb://admin@mongo.example.com:27018/sample?authSource=admin"
-        );
-    }
-
-    #[test]
-    fn test_cli_command_quotes_sanitized_url() {
-        let entry = ConnectionEntry {
-            name: "quoted".to_string(),
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "my db".to_string(),
-            user: "postgres".to_string(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            entry.to_cli_command(),
-            "tsql 'postgres://postgres@localhost/my db'"
-        );
     }
 
     #[test]
@@ -1612,7 +2575,7 @@ password_in_keychain = true
     }
 
     // ========== Issue #16 Reproduction Tests ==========
-    // https://github.com/fcoury/tsql/issues/16
+    // https://github.com/rekurt/tsql/issues/16
     // "Password missing even though the test connection worked"
 
     /// This test reproduces issue #16: when a user creates a new connection,

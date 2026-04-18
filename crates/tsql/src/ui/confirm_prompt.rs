@@ -47,7 +47,7 @@ pub enum ConfirmContext {
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
     /// Switching to a new connection with unsaved query changes.
-    SwitchConnection { entry: ConnectionEntry },
+    SwitchConnection { entry: Box<ConnectionEntry> },
     /// Applying an in-app binary update.
     ApplyUpdate { info: UpdateInfo },
     /// Opening the AI assistant when current query editor has content.
