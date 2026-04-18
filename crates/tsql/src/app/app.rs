@@ -10108,14 +10108,11 @@ impl App {
                 self.password_resolve_in_flight.remove(&entry.name);
                 let reason = pending.reason;
 
-                if self.current_connection_name.as_deref() != Some(entry.name.as_str()) {
-                    return;
-                }
-
                 match result {
                     Ok(Some(password)) => {
                         self.last_error = None;
                         self.last_status = Some(format!("Connecting to {}...", entry.name));
+                        self.current_connection_name = Some(entry.name.clone());
                         self.start_connect(entry.to_url(Some(&password)));
                     }
                     Ok(None) => {
@@ -12982,6 +12979,69 @@ mod tests {
                 .map(|pending| pending.generation),
             Some(fresh_generation)
         );
+    }
+
+    #[test]
+    fn test_password_resolve_survives_old_connection_lost() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.db.status = DbStatus::Connected;
+        app.current_connection_name = Some("old".to_string());
+        app.active_connection_name = Some("old".to_string());
+        app.connect_generation = 7;
+
+        let entry = ConnectionEntry {
+            name: "new".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            password_in_keychain: true,
+            ..Default::default()
+        };
+
+        app.current_connection_name = Some(entry.name.clone());
+        app.password_resolve_generation = app.password_resolve_generation.wrapping_add(1);
+        let password_generation = app.password_resolve_generation;
+        app.password_resolve_in_flight.insert(
+            entry.name.clone(),
+            PendingPasswordResolve {
+                reason: PasswordResolveReason::UserPicked,
+                generation: password_generation,
+            },
+        );
+
+        app.apply_db_event(DbEvent::ConnectionLost {
+            error: "old connection dropped".to_string(),
+            connect_generation: 7,
+        });
+
+        assert_eq!(app.current_connection_name, None);
+        assert_eq!(
+            app.password_resolve_in_flight
+                .get(&entry.name)
+                .map(|pending| pending.generation),
+            Some(password_generation)
+        );
+
+        app.apply_db_event(DbEvent::PasswordResolved {
+            entry: Box::new(entry),
+            result: Ok(Some("secret".to_string())),
+            password_resolve_generation: password_generation,
+        });
+
+        assert_eq!(app.db.status, DbStatus::Connecting);
+        assert_eq!(app.current_connection_name.as_deref(), Some("new"));
+        assert!(app
+            .db
+            .conn_str
+            .as_deref()
+            .is_some_and(|url| url.contains("postgres:secret@localhost")));
     }
 
     #[test]
