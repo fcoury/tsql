@@ -2134,6 +2134,21 @@ mod tests {
     }
 
     #[test]
+    fn test_url_paste_decodes_postgres_username() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::UrlPaste;
+        form.url_paste =
+            "postgres://user%40domain.com:secret@db.example.com:5433/production".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, ConnectionFormAction::StatusMessage(_)));
+
+        assert_eq!(form.user, "user@domain.com");
+        assert_eq!(form.password, "secret");
+        assert_eq!(form.kind, DbKind::Postgres);
+    }
+
+    #[test]
     fn test_url_paste_mongodb_sets_kind_and_uri() {
         let mut form = ConnectionFormModal::new();
         form.focused = FormField::UrlPaste;
