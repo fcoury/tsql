@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use tsql::app::App;
-use tsql::config::{self, load_connections};
+use tsql::config;
 use tsql::session::load_session;
 use tsql::ui::GridModel;
 
@@ -141,10 +141,11 @@ fn build_url_from_libpq_env() -> LibpqEnvResult {
 fn print_usage() {
     eprintln!("tsql - A modern SQL and MongoDB CLI");
     eprintln!();
-    eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL]");
+    eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL|CONNECTION_NAME]");
     eprintln!();
     eprintln!("Arguments:");
-    eprintln!("  [CONNECTION_URL]  Connection URL");
+    eprintln!("  [CONNECTION_URL|CONNECTION_NAME]");
+    eprintln!("                    Connection URL or saved connection name");
     eprintln!("                    (e.g., postgres://user:pass@host:5432/dbname)");
     eprintln!("                    (or mongodb://user:pass@host:27017/dbname)");
     eprintln!();
@@ -153,6 +154,9 @@ fn print_usage() {
     eprintln!("  -V, --version     Print version information");
     eprintln!("      --debug-keys  Print detected key/mouse events (for troubleshooting)");
     eprintln!("      --mouse       (with --debug-keys) Also print mouse events");
+    eprintln!("      --safe-mode   Skip session reconnect and startup side effects");
+    eprintln!("      --no-auto-connect");
+    eprintln!("                    Alias for --safe-mode");
     eprintln!();
     eprintln!("Environment Variables:");
     eprintln!("  DATABASE_URL      Default connection URL if not provided as argument");
@@ -173,9 +177,59 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
     eprintln!("  tsql mongodb://localhost:27017/mydb");
+    eprintln!("  tsql -- -prod");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
     eprintln!("  tsql --debug-keys");
     eprintln!("  tsql --debug-keys --mouse");
+}
+
+fn has_any_startup_option(args: &[String], options: &[&str]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| options.iter().any(|option| arg == option))
+}
+
+fn first_positional_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return iter.next().map(String::as_str);
+        }
+        if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+
+    None
+}
+
+fn config_for_startup(mut cfg: config::Config, safe_mode: bool) -> config::Config {
+    if safe_mode {
+        cfg.connection.default_url = None;
+    }
+    cfg
+}
+
+fn startup_connection_target(
+    positional_arg: Option<&str>,
+    safe_mode: bool,
+) -> (Option<String>, Option<String>) {
+    if let Some(url) = positional_arg {
+        return (Some(url.to_string()), None);
+    }
+
+    if safe_mode {
+        return (None, None);
+    }
+
+    if let Ok(url) = env::var("DATABASE_URL") {
+        return (Some(url), None);
+    }
+
+    let result = build_url_from_libpq_env();
+    (result.url, result.warning)
 }
 
 fn onepassword_cli_available() -> bool {
@@ -189,7 +243,7 @@ fn onepassword_cli_available() -> bool {
         .unwrap_or(false)
 }
 
-fn onepassword_startup_warning(onepassword_enabled: bool) -> Option<String> {
+fn onepassword_startup_warning_nonblocking(onepassword_enabled: bool) -> Option<String> {
     if !onepassword_enabled {
         return None;
     }
@@ -202,14 +256,26 @@ fn onepassword_startup_warning(onepassword_enabled: bool) -> Option<String> {
         );
     }
 
-    if !onepassword_cli_available() {
-        return Some(
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(onepassword_cli_available());
+    });
+
+    match rx.recv_timeout(Duration::from_millis(750)) {
+        Ok(true) => None,
+        Ok(false) => Some(
             "1Password support is enabled, but `op` was not found on PATH. Install/sign in via \
              1Password CLI or disable `connection.enable_onepassword`."
                 .to_string(),
-        );
+        ),
+        Err(_) => Some(
+            "1Password CLI probe timed out; use `tsql --safe-mode` to bypass startup side effects."
+                .to_string(),
+        ),
     }
-    None
 }
 
 fn main() -> Result<()> {
@@ -217,47 +283,47 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     // Check for help flag
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    if has_any_startup_option(&args, &["-h", "--help"]) {
         print_usage();
         return Ok(());
     }
 
     // Check for version flag
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if has_any_startup_option(&args, &["-V", "--version"]) {
         print_version();
         return Ok(());
     }
 
     // Key debug mode (helps identify what the terminal actually sends)
-    let debug_keys_mode = args
-        .iter()
-        .any(|a| a == "--debug-keys" || a == "--debug-keys-mouse")
+    let debug_keys_mode = has_any_startup_option(&args, &["--debug-keys", "--debug-keys-mouse"])
         || args.get(1).is_some_and(|a| a == "debug-keys");
     if debug_keys_mode {
-        let debug_mouse = args
-            .iter()
-            .any(|a| a == "--debug-keys-mouse" || a == "--mouse");
+        let debug_mouse = has_any_startup_option(&args, &["--debug-keys-mouse", "--mouse"]);
         return run_debug_keys(debug_mouse);
     }
 
+    let safe_mode = has_any_startup_option(&args, &["--safe-mode", "--no-auto-connect"]);
+    let mut startup_warnings: Vec<String> = Vec::new();
+
     if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
-        eprintln!(
-            "Warning: Failed to migrate legacy config directory to ~/.tsql: {}",
+        startup_warnings.push(format!(
+            "Failed to migrate legacy config directory to ~/.tsql: {}",
             err
-        );
+        ));
     }
 
     // Load configuration from ~/.tsql/config.toml
     let cfg = config::load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config: {}", e);
+        startup_warnings.push(format!("Failed to load config: {}", e));
         config::Config::default()
     });
+    let cfg = config_for_startup(cfg, safe_mode);
     let onepassword_enabled = cfg.connection.enable_onepassword;
 
     // Load session state if persistence is enabled
     let session = if cfg.editor.persist_session {
         load_session().unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to load session: {}", e);
+            startup_warnings.push(format!("Failed to load session: {}", e));
             Default::default()
         })
     } else {
@@ -265,17 +331,8 @@ fn main() -> Result<()> {
     };
 
     // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
-    let (conn_str, libpq_warning) = if args.len() > 1 && !args[1].starts_with('-') {
-        // First argument is the connection string
-        (Some(args[1].clone()), None)
-    } else if let Ok(url) = env::var("DATABASE_URL") {
-        // Fall back to DATABASE_URL environment variable
-        (Some(url), None)
-    } else {
-        // Then try libpq-compatible env vars (PGHOST, PGPORT, PGDATABASE, etc.)
-        let result = build_url_from_libpq_env();
-        (result.url, result.warning)
-    };
+    let positional_url = first_positional_arg(&args);
+    let (conn_str, libpq_warning) = startup_connection_target(positional_url, safe_mode);
 
     let rt = Runtime::new().context("failed to initialize tokio runtime")?;
     let (db_events_tx, db_events_rx) = mpsc::unbounded_channel();
@@ -291,54 +348,40 @@ fn main() -> Result<()> {
         conn_str.clone(),
         cfg,
     );
+    app.set_safe_mode(safe_mode);
 
     // Display startup warnings.
     if let Some(warning) = libpq_warning {
-        app.last_status = Some(warning);
+        startup_warnings.push(warning);
     }
-    if let Some(warning) = onepassword_startup_warning(onepassword_enabled) {
-        app.last_status = Some(match app.last_status.take() {
-            Some(existing) => format!("{} | {}", existing, warning),
-            None => warning,
-        });
+    if !safe_mode {
+        if let Some(warning) = onepassword_startup_warning_nonblocking(onepassword_enabled) {
+            startup_warnings.push(warning);
+        }
+    } else {
+        startup_warnings.push(
+            "Running in safe mode: session reconnect and startup update checks disabled"
+                .to_string(),
+        );
+    }
+    if !startup_warnings.is_empty() {
+        app.last_status = Some(startup_warnings.join(" | "));
     }
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
     let session_connection = app.apply_session_state(session);
 
-    // Auto-connect from session if no CLI/env connection was specified
-    let mut session_reconnected = false;
-    if conn_str.is_none() {
+    // Auto-connect from session if no CLI/env connection was specified. Queue
+    // it for after the first draw so keychain/1Password cannot black-screen
+    // the terminal before the user sees the UI.
+    if conn_str.is_none() && !safe_mode {
         if let Some(conn_name) = session_connection {
-            // Verify connection still exists
-            let connections = load_connections().unwrap_or_default();
-            if let Some(entry) = connections.find_by_name(&conn_name) {
-                // Check if password is available (not requiring prompt)
-                let timeout_ms = if onepassword_enabled && entry.password_onepassword.is_some() {
-                    5000
-                } else {
-                    500
-                };
-                match entry.get_password_with_timeout_and_options(timeout_ms, onepassword_enabled) {
-                    Ok(Some(_)) | Ok(None) => {
-                        // Password available or not needed - auto-connect
-                        app.connect_to_entry(entry.clone());
-                        session_reconnected = true;
-                    }
-                    Err(_) => {
-                        // Password retrieval failed - skip auto-connect
-                        // User can manually connect
-                    }
-                }
-            }
-            // If connection doesn't exist, silently skip auto-connect
-        }
-
-        // Only open connection picker if no connection was established
-        // (no CLI/env URL and no session reconnection)
-        if !session_reconnected {
+            app.set_pending_startup_reconnect(Some(conn_name));
+        } else {
             app.open_connection_picker();
         }
+    } else if conn_str.is_none() && safe_mode {
+        app.open_connection_picker();
     }
 
     let res = app.run(&mut terminal);
@@ -494,9 +537,14 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
     /// Helper to clear all libpq env vars before each test
     fn clear_libpq_env_vars() {
         for var in [
+            "DATABASE_URL",
             "PGHOST",
             "PGPORT",
             "PGDATABASE",
@@ -506,6 +554,65 @@ mod tests {
         ] {
             env::remove_var(var);
         }
+    }
+
+    #[test]
+    fn test_first_positional_arg_uses_value_after_double_dash() {
+        let args = args(&["tsql", "--safe-mode", "--", "-prod"]);
+        assert_eq!(first_positional_arg(&args), Some("-prod"));
+    }
+
+    #[test]
+    fn test_options_after_double_dash_are_positional() {
+        let args = args(&["tsql", "--", "--help"]);
+        assert!(!has_any_startup_option(&args, &["--help"]));
+        assert_eq!(first_positional_arg(&args), Some("--help"));
+    }
+
+    #[test]
+    fn test_safe_mode_suppresses_config_default_url() {
+        let mut cfg = config::Config::default();
+        cfg.connection.default_url = Some("postgres://localhost/prod".to_string());
+
+        let cfg = config_for_startup(cfg, true);
+
+        assert_eq!(cfg.connection.default_url, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_skips_database_url_fallback() {
+        clear_libpq_env_vars();
+        env::set_var("DATABASE_URL", "postgres://localhost/prod");
+
+        let (conn_str, warning) = startup_connection_target(None, true);
+
+        assert_eq!(conn_str, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_skips_libpq_env_fallback() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "db.example.com");
+
+        let (conn_str, warning) = startup_connection_target(None, true);
+
+        assert_eq!(conn_str, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_honors_explicit_positional_connection() {
+        clear_libpq_env_vars();
+        env::set_var("DATABASE_URL", "postgres://localhost/prod");
+
+        let (conn_str, warning) = startup_connection_target(Some("my-conn"), true);
+
+        assert_eq!(conn_str.as_deref(), Some("my-conn"));
+        assert_eq!(warning, None);
     }
 
     #[test]

@@ -217,6 +217,39 @@ pub struct ConnectionEntry {
     pub ssl_mode: Option<SslMode>,
 }
 
+fn sanitize_connection_url(raw: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(raw) {
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(None);
+            return parsed.to_string();
+        }
+        return raw.to_string();
+    }
+
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let tail = &raw[authority_start..];
+    let authority_len = tail.find(['/', '?']).unwrap_or(tail.len());
+    let authority = &tail[..authority_len];
+    let Some(at) = authority.rfind('@') else {
+        return raw.to_string();
+    };
+    let userinfo = &authority[..at];
+    let Some((username, _)) = userinfo.split_once(':') else {
+        return raw.to_string();
+    };
+
+    let mut sanitized = String::with_capacity(raw.len());
+    sanitized.push_str(&raw[..authority_start]);
+    sanitized.push_str(username);
+    sanitized.push('@');
+    sanitized.push_str(&authority[at + 1..]);
+    sanitized.push_str(&tail[authority_len..]);
+    sanitized
+}
+
 fn default_port() -> u16 {
     // Postgres default. Mongo defaults come from the parsed URI.
     5432
@@ -302,6 +335,24 @@ impl ConnectionEntry {
         }
 
         url
+    }
+
+    /// Build a display/copy-safe URL that never includes an embedded password.
+    pub fn sanitized_url(&self) -> String {
+        sanitize_connection_url(&self.to_url(None))
+    }
+
+    /// Build a shell-pasteable command for launching this connection.
+    pub fn to_cli_command(&self) -> String {
+        let separator = if self.name.starts_with('-') {
+            "-- "
+        } else {
+            ""
+        };
+        match shlex::try_quote(&self.name) {
+            Ok(quoted) => format!("tsql {}{}", separator, quoted),
+            Err(_) => format!("tsql {}{}", separator, self.name),
+        }
     }
 
     /// Parse a URL and create a ConnectionEntry.
@@ -1192,6 +1243,72 @@ mod tests {
         };
         let url = entry.to_url(Some("secret"));
         assert_eq!(url, "mongodb://admin:secret@mongo.example.com:27018/sample");
+    }
+
+    #[test]
+    fn test_sanitized_url_strips_postgres_password() {
+        let entry = ConnectionEntry {
+            name: "pg".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+
+        let runtime_url = entry.to_url(Some("secret"));
+        assert_eq!(sanitize_connection_url(&runtime_url), entry.sanitized_url());
+        assert_eq!(entry.sanitized_url(), "postgres://postgres@localhost/mydb");
+    }
+
+    #[test]
+    fn test_sanitized_url_strips_mongo_password() {
+        let entry = ConnectionEntry {
+            kind: DbKind::Mongo,
+            name: "mongo".to_string(),
+            uri: Some(
+                "mongodb://admin:secret@mongo.example.com:27018/sample?authSource=admin"
+                    .to_string(),
+            ),
+            host: "mongo.example.com".to_string(),
+            port: 27018,
+            database: "sample".to_string(),
+            user: "admin".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            entry.sanitized_url(),
+            "mongodb://admin@mongo.example.com:27018/sample?authSource=admin"
+        );
+    }
+
+    #[test]
+    fn test_cli_command_quotes_connection_name() {
+        let entry = ConnectionEntry {
+            name: "local;dev".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "my db".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(entry.to_cli_command(), "tsql 'local;dev'");
+    }
+
+    #[test]
+    fn test_cli_command_uses_double_dash_for_option_like_name() {
+        let entry = ConnectionEntry {
+            name: "-prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(entry.to_cli_command(), "tsql -- -prod");
     }
 
     #[test]

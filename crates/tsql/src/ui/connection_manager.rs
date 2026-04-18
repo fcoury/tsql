@@ -44,6 +44,21 @@ pub enum ConnectionManagerAction {
         /// The connection entry to duplicate
         entry: ConnectionEntry,
     },
+    /// Copy the selected connection URL without a password.
+    YankUrl {
+        /// URL to copy.
+        url: String,
+    },
+    /// Copy a shell-pasteable `tsql <connection-name>` command.
+    YankCli {
+        /// Command to copy.
+        command: String,
+    },
+    /// Test the selected connection in the background.
+    TestConnection {
+        /// The connection entry to test.
+        entry: ConnectionEntry,
+    },
     /// Delete the selected connection (requires confirmation).
     Delete {
         /// The connection name to delete
@@ -177,9 +192,43 @@ impl ConnectionManagerModal {
             }
 
             // Duplicate selected connection
-            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+            (KeyCode::Char('D'), KeyModifiers::NONE)
+            | (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
                 if let Some(entry) = self.selected_connection() {
                     ConnectionManagerAction::Duplicate {
+                        entry: entry.clone(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Yank sanitized URL
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::YankUrl {
+                        url: entry.sanitized_url(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Copy CLI command
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::YankCli {
+                        command: entry.to_cli_command(),
+                    }
+                } else {
+                    ConnectionManagerAction::Continue
+                }
+            }
+
+            // Test connection
+            (KeyCode::Char('t'), KeyModifiers::NONE) => {
+                if let Some(entry) = self.selected_connection() {
+                    ConnectionManagerAction::TestConnection {
                         entry: entry.clone(),
                     }
                 } else {
@@ -564,8 +613,14 @@ impl ConnectionManagerModal {
         let help_spans = vec![
             Span::styled("[a]", Style::default().fg(Color::Yellow)),
             Span::raw("dd "),
-            Span::styled("[y]", Style::default().fg(Color::Yellow)),
+            Span::styled("[D]", Style::default().fg(Color::Yellow)),
             Span::raw(" duplicate "),
+            Span::styled("[y]", Style::default().fg(Color::Yellow)),
+            Span::raw(" url "),
+            Span::styled("[c]", Style::default().fg(Color::Yellow)),
+            Span::raw(" cli "),
+            Span::styled("[t]", Style::default().fg(Color::Yellow)),
+            Span::raw(" test "),
             Span::styled("[e]", Style::default().fg(Color::Yellow)),
             Span::raw("dit "),
             Span::styled("[d]", Style::default().fg(Color::Yellow)),
@@ -779,13 +834,101 @@ mod tests {
         let file = create_test_connections();
         let mut manager = ConnectionManagerModal::new(&file, None);
 
-        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
 
         match action {
             ConnectionManagerAction::Duplicate { entry } => {
                 assert_eq!(entry.name, "local");
             }
             _ => panic!("Expected Duplicate action"),
+        }
+    }
+
+    #[test]
+    fn test_yank_url_action_uses_sanitized_url() {
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "secret".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut manager = ConnectionManagerModal::new(&file, None);
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::YankUrl { url } => {
+                assert_eq!(url, "postgres://postgres@localhost/mydb");
+                assert!(!url.contains(":secret@"));
+            }
+            _ => panic!("Expected YankUrl action"),
+        }
+    }
+
+    #[test]
+    fn test_yank_cli_action_quotes_connection_name() {
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "local;dev".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "my db".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut manager = ConnectionManagerModal::new(&file, None);
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::YankCli { command } => {
+                assert_eq!(command, "tsql 'local;dev'");
+            }
+            _ => panic!("Expected YankCli action"),
+        }
+    }
+
+    #[test]
+    fn test_yank_cli_action_uses_double_dash_for_option_like_name() {
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "-prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut manager = ConnectionManagerModal::new(&file, None);
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::YankCli { command } => {
+                assert_eq!(command, "tsql -- -prod");
+            }
+            _ => panic!("Expected YankCli action"),
+        }
+    }
+
+    #[test]
+    fn test_connection_test_action() {
+        let file = create_test_connections();
+        let mut manager = ConnectionManagerModal::new(&file, None);
+
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::TestConnection { entry } => {
+                assert_eq!(entry.name, "local");
+            }
+            _ => panic!("Expected TestConnection action"),
         }
     }
 
