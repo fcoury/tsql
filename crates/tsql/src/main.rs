@@ -212,6 +212,26 @@ fn config_for_startup(mut cfg: config::Config, safe_mode: bool) -> config::Confi
     cfg
 }
 
+fn startup_connection_target(
+    positional_arg: Option<&str>,
+    safe_mode: bool,
+) -> (Option<String>, Option<String>) {
+    if let Some(url) = positional_arg {
+        return (Some(url.to_string()), None);
+    }
+
+    if safe_mode {
+        return (None, None);
+    }
+
+    if let Ok(url) = env::var("DATABASE_URL") {
+        return (Some(url), None);
+    }
+
+    let result = build_url_from_libpq_env();
+    (result.url, result.warning)
+}
+
 fn onepassword_cli_available() -> bool {
     std::process::Command::new("op")
         .arg("--version")
@@ -312,16 +332,7 @@ fn main() -> Result<()> {
 
     // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
     let positional_url = first_positional_arg(&args);
-    let (conn_str, libpq_warning) = if let Some(url) = positional_url {
-        (Some(url.to_string()), None)
-    } else if let Ok(url) = env::var("DATABASE_URL") {
-        // Fall back to DATABASE_URL environment variable
-        (Some(url), None)
-    } else {
-        // Then try libpq-compatible env vars (PGHOST, PGPORT, PGDATABASE, etc.)
-        let result = build_url_from_libpq_env();
-        (result.url, result.warning)
-    };
+    let (conn_str, libpq_warning) = startup_connection_target(positional_url, safe_mode);
 
     let rt = Runtime::new().context("failed to initialize tokio runtime")?;
     let (db_events_tx, db_events_rx) = mpsc::unbounded_channel();
@@ -533,6 +544,7 @@ mod tests {
     /// Helper to clear all libpq env vars before each test
     fn clear_libpq_env_vars() {
         for var in [
+            "DATABASE_URL",
             "PGHOST",
             "PGPORT",
             "PGDATABASE",
@@ -565,6 +577,42 @@ mod tests {
         let cfg = config_for_startup(cfg, true);
 
         assert_eq!(cfg.connection.default_url, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_skips_database_url_fallback() {
+        clear_libpq_env_vars();
+        env::set_var("DATABASE_URL", "postgres://localhost/prod");
+
+        let (conn_str, warning) = startup_connection_target(None, true);
+
+        assert_eq!(conn_str, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_skips_libpq_env_fallback() {
+        clear_libpq_env_vars();
+        env::set_var("PGHOST", "db.example.com");
+
+        let (conn_str, warning) = startup_connection_target(None, true);
+
+        assert_eq!(conn_str, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_honors_explicit_positional_connection() {
+        clear_libpq_env_vars();
+        env::set_var("DATABASE_URL", "postgres://localhost/prod");
+
+        let (conn_str, warning) = startup_connection_target(Some("my-conn"), true);
+
+        assert_eq!(conn_str.as_deref(), Some("my-conn"));
+        assert_eq!(warning, None);
     }
 
     #[test]

@@ -2020,6 +2020,12 @@ struct PendingPasswordResolve {
     generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStartupReconnect {
+    name: String,
+    automatic: bool,
+}
+
 pub struct DbSession {
     pub status: DbStatus,
     pub kind: Option<DbKind>,
@@ -2327,8 +2333,8 @@ pub struct App {
     pub current_connection_name: Option<String>,
     /// Name of the saved connection that is actually connected.
     active_connection_name: Option<String>,
-    /// Saved connection name to reconnect after the first TUI frame.
-    pending_startup_reconnect: Option<String>,
+    /// Saved connection to connect after the first TUI frame.
+    pending_startup_reconnect: Option<PendingStartupReconnect>,
     /// Skip startup side effects that can block or touch the network.
     safe_mode: bool,
     /// Monotonic id used to ignore stale connect task completions.
@@ -2462,7 +2468,8 @@ impl App {
             History::new_empty(config.editor.max_history)
         });
 
-        // Determine connection string: CLI arg > config > env var
+        // Determine connection string: CLI arg > config.
+        let explicit_conn_str = conn_str.is_some();
         let effective_conn_str = conn_str.or_else(|| config.connection.default_url.clone());
 
         // Build keymaps from defaults + config overrides
@@ -2568,7 +2575,10 @@ impl App {
             if !url.contains("://") {
                 // Try to find a connection by name
                 if let Some(entry) = app.connections.find_by_name(&url) {
-                    app.pending_startup_reconnect = Some(entry.name.clone());
+                    app.pending_startup_reconnect = Some(PendingStartupReconnect {
+                        name: entry.name.clone(),
+                        automatic: !explicit_conn_str,
+                    });
                 } else {
                     app.last_error = Some(format!("Unknown connection: {}", url));
                     // Open connection picker so user can select (falls back to manager if empty)
@@ -4561,18 +4571,18 @@ impl App {
         }
     }
 
-    fn copy_to_clipboard(&mut self, text: &str) {
+    fn copy_to_clipboard(&mut self, text: &str) -> bool {
         if self.config.clipboard.backend == ClipboardBackend::Disabled {
             self.last_error = None;
             self.last_status = Some("Clipboard disabled".to_string());
-            return;
+            return false;
         }
 
         let choice = match crate::clipboard::choose_backend(&self.config.clipboard) {
             Ok(choice) => choice,
             Err(e) => {
                 self.last_error = Some(e.to_string());
-                return;
+                return false;
             }
         };
 
@@ -4582,18 +4592,22 @@ impl App {
             crate::clipboard::ClipboardBackendChoice::Disabled => {
                 self.last_error = None;
                 self.last_status = Some("Clipboard disabled".to_string());
+                false
             }
             crate::clipboard::ClipboardBackendChoice::Arboard => {
                 if let Err(e) = self.copy_to_clipboard_with_arboard(text) {
                     self.last_error = Some(format!("Failed to copy: {}", e));
+                    false
                 } else {
                     self.set_copied_status(text);
+                    true
                 }
             }
             crate::clipboard::ClipboardBackendChoice::WlCopy { cmd } => {
                 match crate::clipboard::copy_with_wl_copy(text, &self.config.clipboard, &cmd) {
                     Ok(()) => {
                         self.set_copied_status(text);
+                        true
                     }
                     Err(e) => {
                         if self.config.clipboard.backend == ClipboardBackend::Auto {
@@ -4603,11 +4617,14 @@ impl App {
                                     "wl-copy failed: {}; arboard failed: {}",
                                     e, arboard_err
                                 ));
+                                false
                             } else {
                                 self.set_copied_status(text);
+                                true
                             }
                         } else {
                             self.last_error = Some(format!("Failed to copy: {}", e));
+                            false
                         }
                     }
                 }
@@ -7771,7 +7788,10 @@ impl App {
 
     /// Queue a session auto-reconnect that will be dispatched after first draw.
     pub fn set_pending_startup_reconnect(&mut self, name: Option<String>) {
-        self.pending_startup_reconnect = name;
+        self.pending_startup_reconnect = name.map(|name| PendingStartupReconnect {
+            name,
+            automatic: true,
+        });
     }
 
     /// Enable safe mode: skip startup reconnects and scheduled update checks.
@@ -7785,14 +7805,13 @@ impl App {
     }
 
     fn dispatch_pending_startup_reconnect(&mut self) {
-        if self.safe_mode {
-            self.pending_startup_reconnect = None;
-            return;
-        }
-
-        let Some(name) = self.pending_startup_reconnect.take() else {
+        let Some(pending) = self.pending_startup_reconnect.take() else {
             return;
         };
+        if self.safe_mode && pending.automatic {
+            return;
+        }
+        let name = pending.name;
 
         if let Ok(connections) = load_connections() {
             self.connections = connections;
@@ -8270,12 +8289,15 @@ impl App {
                     ));
             }
             ConnectionManagerAction::YankUrl { url } => {
-                self.copy_to_clipboard(&url);
-                self.last_status = Some("Connection URL copied (password stripped)".to_string());
+                if self.copy_to_clipboard(&url) {
+                    self.last_status =
+                        Some("Connection URL copied (password stripped)".to_string());
+                }
             }
             ConnectionManagerAction::YankCli { command } => {
-                self.copy_to_clipboard(&command);
-                self.last_status = Some("tsql command copied".to_string());
+                if self.copy_to_clipboard(&command) {
+                    self.last_status = Some("tsql command copied".to_string());
+                }
             }
             ConnectionManagerAction::TestConnection { entry } => {
                 self.last_status = Some(format!("Testing connection to {}...", entry.name));
@@ -12955,6 +12977,97 @@ mod tests {
                 .map(|pending| pending.generation),
             Some(fresh_generation)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_suppresses_automatic_pending_reconnect() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+
+        app.set_pending_startup_reconnect(Some("saved".to_string()));
+        app.set_safe_mode(true);
+        app.dispatch_pending_startup_reconnect();
+
+        assert_eq!(app.db.status, DbStatus::Disconnected);
+        assert_eq!(app.current_connection_name, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_honors_explicit_saved_connection_name() {
+        let _guard = ConfigDirGuard::new();
+
+        let mut connections = ConnectionsFile::new();
+        connections
+            .add(ConnectionEntry {
+                name: "saved".to_string(),
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "testdb".to_string(),
+                user: "postgres".to_string(),
+                no_password_required: true,
+                ..Default::default()
+            })
+            .unwrap();
+        save_connections(&connections).unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            Some("saved".to_string()),
+        );
+
+        app.set_safe_mode(true);
+        app.dispatch_pending_startup_reconnect();
+
+        assert_eq!(app.db.status, DbStatus::Connecting);
+        assert_eq!(app.current_connection_name.as_deref(), Some("saved"));
+    }
+
+    #[test]
+    fn test_connection_manager_copy_status_preserves_clipboard_failure() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.clipboard.backend = ClipboardBackend::Disabled;
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+
+        app.handle_connection_manager_action(ConnectionManagerAction::YankUrl {
+            url: "postgres://postgres@localhost/testdb".to_string(),
+        });
+        assert_eq!(app.last_status.as_deref(), Some("Clipboard disabled"));
+
+        app.handle_connection_manager_action(ConnectionManagerAction::YankCli {
+            command: "tsql saved".to_string(),
+        });
+        assert_eq!(app.last_status.as_deref(), Some("Clipboard disabled"));
     }
 
     /// Test the full workflow: Esc on unmodified form closes immediately
