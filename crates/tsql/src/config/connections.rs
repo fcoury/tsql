@@ -489,17 +489,27 @@ impl ConnectionEntry {
         // If password is in URL, we have a password; if not, assume no password required
         let no_password_required = password.is_none();
 
-        let ssl_mode = if kind == DbKind::Postgres {
-            url.query_pairs().find_map(|(k, v)| {
+        let mut ssl_mode = None;
+        let mut application_name = None;
+        let mut connect_timeout_secs = None;
+        if kind == DbKind::Postgres {
+            for (k, v) in url.query_pairs() {
                 if k.eq_ignore_ascii_case("sslmode") {
-                    SslMode::parse(&v)
-                } else {
-                    None
+                    if let Some(parsed) = SslMode::parse(&v) {
+                        ssl_mode = Some(parsed);
+                    }
+                } else if k.eq_ignore_ascii_case("application_name") {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() {
+                        application_name = Some(trimmed.to_string());
+                    }
+                } else if k.eq_ignore_ascii_case("connect_timeout") {
+                    if let Some(secs) = v.parse::<u64>().ok().filter(|secs| *secs > 0) {
+                        connect_timeout_secs = Some(secs);
+                    }
                 }
-            })
-        } else {
-            None
-        };
+            }
+        }
 
         let sanitized_uri = if kind == DbKind::Mongo {
             let mut clean = url.clone();
@@ -524,6 +534,8 @@ impl ConnectionEntry {
             color: ConnectionColor::None,
             favorite: None,
             ssl_mode,
+            application_name,
+            connect_timeout_secs,
             ..Default::default()
         };
 
@@ -2124,6 +2136,22 @@ user = "me"
                 .unwrap();
 
         assert_eq!(entry.ssl_mode, Some(SslMode::Require));
+    }
+
+    #[test]
+    fn test_connection_from_url_preserves_supported_query_options() {
+        let (entry, _) = ConnectionEntry::from_url(
+            "test",
+            "postgres://user@localhost/mydb?connect_timeout=5&application_name=tsql",
+        )
+        .unwrap();
+
+        assert_eq!(entry.connect_timeout_secs, Some(5));
+        assert_eq!(entry.application_name.as_deref(), Some("tsql"));
+
+        let url = entry.to_url(None);
+        assert!(url.contains("connect_timeout=5"), "url: {url}");
+        assert!(url.contains("application_name=tsql"), "url: {url}");
     }
 
     #[test]

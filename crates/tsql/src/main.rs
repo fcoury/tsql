@@ -227,6 +227,13 @@ fn onepassword_startup_warning_nonblocking(onepassword_enabled: bool) -> Option<
     }
 }
 
+fn prepare_config_for_startup(mut cfg: config::Config, safe_mode: bool) -> config::Config {
+    if safe_mode {
+        cfg.connection.default_url = None;
+    }
+    cfg
+}
+
 fn main() -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -273,6 +280,7 @@ fn main() -> Result<()> {
         config::Config::default()
     });
     let onepassword_enabled = cfg.connection.enable_onepassword;
+    let cfg = prepare_config_for_startup(cfg, safe_mode);
 
     // Load session state if persistence is enabled
     let session = if cfg.editor.persist_session {
@@ -521,6 +529,16 @@ mod tests {
         let result = build_url_from_libpq_env();
         assert!(result.url.is_none());
         assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn test_safe_mode_removes_config_default_url_before_app_construction() {
+        let mut cfg = config::Config::default();
+        cfg.connection.default_url = Some("postgres://user@localhost/db".to_string());
+
+        let cfg = prepare_config_for_startup(cfg, true);
+
+        assert!(cfg.connection.default_url.is_none());
     }
 
     #[test]

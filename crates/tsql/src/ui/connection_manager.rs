@@ -472,6 +472,10 @@ impl ConnectionManagerModal {
             ));
             return ConnectionManagerAction::Continue;
         }
+        if !self.search.trim().is_empty() {
+            self.toast = Some("Clear the filter before reordering connections".to_string());
+            return ConnectionManagerAction::Continue;
+        }
         match self.selected_connection() {
             Some(entry) => ConnectionManagerAction::Reorder {
                 name: entry.name.clone(),
@@ -1055,6 +1059,28 @@ mod tests {
             action,
             ConnectionManagerAction::Reorder { delta: 1, .. }
         ));
+    }
+
+    #[test]
+    fn test_reorder_blocked_while_filtered() {
+        let file = create_test_connections();
+        let mut m = ConnectionManagerModal::new(&file, None);
+
+        m.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "prod".chars() {
+            m.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        m.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let action = m.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL));
+        assert_eq!(action, ConnectionManagerAction::Continue);
+        assert!(
+            m.toast
+                .as_deref()
+                .map(|t| t.contains("filter"))
+                .unwrap_or(false),
+            "manager should explain why reorder is disabled while filtered"
+        );
     }
 
     fn create_test_connections() -> ConnectionsFile {
