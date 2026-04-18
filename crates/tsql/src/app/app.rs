@@ -39,7 +39,7 @@ use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarS
 use crate::ai::{generate_query, AiProposal, AiRequestContext};
 use crate::config::{
     load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
-    ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode,
+    ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode, WriteSafetyMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -53,7 +53,7 @@ use crate::ui::{
     KeySequenceCompletion, KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt,
     PasswordPromptResult, PendingKey, PickerAction, Priority, QueryEditor, ResizeAction,
     RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
-    StatusLineBuilder, StatusSegment, TableInfo, YankFormat,
+    StatusLineBuilder, StatusSegment, TableInfo, WritePreviewAction, WritePreviewModal, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -731,6 +731,128 @@ pub struct QueryResult {
     pub primary_keys: Vec<String>,
     /// Column data types from PostgreSQL (e.g., "jsonb", "text", "int4").
     pub col_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePreviewFormat {
+    Sql,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteCapabilities {
+    preview_format: WritePreviewFormat,
+    transaction: bool,
+}
+
+impl WriteCapabilities {
+    fn for_kind(kind: Option<DbKind>) -> Option<Self> {
+        match kind {
+            Some(DbKind::Postgres) => Some(Self {
+                preview_format: WritePreviewFormat::Sql,
+                transaction: true,
+            }),
+            Some(DbKind::Mongo) => Some(Self {
+                preview_format: WritePreviewFormat::Json,
+                transaction: false,
+            }),
+            None => None,
+        }
+    }
+
+    fn supported_modes(self) -> &'static str {
+        if self.transaction {
+            "immediate, preview, transaction"
+        } else {
+            "immediate, preview"
+        }
+    }
+
+    fn supports(self, mode: WriteSafetyMode) -> bool {
+        match mode {
+            WriteSafetyMode::Immediate | WriteSafetyMode::Preview => true,
+            WriteSafetyMode::Transaction => self.transaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WriteOperation {
+    PostgresSql(String),
+    MongoUpdate {
+        collection: String,
+        filter: Document,
+        update: Document,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WritePlan {
+    kind: DbKind,
+    target: String,
+    field: String,
+    old_value: Option<String>,
+    new_value: Option<String>,
+    row: usize,
+    col: usize,
+    operation: WriteOperation,
+}
+
+impl WritePlan {
+    fn preview_body(&self) -> String {
+        match &self.operation {
+            WriteOperation::PostgresSql(sql) => sql.clone(),
+            WriteOperation::MongoUpdate {
+                collection,
+                filter,
+                update,
+            } => {
+                let payload = serde_json::json!({
+                    "op": "updateOne",
+                    "collection": collection,
+                    "filter": bson_document_to_json(filter),
+                    "update": bson_document_to_json(update),
+                });
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+            }
+        }
+    }
+
+    fn body_label(&self) -> &'static str {
+        match self.operation {
+            WriteOperation::PostgresSql(_) => "SQL",
+            WriteOperation::MongoUpdate { .. } => "JSON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedWriteChange {
+    row: usize,
+    col: usize,
+    old_value: String,
+    new_value: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OwnedWriteTransaction {
+    active: bool,
+    changes: Vec<AppliedWriteChange>,
+    needs_rollback: bool,
+}
+
+impl OwnedWriteTransaction {
+    fn clear(&mut self) {
+        self.active = false;
+        self.changes.clear();
+        self.needs_rollback = false;
+    }
+}
+
+fn bson_document_to_json(doc: &Document) -> serde_json::Value {
+    bson::from_bson::<serde_json::Value>(Bson::Document(doc.clone()))
+        .unwrap_or_else(|_| serde_json::Value::String(format!("{doc:?}")))
 }
 
 /// State for a paged/streaming query using server-side cursors.
@@ -2136,6 +2258,8 @@ pub enum DbEvent {
         col: usize,
         value: String,
     },
+    WriteTransactionCommitted,
+    WriteTransactionRolledBack,
     /// Result of a connection test (from connection form).
     TestConnectionResult {
         success: bool,
@@ -2463,6 +2587,16 @@ pub struct App {
 
     /// JSON editor modal for multiline JSON editing.
     pub json_editor: Option<JsonEditorModal<'static>>,
+    /// Review modal for generated write operations.
+    write_preview: Option<WritePreviewModal>,
+    /// Write awaiting preview confirmation.
+    pending_write_plan: Option<WritePlan>,
+    /// Write currently being executed asynchronously.
+    executing_write_plan: Option<WritePlan>,
+    /// Current safety mode for generated writes.
+    write_safety_mode: WriteSafetyMode,
+    /// Owned Postgres transaction state for generated writes.
+    owned_write_txn: OwnedWriteTransaction,
 
     /// Last known grid viewport dimensions for scroll calculations.
     /// (viewport_rows, viewport_width)
@@ -2653,6 +2787,7 @@ impl App {
         let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
         let connection_form_keymap = Self::build_connection_form_keymap(&config);
         let key_sequence_timeout_ms = config.keymap.key_sequence_timeout_ms;
+        let write_safety_mode = config.writes.safety_mode;
 
         let mut app = Self {
             focus: Focus::Query,
@@ -2688,6 +2823,11 @@ impl App {
 
             cell_editor: CellEditor::new(),
             json_editor: None,
+            write_preview: None,
+            pending_write_plan: None,
+            executing_write_plan: None,
+            write_safety_mode,
+            owned_write_txn: OwnedWriteTransaction::default(),
 
             last_grid_viewport: None,
             last_grid_click: None,
@@ -3554,6 +3694,11 @@ impl App {
                     modal.render(frame, size);
                 }
 
+                // Render generated write preview modal.
+                if let Some(ref mut modal) = self.write_preview {
+                    modal.render(frame, size);
+                }
+
                 // Error popup (modal).
                 if let Some(ref err) = self.last_error {
                     let has_other_modal = self.help_popup.is_some()
@@ -3568,7 +3713,8 @@ impl App {
                         || self.row_detail.is_some()
                         || self.connection_manager.is_some()
                         || self.connection_form.is_some()
-                        || self.confirm_prompt.is_some();
+                        || self.confirm_prompt.is_some()
+                        || self.write_preview.is_some();
 
                     if !has_other_modal && size.width >= 20 && size.height >= 5 {
                         let popup_width = (size.width.saturating_mul(70) / 100)
@@ -3681,6 +3827,10 @@ impl App {
                     return false;
                 }
             }
+        }
+
+        if self.write_preview.is_some() {
+            return self.handle_write_preview_key(key);
         }
 
         // Handle AI modal when active - it captures all input.
@@ -3988,6 +4138,13 @@ impl App {
                     return false;
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                    if self.owned_write_txn.active {
+                        self.last_error = Some(
+                            "Commit or rollback the active generated transaction before quitting"
+                                .to_string(),
+                        );
+                        return false;
+                    }
                     // Always show confirmation prompt, with different message based on unsaved changes
                     if self.editor.is_modified() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
@@ -5043,6 +5200,118 @@ impl App {
         }
     }
 
+    fn write_capabilities(&self) -> Option<WriteCapabilities> {
+        WriteCapabilities::for_kind(self.db.kind)
+    }
+
+    fn validate_write_mode(&mut self, mode: WriteSafetyMode) -> Option<WriteCapabilities> {
+        let Some(capabilities) = self.write_capabilities() else {
+            self.last_error = Some("Not connected".to_string());
+            return None;
+        };
+
+        if !capabilities.supports(mode) {
+            let db = match self.db.kind {
+                Some(DbKind::Mongo) => "Mongo",
+                Some(DbKind::Postgres) => "Postgres",
+                None => "This database",
+            };
+            self.last_error = Some(format!(
+                "{db} does not support {} write mode. Supported modes: {}",
+                mode.as_str(),
+                capabilities.supported_modes()
+            ));
+            return None;
+        }
+
+        Some(capabilities)
+    }
+
+    fn dispatch_write_plan(&mut self, plan: WritePlan) {
+        if self.owned_write_txn.needs_rollback {
+            self.last_error =
+                Some("Transaction needs rollback before another generated write".to_string());
+            return;
+        }
+
+        let Some(capabilities) = self.validate_write_mode(self.write_safety_mode) else {
+            return;
+        };
+
+        match self.write_safety_mode {
+            WriteSafetyMode::Immediate => self.execute_write_plan(plan),
+            WriteSafetyMode::Preview | WriteSafetyMode::Transaction => {
+                let expected_format = match plan.kind {
+                    DbKind::Postgres => WritePreviewFormat::Sql,
+                    DbKind::Mongo => WritePreviewFormat::Json,
+                };
+                debug_assert_eq!(capabilities.preview_format, expected_format);
+                let modal = WritePreviewModal::review(
+                    plan.target.clone(),
+                    plan.field.clone(),
+                    plan.old_value.clone(),
+                    plan.new_value.clone(),
+                    plan.body_label(),
+                    plan.preview_body(),
+                );
+                self.pending_write_plan = Some(plan);
+                self.write_preview = Some(modal);
+            }
+        }
+    }
+
+    fn handle_write_preview_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut modal) = self.write_preview.take() else {
+            return false;
+        };
+
+        match modal.handle_key(key) {
+            WritePreviewAction::Continue => {
+                self.write_preview = Some(modal);
+            }
+            WritePreviewAction::Apply => {
+                if let Some(plan) = self.pending_write_plan.take() {
+                    self.execute_write_plan(plan);
+                }
+            }
+            WritePreviewAction::EditInQuery => {
+                if let Some(plan) = self.pending_write_plan.take() {
+                    self.editor.set_text(plan.preview_body());
+                    self.editor.mark_saved();
+                    self.focus = Focus::Query;
+                    self.mode = Mode::Insert;
+                    self.last_status = Some("Write copied to query editor".to_string());
+                }
+            }
+            WritePreviewAction::Copy => {
+                let body = modal.body().to_string();
+                self.copy_to_clipboard(&body);
+                self.write_preview = Some(modal);
+            }
+            WritePreviewAction::Cancel => {
+                self.pending_write_plan = None;
+                self.last_status = Some("Write cancelled".to_string());
+            }
+        }
+
+        false
+    }
+
+    fn execute_write_plan(&mut self, plan: WritePlan) {
+        match plan.operation.clone() {
+            WriteOperation::PostgresSql(sql) => {
+                self.execute_postgres_write_plan(plan, sql);
+            }
+            WriteOperation::MongoUpdate {
+                collection,
+                filter,
+                update,
+            } => {
+                self.execute_mongo_write_plan(plan, collection, filter, update);
+            }
+        }
+    }
+
     fn handle_cell_edit_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             // Enter: confirm edit
@@ -5189,15 +5458,23 @@ impl App {
             }
         };
 
-        let update_sql = format!(
-            "UPDATE {} SET {} = {} WHERE {}",
-            quote_identifier(&table),
-            quote_identifier(&column_name),
-            escape_sql_value(&new_value),
-            where_clause
-        );
-
-        self.execute_cell_update(update_sql, row, col, new_value);
+        let plan = WritePlan {
+            kind: DbKind::Postgres,
+            target: table.clone(),
+            field: column_name.clone(),
+            old_value: self.grid.rows.get(row).and_then(|r| r.get(col)).cloned(),
+            new_value: Some(new_value.clone()),
+            row,
+            col,
+            operation: WriteOperation::PostgresSql(format!(
+                "UPDATE {} SET {} = {} WHERE {}",
+                quote_identifier(&table),
+                quote_identifier(&column_name),
+                escape_sql_value(&new_value),
+                where_clause
+            )),
+        };
+        self.dispatch_write_plan(plan);
     }
 
     fn commit_cell_edit(&mut self) {
@@ -5256,9 +5533,20 @@ impl App {
             where_clause
         );
 
-        // Close editor and execute update
+        let plan = WritePlan {
+            kind: DbKind::Postgres,
+            target: table,
+            field: column_name,
+            old_value: Some(original_value),
+            new_value: Some(new_value),
+            row,
+            col,
+            operation: WriteOperation::PostgresSql(update_sql),
+        };
+
+        // Close editor and dispatch write
         self.cell_editor.close();
-        self.execute_cell_update(update_sql, row, col, new_value);
+        self.dispatch_write_plan(plan);
     }
 
     fn commit_mongo_edit(
@@ -5297,13 +5585,27 @@ impl App {
             .get(col)
             .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
         set_doc.insert(
-            field_name,
+            field_name.clone(),
             parse_grid_cell_to_bson(&new_value, field_type_hint, true),
         );
         let mut update = Document::new();
         update.insert("$set", Bson::Document(set_doc));
 
-        self.execute_mongo_cell_update(collection, filter, update, row, col, new_value);
+        let plan = WritePlan {
+            kind: DbKind::Mongo,
+            target: collection.clone(),
+            field: field_name,
+            old_value: self.grid.rows.get(row).and_then(|r| r.get(col)).cloned(),
+            new_value: Some(new_value),
+            row,
+            col,
+            operation: WriteOperation::MongoUpdate {
+                collection,
+                filter,
+                update,
+            },
+        };
+        self.dispatch_write_plan(plan);
     }
 
     fn build_mongo_update_filter(
@@ -5353,14 +5655,12 @@ impl App {
         Ok(filter)
     }
 
-    fn execute_mongo_cell_update(
+    fn execute_mongo_write_plan(
         &mut self,
+        plan: WritePlan,
         collection: String,
         filter: Document,
         update: Document,
-        row: usize,
-        col: usize,
-        new_value: String,
     ) {
         let Some(client) = self.db.mongo_client.clone() else {
             self.last_error = Some("Not connected".to_string());
@@ -5379,6 +5679,7 @@ impl App {
         self.db.running = true;
         self.last_status = Some("Updating...".to_string());
         self.query_ui.start();
+        self.executing_write_plan = Some(plan.clone());
 
         let tx = self.db_events_tx.clone();
         self.rt.spawn(async move {
@@ -5388,9 +5689,9 @@ impl App {
                 Ok(res) => {
                     if res.matched_count == 1 {
                         let _ = tx.send(DbEvent::CellUpdated {
-                            row,
-                            col,
-                            value: new_value,
+                            row: plan.row,
+                            col: plan.col,
+                            value: plan.new_value.unwrap_or_default(),
                         });
                     } else if res.matched_count == 0 {
                         let _ = tx.send(DbEvent::QueryError {
@@ -5415,7 +5716,7 @@ impl App {
         });
     }
 
-    fn execute_cell_update(&mut self, sql: String, row: usize, col: usize, new_value: String) {
+    fn execute_postgres_write_plan(&mut self, plan: WritePlan, sql: String) {
         let Some(client) = self.db.client.clone() else {
             self.last_error = Some("Not connected".to_string());
             return;
@@ -5429,16 +5730,22 @@ impl App {
         self.db.running = true;
         self.last_status = Some("Updating...".to_string());
         self.query_ui.start();
+        self.executing_write_plan = Some(plan.clone());
 
         let tx = self.db_events_tx.clone();
-
-        // Store row/col/value for updating grid on success
-        let update_row = row;
-        let update_col = col;
-        let update_value = new_value;
+        let use_transaction = self.write_safety_mode == WriteSafetyMode::Transaction;
+        let begin_transaction = use_transaction && !self.owned_write_txn.active;
 
         self.rt.spawn(async move {
             let guard = client.lock().await;
+            if begin_transaction {
+                if let Err(e) = guard.simple_query("BEGIN").await {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Failed to begin transaction: {}", format_pg_error(&e)),
+                    });
+                    return;
+                }
+            }
             match guard.simple_query(&sql).await {
                 Ok(messages) => {
                     drop(guard);
@@ -5453,9 +5760,9 @@ impl App {
                     if affected == 1 {
                         // Send a custom event to update the cell
                         let _ = tx.send(DbEvent::CellUpdated {
-                            row: update_row,
-                            col: update_col,
-                            value: update_value,
+                            row: plan.row,
+                            col: plan.col,
+                            value: plan.new_value.unwrap_or_default(),
                         });
                     } else if affected == 0 {
                         let _ = tx.send(DbEvent::QueryError {
@@ -5654,7 +5961,26 @@ impl App {
 
         match command {
             "q" | "quit" | "exit" => {
+                if self.owned_write_txn.active {
+                    self.last_error = Some(
+                        "Commit or rollback the active generated transaction before quitting"
+                            .to_string(),
+                    );
+                    return false;
+                }
                 return true;
+            }
+            "write-mode" | "writemode" => {
+                self.handle_write_mode_command(args);
+            }
+            "commit" => {
+                self.commit_owned_write_transaction();
+            }
+            "rollback" => {
+                self.rollback_owned_write_transaction();
+            }
+            "changes" => {
+                self.show_owned_write_changes();
             }
             "connect" | "c" => {
                 if args.is_empty() {
@@ -5667,6 +5993,13 @@ impl App {
                 }
             }
             "disconnect" | "dc" => {
+                if self.owned_write_txn.active {
+                    self.last_error = Some(
+                        "Commit or rollback the active generated transaction before disconnecting"
+                            .to_string(),
+                    );
+                    return false;
+                }
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
@@ -5842,6 +6175,144 @@ impl App {
 
     fn query_editor_has_content(&self) -> bool {
         !self.editor.text().trim().is_empty()
+    }
+
+    fn handle_write_mode_command(&mut self, args: &str) {
+        if args.is_empty() {
+            let supported = self
+                .write_capabilities()
+                .map(|c| c.supported_modes())
+                .unwrap_or("none");
+            self.last_status = Some(format!(
+                "Write mode: {} (supported: {supported})",
+                self.write_safety_mode.as_str()
+            ));
+            return;
+        }
+
+        if self.owned_write_txn.active {
+            self.last_error = Some(
+                "Cannot change write mode while a generated transaction is active".to_string(),
+            );
+            return;
+        }
+
+        let mode = match args {
+            "immediate" => WriteSafetyMode::Immediate,
+            "preview" => WriteSafetyMode::Preview,
+            "transaction" | "txn" => WriteSafetyMode::Transaction,
+            _ => {
+                self.last_status =
+                    Some("Usage: :write-mode immediate|preview|transaction".to_string());
+                return;
+            }
+        };
+
+        if self.write_capabilities().is_some() && self.validate_write_mode(mode).is_none() {
+            return;
+        }
+        self.write_safety_mode = mode;
+        self.last_status = Some(format!("Write mode set to {}", mode.as_str()));
+    }
+
+    fn commit_owned_write_transaction(&mut self) {
+        let Some(client) = self.db.client.clone() else {
+            self.last_error = Some("Not connected".to_string());
+            return;
+        };
+        if !self.owned_write_txn.active {
+            self.last_status = Some("No generated transaction to commit".to_string());
+            return;
+        }
+        if self.owned_write_txn.needs_rollback {
+            self.last_error =
+                Some("Transaction has a failed write and must be rolled back".to_string());
+            return;
+        }
+        if self.db.running {
+            self.last_error = Some("Another query is running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.query_ui.start();
+        self.last_status = Some("Committing...".to_string());
+        let tx = self.db_events_tx.clone();
+        self.rt.spawn(async move {
+            let guard = client.lock().await;
+            match guard.simple_query("COMMIT").await {
+                Ok(_) => {
+                    let _ = tx.send(DbEvent::WriteTransactionCommitted);
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Commit failed: {}", format_pg_error(&e)),
+                    });
+                }
+            }
+        });
+    }
+
+    fn rollback_owned_write_transaction(&mut self) {
+        let Some(client) = self.db.client.clone() else {
+            self.last_error = Some("Not connected".to_string());
+            return;
+        };
+        if !self.owned_write_txn.active {
+            self.last_status = Some("No generated transaction to roll back".to_string());
+            return;
+        }
+        if self.db.running {
+            self.last_error = Some("Another query is running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.query_ui.start();
+        self.last_status = Some("Rolling back...".to_string());
+        let tx = self.db_events_tx.clone();
+        self.rt.spawn(async move {
+            let guard = client.lock().await;
+            match guard.simple_query("ROLLBACK").await {
+                Ok(_) => {
+                    let _ = tx.send(DbEvent::WriteTransactionRolledBack);
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Rollback failed: {}", format_pg_error(&e)),
+                    });
+                }
+            }
+        });
+    }
+
+    fn show_owned_write_changes(&mut self) {
+        if self.owned_write_txn.changes.is_empty() {
+            self.last_status = Some("No generated transaction changes".to_string());
+            return;
+        }
+
+        let body = self
+            .owned_write_txn
+            .changes
+            .iter()
+            .enumerate()
+            .map(|(idx, change)| {
+                format!(
+                    "-- Change {}\n-- row {}, col {}\n{}\n",
+                    idx + 1,
+                    change.row + 1,
+                    change.col + 1,
+                    change.body
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.write_preview = Some(WritePreviewModal::read_only(
+            " Transaction Changes ",
+            "Pending Writes",
+            body,
+        ));
     }
 
     fn handle_export_connections_command(&mut self, args: &str) {
@@ -7818,6 +8289,13 @@ impl App {
     }
 
     pub fn start_connect(&mut self, conn_str: String) {
+        if self.owned_write_txn.active {
+            self.last_error = Some(
+                "Commit or rollback the active generated transaction before switching connections"
+                    .to_string(),
+            );
+            return;
+        }
         self.invalidate_password_resolves();
         self.db.status = DbStatus::Connecting;
         self.db.kind = None;
@@ -8039,6 +8517,13 @@ impl App {
 
     /// Connect to a saved connection entry.
     pub fn connect_to_entry(&mut self, entry: ConnectionEntry) {
+        if self.owned_write_txn.active {
+            self.last_error = Some(
+                "Commit or rollback the active generated transaction before switching connections"
+                    .to_string(),
+            );
+            return;
+        }
         self.invalidate_password_resolves();
 
         if entry.no_password_required {
@@ -9312,7 +9797,7 @@ impl App {
         let page_size = DEFAULT_PAGE_SIZE;
 
         // Use cursor-based paging for simple SELECT queries
-        if is_pageable_query(&query) {
+        if is_pageable_query(&query) && !self.db.in_transaction {
             // Create channel for fetch-more requests
             let (fetch_more_tx, fetch_more_rx) = mpsc::unbounded_channel();
 
@@ -10279,6 +10764,7 @@ impl App {
                             || tag_upper.starts_with("END")
                         {
                             self.db.in_transaction = false;
+                            self.owned_write_txn.clear();
                         }
                     }
                 }
@@ -10323,6 +10809,16 @@ impl App {
                 self.db.running = false;
                 self.query_ui.clear();
                 self.paged_query = None; // Clear paged query state on error
+                if self
+                    .executing_write_plan
+                    .take()
+                    .is_some_and(|plan| plan.kind == DbKind::Postgres)
+                    && self.write_safety_mode == WriteSafetyMode::Transaction
+                {
+                    self.owned_write_txn.active = true;
+                    self.owned_write_txn.needs_rollback = true;
+                    self.db.in_transaction = true;
+                }
                 self.last_status = Some("Query error (see above)".to_string());
                 self.last_error = Some(error);
             }
@@ -10353,13 +10849,68 @@ impl App {
             DbEvent::CellUpdated { row, col, value } => {
                 self.db.running = false;
                 self.query_ui.clear();
+                let executed_plan = self.executing_write_plan.take();
+                if self.write_safety_mode == WriteSafetyMode::Transaction
+                    && executed_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.kind == DbKind::Postgres)
+                {
+                    self.owned_write_txn.active = true;
+                    self.db.in_transaction = true;
+                }
                 // Update the grid cell
                 if let Some(grid_row) = self.grid.rows.get_mut(row) {
                     if let Some(cell) = grid_row.get_mut(col) {
                         *cell = value;
                     }
                 }
-                self.last_status = Some("Cell updated successfully".to_string());
+                if let Some(plan) = executed_plan {
+                    if self.owned_write_txn.active && plan.kind == DbKind::Postgres {
+                        let body = plan.preview_body();
+                        self.owned_write_txn.changes.push(AppliedWriteChange {
+                            row,
+                            col,
+                            old_value: plan.old_value.unwrap_or_default(),
+                            new_value: plan.new_value.unwrap_or_default(),
+                            body,
+                        });
+                        self.last_status = Some(format!(
+                            "Cell updated in transaction ({} changes)",
+                            self.owned_write_txn.changes.len()
+                        ));
+                    } else {
+                        self.last_status = Some("Cell updated successfully".to_string());
+                    }
+                } else {
+                    self.last_status = Some("Cell updated successfully".to_string());
+                }
+            }
+            DbEvent::WriteTransactionCommitted => {
+                self.db.running = false;
+                self.query_ui.clear();
+                let count = self.owned_write_txn.changes.len();
+                self.owned_write_txn.clear();
+                self.db.in_transaction = false;
+                self.last_error = None;
+                self.last_status = Some(format!("Committed {count} changes"));
+            }
+            DbEvent::WriteTransactionRolledBack => {
+                self.db.running = false;
+                self.query_ui.clear();
+                let count = self.owned_write_txn.changes.len();
+                for change in self.owned_write_txn.changes.iter().rev() {
+                    if let Some(row) = self.grid.rows.get_mut(change.row) {
+                        if let Some(cell) = row.get_mut(change.col) {
+                            if *cell == change.new_value {
+                                *cell = change.old_value.clone();
+                            }
+                        }
+                    }
+                }
+                self.owned_write_txn.clear();
+                self.db.in_transaction = false;
+                self.last_error = None;
+                self.last_status = Some(format!("Rolled back {count} changes"));
             }
             DbEvent::TestConnectionResult { success, message } => {
                 if success {
@@ -10611,6 +11162,22 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
+        let write_mode_segment = match self.write_safety_mode {
+            WriteSafetyMode::Immediate => None,
+            WriteSafetyMode::Preview => Some("WRITE preview".to_string()),
+            WriteSafetyMode::Transaction => Some("WRITE txn".to_string()),
+        };
+        let transaction_segment = if self.owned_write_txn.active {
+            Some(format!(
+                "TXN {} changes",
+                self.owned_write_txn.changes.len()
+            ))
+        } else if self.db.in_transaction {
+            Some("TXN".to_string())
+        } else {
+            None
+        };
+
         // Build status line with priority-based segments
         let line = StatusLineBuilder::new()
             // Critical: Mode (always shown)
@@ -10633,9 +11200,14 @@ impl App {
             )
             // High: Transaction indicator (if in transaction)
             .segment_if(
-                self.db.in_transaction,
-                StatusSegment::new("TXN", Priority::High)
+                transaction_segment.is_some(),
+                StatusSegment::new(transaction_segment.unwrap_or_default(), Priority::High)
                     .style(Style::default().fg(Color::Magenta)),
+            )
+            .segment_if(
+                write_mode_segment.is_some(),
+                StatusSegment::new(write_mode_segment.unwrap_or_default(), Priority::High)
+                    .style(Style::default().fg(Color::Yellow)),
             )
             // Medium: Row info
             .segment(StatusSegment::new(row_info, Priority::Medium).min_width(50))
@@ -11608,6 +12180,127 @@ mod tests {
             where_clause.contains("b IS NOT DISTINCT FROM NULL"),
             "Should use IS NOT DISTINCT FROM and preserve NULLs"
         );
+    }
+
+    #[test]
+    fn test_mongo_transaction_write_mode_is_blocked() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.db.kind = Some(DbKind::Mongo);
+
+        app.handle_write_mode_command("transaction");
+
+        assert_eq!(app.write_safety_mode, WriteSafetyMode::Immediate);
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("Mongo does not support transaction")));
+    }
+
+    #[test]
+    fn test_write_mode_can_be_set_before_connecting() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+
+        app.handle_write_mode_command("preview");
+
+        assert_eq!(app.write_safety_mode, WriteSafetyMode::Preview);
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Write mode set to preview")
+        );
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn test_postgres_preview_mode_opens_write_preview_for_cell_edit() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut grid = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+        )
+        .with_source_table(Some("users".to_string()))
+        .with_primary_keys(vec!["id".to_string()]);
+        grid.col_types = vec!["int4".to_string(), "text".to_string()];
+
+        let mut app = App::new(grid, rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.db.kind = Some(DbKind::Postgres);
+        app.write_safety_mode = WriteSafetyMode::Preview;
+        app.cell_editor.open(0, 1, "Alice".to_string());
+        app.cell_editor.value = "Alicia".to_string();
+
+        app.commit_cell_edit();
+
+        assert!(app.write_preview.is_some());
+        assert!(app.pending_write_plan.is_some());
+        assert!(!app.db.running);
+    }
+
+    #[test]
+    fn test_write_preview_edit_in_query_inserts_operation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+        let plan = WritePlan {
+            kind: DbKind::Postgres,
+            target: "users".to_string(),
+            field: "name".to_string(),
+            old_value: Some("Alice".to_string()),
+            new_value: Some("Alicia".to_string()),
+            row: 0,
+            col: 1,
+            operation: WriteOperation::PostgresSql(
+                "UPDATE users SET name = 'Alicia' WHERE id = 1".to_string(),
+            ),
+        };
+        app.pending_write_plan = Some(plan.clone());
+        let body_label = plan.body_label();
+        let body = plan.preview_body();
+        app.write_preview = Some(WritePreviewModal::review(
+            plan.target.clone(),
+            plan.field.clone(),
+            plan.old_value.clone(),
+            plan.new_value.clone(),
+            body_label,
+            body,
+        ));
+
+        app.handle_write_preview_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.editor.text(),
+            "UPDATE users SET name = 'Alicia' WHERE id = 1"
+        );
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(app.write_preview.is_none());
     }
 
     #[test]

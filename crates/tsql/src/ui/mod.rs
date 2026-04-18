@@ -18,6 +18,7 @@ mod row_detail;
 pub mod sidebar;
 mod status_line;
 mod style;
+mod write_preview;
 
 pub use ai_query_modal::{AiQueryModal, AiQueryModalAction};
 pub use completion::{
@@ -45,3 +46,4 @@ pub use password_prompt::{PasswordPrompt, PasswordPromptResult};
 pub use row_detail::{RowDetailAction, RowDetailModal, YankFormat};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};
+pub use write_preview::{WritePreviewAction, WritePreviewModal};

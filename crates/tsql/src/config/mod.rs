@@ -19,7 +19,7 @@ pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{
     AiConfig, AiProvider, ClipboardBackend, ClipboardConfig, Config, ConnectionConfig,
     CustomKeyBinding, DisplayConfig, EditorConfig, IdentifierStyle, KeymapConfig, SqlConfig,
-    UpdateChannel, UpdateMode, UpdatesConfig,
+    UpdateChannel, UpdateMode, UpdatesConfig, WriteSafetyMode, WritesConfig,
 };
 
 use anyhow::{Context, Result};

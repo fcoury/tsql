@@ -15,6 +15,8 @@ pub struct Config {
     pub connection: ConnectionConfig,
     /// SQL generation / templating settings
     pub sql: SqlConfig,
+    /// Generated write safety settings
+    pub writes: WritesConfig,
     /// Clipboard settings
     pub clipboard: ClipboardConfig,
     /// Keymap customizations
@@ -363,6 +365,44 @@ impl Default for SqlConfig {
     }
 }
 
+/// Generated write safety settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WritesConfig {
+    /// Default safety mode for generated grid writes.
+    pub safety_mode: WriteSafetyMode,
+}
+
+impl Default for WritesConfig {
+    fn default() -> Self {
+        Self {
+            safety_mode: WriteSafetyMode::Immediate,
+        }
+    }
+}
+
+/// Safety mode used when tsql generates a write operation from the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteSafetyMode {
+    /// Execute generated writes immediately.
+    Immediate,
+    /// Preview generated writes before execution.
+    Preview,
+    /// Execute approved writes inside an explicit transaction.
+    Transaction,
+}
+
+impl WriteSafetyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Preview => "preview",
+            Self::Transaction => "transaction",
+        }
+    }
+}
+
 /// Identifier formatting style used for generated SQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -406,6 +446,9 @@ max_history = 500
 default_url = "postgres://localhost/mydb"
 connect_timeout_secs = 5
 max_rows = 10000
+
+[writes]
+safety_mode = "preview"
 
 [clipboard]
 backend = "wl-copy"
@@ -471,6 +514,9 @@ description = "Export results as CSV"
         assert_eq!(config.connection.connect_timeout_secs, 5);
         assert_eq!(config.connection.max_rows, 10000);
 
+        // Writes
+        assert_eq!(config.writes.safety_mode, WriteSafetyMode::Preview);
+
         // Clipboard
         assert_eq!(config.clipboard.backend, ClipboardBackend::WlCopy);
         assert!(config.clipboard.wl_copy_primary);
@@ -526,6 +572,7 @@ description = "Export results as CSV"
         assert!(toml_str.contains("[display]"));
         assert!(toml_str.contains("[editor]"));
         assert!(toml_str.contains("[connection]"));
+        assert!(toml_str.contains("[writes]"));
         assert!(toml_str.contains("[updates]"));
         assert!(toml_str.contains("[ai]"));
     }
