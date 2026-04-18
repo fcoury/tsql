@@ -2339,6 +2339,8 @@ pub struct App {
     safe_mode: bool,
     /// Monotonic id used to ignore stale connect task completions.
     connect_generation: u64,
+    /// Saved connection name associated with the current connect generation.
+    connect_generation_name: Option<String>,
     /// Monotonic id used to ignore stale saved-connection password resolves.
     password_resolve_generation: u64,
     /// Saved connection password resolves currently running off the UI thread.
@@ -2538,6 +2540,7 @@ impl App {
             pending_startup_reconnect: None,
             safe_mode: false,
             connect_generation: 0,
+            connect_generation_name: None,
             password_resolve_generation: 0,
             password_resolve_in_flight: HashMap::new(),
             connection_picker: None,
@@ -5496,6 +5499,7 @@ impl App {
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
+                self.connect_generation_name = None;
                 self.last_status = Some("Disconnected".to_string());
             }
             "help" | "h" => {
@@ -7556,6 +7560,7 @@ impl App {
         self.last_status = Some("Connecting...".to_string());
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let connect_generation = self.connect_generation;
+        self.connect_generation_name = self.current_connection_name.clone();
 
         let tx = self.db_events_tx.clone();
         let rt = self.rt.clone();
@@ -7887,12 +7892,8 @@ impl App {
         });
     }
 
-    fn record_successful_connect(&mut self) {
-        if let Some(name) = self.current_connection_name.clone() {
-            self.active_connection_name = Some(name);
-        } else {
-            self.active_connection_name = None;
-        }
+    fn record_successful_connect(&mut self, connection_name: Option<String>) {
+        self.active_connection_name = connection_name;
     }
 
     /// Connect to an entry with the provided password (called after password prompt).
@@ -9835,7 +9836,7 @@ impl App {
                 self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
-                self.record_successful_connect();
+                self.record_successful_connect(self.connect_generation_name.clone());
                 // Load schema for completion
                 self.load_schema();
             }
@@ -9860,7 +9861,7 @@ impl App {
                 self.last_status = Some(format!(
                     "Connected to Mongo ({database}), loading schema..."
                 ));
-                self.record_successful_connect();
+                self.record_successful_connect(self.connect_generation_name.clone());
                 self.load_schema();
             }
             DbEvent::ConnectError {
@@ -9879,6 +9880,7 @@ impl App {
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
+                self.connect_generation_name = None;
                 self.last_status = Some("Connect failed (see error)".to_string());
                 self.last_error = Some(format!("Connection error: {}", error));
             }
@@ -9898,6 +9900,7 @@ impl App {
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
+                self.connect_generation_name = None;
                 self.last_status = Some("Connection lost (see error)".to_string());
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
@@ -13042,6 +13045,24 @@ mod tests {
             .conn_str
             .as_deref()
             .is_some_and(|url| url.contains("postgres:secret@localhost")));
+    }
+
+    #[test]
+    fn test_successful_connect_records_attempt_connection_name() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.current_connection_name = Some("attempt-a".to_string());
+        app.start_connect("postgres://postgres@localhost/db".to_string());
+
+        app.current_connection_name = Some("pending-b".to_string());
+        app.record_successful_connect(app.connect_generation_name.clone());
+
+        assert_eq!(app.active_connection_name.as_deref(), Some("attempt-a"));
     }
 
     #[test]
