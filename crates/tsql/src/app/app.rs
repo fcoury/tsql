@@ -7825,7 +7825,12 @@ impl App {
                 if entry.no_password_required {
                     self.start_connect(entry.to_url(None));
                 } else {
-                    self.begin_password_resolve(entry, PasswordResolveReason::Startup);
+                    let reason = if pending.automatic {
+                        PasswordResolveReason::Startup
+                    } else {
+                        PasswordResolveReason::UserPicked
+                    };
+                    self.begin_password_resolve(entry, reason);
                 }
             }
             None => {
@@ -13037,6 +13042,62 @@ mod tests {
 
         assert_eq!(app.db.status, DbStatus::Connecting);
         assert_eq!(app.current_connection_name.as_deref(), Some("saved"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_explicit_saved_connection_name_prompts_when_password_unavailable() {
+        let _guard = ConfigDirGuard::new();
+
+        let mut connections = ConnectionsFile::new();
+        connections
+            .add(ConnectionEntry {
+                name: "saved".to_string(),
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "testdb".to_string(),
+                user: "postgres".to_string(),
+                password_in_keychain: true,
+                ..Default::default()
+            })
+            .unwrap();
+        save_connections(&connections).unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            Some("saved".to_string()),
+        );
+
+        app.set_safe_mode(true);
+        app.dispatch_pending_startup_reconnect();
+
+        let generation = app
+            .password_resolve_in_flight
+            .get("saved")
+            .map(|pending| {
+                assert_eq!(pending.reason, PasswordResolveReason::UserPicked);
+                pending.generation
+            })
+            .expect("expected pending password resolve");
+        let entry = app.connections.find_by_name("saved").cloned().unwrap();
+
+        app.apply_db_event(DbEvent::PasswordResolved {
+            entry: Box::new(entry),
+            result: Ok(None),
+            password_resolve_generation: generation,
+        });
+
+        assert!(app.password_prompt.is_some());
+        assert!(app.connection_picker.is_none());
     }
 
     #[test]
