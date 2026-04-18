@@ -141,10 +141,11 @@ fn build_url_from_libpq_env() -> LibpqEnvResult {
 fn print_usage() {
     eprintln!("tsql - A modern SQL and MongoDB CLI");
     eprintln!();
-    eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL]");
+    eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL|CONNECTION_NAME]");
     eprintln!();
     eprintln!("Arguments:");
-    eprintln!("  [CONNECTION_URL]  Connection URL");
+    eprintln!("  [CONNECTION_URL|CONNECTION_NAME]");
+    eprintln!("                    Connection URL or saved connection name");
     eprintln!("                    (e.g., postgres://user:pass@host:5432/dbname)");
     eprintln!("                    (or mongodb://user:pass@host:27017/dbname)");
     eprintln!();
@@ -176,9 +177,39 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
     eprintln!("  tsql mongodb://localhost:27017/mydb");
+    eprintln!("  tsql -- -prod");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
     eprintln!("  tsql --debug-keys");
     eprintln!("  tsql --debug-keys --mouse");
+}
+
+fn has_any_startup_option(args: &[String], options: &[&str]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| options.iter().any(|option| arg == option))
+}
+
+fn first_positional_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return iter.next().map(String::as_str);
+        }
+        if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+
+    None
+}
+
+fn config_for_startup(mut cfg: config::Config, safe_mode: bool) -> config::Config {
+    if safe_mode {
+        cfg.connection.default_url = None;
+    }
+    cfg
 }
 
 fn onepassword_cli_available() -> bool {
@@ -232,32 +263,26 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     // Check for help flag
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    if has_any_startup_option(&args, &["-h", "--help"]) {
         print_usage();
         return Ok(());
     }
 
     // Check for version flag
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if has_any_startup_option(&args, &["-V", "--version"]) {
         print_version();
         return Ok(());
     }
 
     // Key debug mode (helps identify what the terminal actually sends)
-    let debug_keys_mode = args
-        .iter()
-        .any(|a| a == "--debug-keys" || a == "--debug-keys-mouse")
+    let debug_keys_mode = has_any_startup_option(&args, &["--debug-keys", "--debug-keys-mouse"])
         || args.get(1).is_some_and(|a| a == "debug-keys");
     if debug_keys_mode {
-        let debug_mouse = args
-            .iter()
-            .any(|a| a == "--debug-keys-mouse" || a == "--mouse");
+        let debug_mouse = has_any_startup_option(&args, &["--debug-keys-mouse", "--mouse"]);
         return run_debug_keys(debug_mouse);
     }
 
-    let safe_mode = args
-        .iter()
-        .any(|a| a == "--safe-mode" || a == "--no-auto-connect");
+    let safe_mode = has_any_startup_option(&args, &["--safe-mode", "--no-auto-connect"]);
     let mut startup_warnings: Vec<String> = Vec::new();
 
     if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
@@ -272,6 +297,7 @@ fn main() -> Result<()> {
         startup_warnings.push(format!("Failed to load config: {}", e));
         config::Config::default()
     });
+    let cfg = config_for_startup(cfg, safe_mode);
     let onepassword_enabled = cfg.connection.enable_onepassword;
 
     // Load session state if persistence is enabled
@@ -285,9 +311,9 @@ fn main() -> Result<()> {
     };
 
     // Connection string priority: CLI arg > DATABASE_URL env var > libpq env vars > config file
-    let positional_url = args.iter().skip(1).find(|a| !a.starts_with('-'));
+    let positional_url = first_positional_arg(&args);
     let (conn_str, libpq_warning) = if let Some(url) = positional_url {
-        (Some(url.clone()), None)
+        (Some(url.to_string()), None)
     } else if let Ok(url) = env::var("DATABASE_URL") {
         // Fall back to DATABASE_URL environment variable
         (Some(url), None)
@@ -500,6 +526,10 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
     /// Helper to clear all libpq env vars before each test
     fn clear_libpq_env_vars() {
         for var in [
@@ -512,6 +542,29 @@ mod tests {
         ] {
             env::remove_var(var);
         }
+    }
+
+    #[test]
+    fn test_first_positional_arg_uses_value_after_double_dash() {
+        let args = args(&["tsql", "--safe-mode", "--", "-prod"]);
+        assert_eq!(first_positional_arg(&args), Some("-prod"));
+    }
+
+    #[test]
+    fn test_options_after_double_dash_are_positional() {
+        let args = args(&["tsql", "--", "--help"]);
+        assert!(!has_any_startup_option(&args, &["--help"]));
+        assert_eq!(first_positional_arg(&args), Some("--help"));
+    }
+
+    #[test]
+    fn test_safe_mode_suppresses_config_default_url() {
+        let mut cfg = config::Config::default();
+        cfg.connection.default_url = Some("postgres://localhost/prod".to_string());
+
+        let cfg = config_for_startup(cfg, true);
+
+        assert_eq!(cfg.connection.default_url, None);
     }
 
     #[test]

@@ -894,6 +894,30 @@ mod tests {
     }
 
     #[test]
+    fn test_yank_cli_action_uses_double_dash_for_option_like_name() {
+        let mut file = ConnectionsFile::new();
+        file.add(ConnectionEntry {
+            name: "-prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut manager = ConnectionManagerModal::new(&file, None);
+        let action = manager.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        match action {
+            ConnectionManagerAction::YankCli { command } => {
+                assert_eq!(command, "tsql -- -prod");
+            }
+            _ => panic!("Expected YankCli action"),
+        }
+    }
+
+    #[test]
     fn test_connection_test_action() {
         let file = create_test_connections();
         let mut manager = ConnectionManagerModal::new(&file, None);

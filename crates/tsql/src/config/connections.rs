@@ -344,9 +344,14 @@ impl ConnectionEntry {
 
     /// Build a shell-pasteable command for launching this connection.
     pub fn to_cli_command(&self) -> String {
+        let separator = if self.name.starts_with('-') {
+            "-- "
+        } else {
+            ""
+        };
         match shlex::try_quote(&self.name) {
-            Ok(quoted) => format!("tsql {}", quoted),
-            Err(_) => format!("tsql {}", self.name),
+            Ok(quoted) => format!("tsql {}{}", separator, quoted),
+            Err(_) => format!("tsql {}{}", separator, self.name),
         }
     }
 
@@ -1290,6 +1295,20 @@ mod tests {
         };
 
         assert_eq!(entry.to_cli_command(), "tsql 'local;dev'");
+    }
+
+    #[test]
+    fn test_cli_command_uses_double_dash_for_option_like_name() {
+        let entry = ConnectionEntry {
+            name: "-prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            user: "postgres".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(entry.to_cli_command(), "tsql -- -prod");
     }
 
     #[test]
