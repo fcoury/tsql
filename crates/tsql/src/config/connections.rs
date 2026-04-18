@@ -420,19 +420,10 @@ impl ConnectionEntry {
                 query.push(("application_name", trimmed.to_string()));
             }
         }
-        // SSL cert paths: libpq-compatible `sslrootcert` / `sslcert` /
-        // `sslkey`. Without these, saved TLS-configured entries would
-        // connect anyway but without the user's CA / client cert,
-        // silently failing handshakes or skipping verification.
-        if let Some(p) = self.ssl_root_cert.as_ref() {
-            query.push(("sslrootcert", p.to_string_lossy().into_owned()));
-        }
-        if let Some(p) = self.ssl_client_cert.as_ref() {
-            query.push(("sslcert", p.to_string_lossy().into_owned()));
-        }
-        if let Some(p) = self.ssl_client_key.as_ref() {
-            query.push(("sslkey", p.to_string_lossy().into_owned()));
-        }
+        // SSL certificate file paths are persisted on the entry, but
+        // tokio-postgres does not accept libpq's sslrootcert / sslcert /
+        // sslkey URL parameters. Keep them out of the URL until the
+        // rustls connector is wired to consume them directly.
         if !query.is_empty() {
             url.push('?');
             for (i, (k, v)) in query.iter().enumerate() {
@@ -2010,10 +2001,11 @@ user = "me"
     }
 
     #[test]
-    fn test_connection_to_url_threads_ssl_cert_paths() {
-        // Regression: saved per-entry SSL cert paths were inert at
-        // connect / test time because `to_url` never emitted them
-        // as `sslrootcert` / `sslcert` / `sslkey` query params.
+    fn test_connection_to_url_omits_unsupported_ssl_cert_paths() {
+        // tokio-postgres rejects unknown URL parameters. Until cert
+        // paths are wired into the rustls connector directly, `to_url`
+        // must not emit libpq-only sslrootcert / sslcert / sslkey
+        // params that make the connection fail before it starts.
         use std::path::PathBuf;
         let entry = ConnectionEntry {
             name: "test".to_string(),
@@ -2029,12 +2021,9 @@ user = "me"
         };
         let url = entry.to_url(None);
         assert!(url.contains("sslmode=verify-full"), "url: {url}");
-        assert!(
-            url.contains("sslrootcert=") && (url.contains("ca.pem") || url.contains("ca%2Epem")),
-            "url: {url}"
-        );
-        assert!(url.contains("sslcert="), "url: {url}");
-        assert!(url.contains("sslkey="), "url: {url}");
+        assert!(!url.contains("sslrootcert="), "url: {url}");
+        assert!(!url.contains("sslcert="), "url: {url}");
+        assert!(!url.contains("sslkey="), "url: {url}");
     }
 
     #[test]

@@ -2492,6 +2492,9 @@ pub struct App {
     active_connection_name: Option<String>,
     /// Saved connection name to reconnect after the first TUI frame.
     pending_startup_reconnect: Option<String>,
+    /// True when the pending reconnect came from an explicit CLI saved-name
+    /// argument rather than persisted session state.
+    pending_startup_reconnect_explicit: bool,
     /// Skip startup side effects that can block or touch the network.
     safe_mode: bool,
     /// Monotonic id used to ignore stale connect task completions.
@@ -2694,6 +2697,7 @@ impl App {
             current_connection_name: None,
             active_connection_name: None,
             pending_startup_reconnect: None,
+            pending_startup_reconnect_explicit: false,
             safe_mode: false,
             connect_generation: 0,
             pending_duplicate_donor: None,
@@ -2735,6 +2739,7 @@ impl App {
                 // Try to find a connection by name
                 if let Some(entry) = app.connections.find_by_name(&url) {
                     app.pending_startup_reconnect = Some(entry.name.clone());
+                    app.pending_startup_reconnect_explicit = true;
                 } else {
                     app.last_error = Some(format!("Unknown connection: {}", url));
                     // Open connection picker so user can select (falls back to manager if empty)
@@ -8033,6 +8038,7 @@ impl App {
     /// Queue a session auto-reconnect that will be dispatched after first draw.
     pub fn set_pending_startup_reconnect(&mut self, name: Option<String>) {
         self.pending_startup_reconnect = name;
+        self.pending_startup_reconnect_explicit = false;
     }
 
     /// Enable safe mode: skip startup reconnects and scheduled update checks.
@@ -8041,14 +8047,16 @@ impl App {
     }
 
     fn dispatch_pending_startup_reconnect(&mut self) {
-        if self.safe_mode {
+        if self.safe_mode && !self.pending_startup_reconnect_explicit {
             self.pending_startup_reconnect = None;
             return;
         }
 
         let Some(name) = self.pending_startup_reconnect.take() else {
+            self.pending_startup_reconnect_explicit = false;
             return;
         };
+        self.pending_startup_reconnect_explicit = false;
 
         if let Ok(connections) = load_connections() {
             self.connections = connections;
@@ -8773,6 +8781,7 @@ impl App {
                 } else {
                     if let Some(donor) = self.pending_duplicate_donor.as_deref() {
                         merge_edit_preserving_non_form_fields(&mut entry_to_store, donor);
+                        entry_to_store.no_password_required = donor.no_password_required;
                         entry_to_store.favorite = None;
                         entry_to_store.last_used_at = None;
                         entry_to_store.use_count = 0;
@@ -12964,6 +12973,93 @@ mod tests {
         let duplicate = app.connections.find_by_name("editme-copy").unwrap();
         assert_eq!(duplicate.host, "localhost");
         assert_eq!(duplicate.database, "testdb");
+    }
+
+    #[test]
+    #[serial]
+    fn test_duplicate_passworded_connection_prompts_for_password() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        let entry = ConnectionEntry {
+            name: "prod".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "testdb".to_string(),
+            user: "postgres".to_string(),
+            password_in_keychain: true,
+            no_password_required: false,
+            ..Default::default()
+        };
+        app.connections = ConnectionsFile::new();
+        app.connections.add(entry).unwrap();
+        app.connection_manager = Some(ConnectionManagerModal::new(
+            &app.connections,
+            app.current_connection_name.clone(),
+        ));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let duplicate = app.connections.find_by_name("prod-copy").unwrap();
+        assert!(
+            !duplicate.no_password_required,
+            "duplicate should prompt for a password instead of connecting without credentials"
+        );
+        assert!(
+            !duplicate.password_in_keychain,
+            "duplicate should not point at the source connection's keychain entry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_safe_mode_keeps_explicit_saved_connection_name() {
+        let _guard = ConfigDirGuard::new();
+        let mut connections = ConnectionsFile::new();
+        connections
+            .add(ConnectionEntry {
+                name: "prod".to_string(),
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "testdb".to_string(),
+                user: "postgres".to_string(),
+                no_password_required: true,
+                ..Default::default()
+            })
+            .unwrap();
+        save_connections(&connections).unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            Some("prod".to_string()),
+        );
+        app.set_safe_mode(true);
+        app.dispatch_pending_startup_reconnect();
+
+        assert_eq!(
+            app.db.status,
+            DbStatus::Connecting,
+            "safe mode should skip session reconnects, not explicit saved-name CLI targets"
+        );
+        assert_eq!(app.current_connection_name.as_deref(), Some("prod"));
     }
 
     /// Issue 3: Esc in connection manager should close it in one press
