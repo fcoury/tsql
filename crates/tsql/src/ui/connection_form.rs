@@ -15,7 +15,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use url::Url;
 
-use crate::config::{Action, ConnectionColor, ConnectionEntry, DbKind, Keymap, SslMode};
+use crate::config::{
+    parse_sqlite_url, Action, ConnectionColor, ConnectionEntry, DbKind, Keymap, SqliteOpenMode,
+    SslMode,
+};
 
 /// Which field is currently focused in the form
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,6 +93,13 @@ impl FormField {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormRow {
+    Field(FormField),
+    Separator,
+    Help,
+}
+
 /// Result of handling a key event in the connection form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionFormAction {
@@ -135,6 +145,7 @@ pub struct ConnectionFormModal {
     op_ref: String,
     save_password: bool,
     ssl_mode: SslMode,
+    sqlite_mode: SqliteOpenMode,
     color: ConnectionColor,
     url_paste: String,
 
@@ -172,6 +183,8 @@ pub struct ConnectionFormModal {
     color_index: usize,
     /// SSL mode selection index (for cycling through modes)
     ssl_mode_index: usize,
+    /// SQLite open mode selection index (for cycling through modes)
+    sqlite_mode_index: usize,
 
     /// Original name when editing (for rename detection)
     original_name: Option<String>,
@@ -208,6 +221,7 @@ struct OriginalFormValues {
     op_ref: String,
     save_password: bool,
     ssl_mode: SslMode,
+    sqlite_mode: SqliteOpenMode,
     color: ConnectionColor,
     // v2 metadata fields — must be in the snapshot too or editing them
     // alone and pressing Esc would skip the unsaved-changes prompt.
@@ -243,6 +257,7 @@ impl ConnectionFormModal {
             op_ref: String::new(),
             save_password: false,
             ssl_mode: SslMode::Disable,
+            sqlite_mode: SqliteOpenMode::ReadWrite,
             color: ConnectionColor::None,
             url_paste: String::new(),
 
@@ -269,6 +284,7 @@ impl ConnectionFormModal {
             focused: FormField::Name,
             color_index: 0,
             ssl_mode_index: 0,
+            sqlite_mode_index: 0,
             original_name: None,
             title: "New Connection".to_string(),
             modified: false,
@@ -319,19 +335,51 @@ impl ConnectionFormModal {
             .connect_timeout_secs
             .map(|v| v.to_string())
             .unwrap_or_default();
+        let sqlite_mode = entry
+            .uri
+            .as_deref()
+            .and_then(|uri| parse_sqlite_url(uri).ok())
+            .map(|parts| parts.mode)
+            .unwrap_or(SqliteOpenMode::ReadWrite);
+        let form_host = if entry.kind == DbKind::Sqlite {
+            entry
+                .uri
+                .as_deref()
+                .and_then(|uri| parse_sqlite_url(uri).ok())
+                .map(|parts| parts.path)
+                .unwrap_or_else(|| entry.host.clone())
+        } else {
+            entry.host.clone()
+        };
+        let form_port = if entry.kind == DbKind::Sqlite {
+            String::new()
+        } else {
+            entry.port.to_string()
+        };
+        let form_database = if entry.kind == DbKind::Sqlite {
+            String::new()
+        } else {
+            entry.database.clone()
+        };
+        let form_user = if entry.kind == DbKind::Sqlite {
+            String::new()
+        } else {
+            entry.user.clone()
+        };
 
         let original_values = OriginalFormValues {
             name: entry.name.clone(),
             kind: entry.kind,
             mongo_uri: entry.uri.clone(),
-            host: entry.host.clone(),
-            port: entry.port.to_string(),
-            database: entry.database.clone(),
-            user: entry.user.clone(),
+            host: form_host.clone(),
+            port: form_port.clone(),
+            database: form_database.clone(),
+            user: form_user.clone(),
             password: password.clone(),
             op_ref: op_ref.clone(),
             save_password: entry.password_in_keychain,
             ssl_mode: entry.ssl_mode.unwrap_or(SslMode::Disable),
+            sqlite_mode,
             color: entry.color,
             description: description.clone(),
             tags_input: tags_input.clone(),
@@ -342,6 +390,7 @@ impl ConnectionFormModal {
 
         let ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
         let ssl_mode_index = ssl_mode.to_index();
+        let sqlite_mode_index = sqlite_mode.to_index();
         let description_cursor = description.chars().count();
         let tags_input_cursor = tags_input.chars().count();
         let folder_cursor = folder.chars().count();
@@ -352,14 +401,15 @@ impl ConnectionFormModal {
             name: entry.name.clone(),
             kind: entry.kind,
             mongo_uri: entry.uri.clone(),
-            host: entry.host.clone(),
-            port: entry.port.to_string(),
-            database: entry.database.clone(),
-            user: entry.user.clone(),
+            host: form_host.clone(),
+            port: form_port.clone(),
+            database: form_database.clone(),
+            user: form_user.clone(),
             password: password.clone(),
             op_ref: op_ref.clone(),
             save_password: entry.password_in_keychain,
             ssl_mode,
+            sqlite_mode,
             color: entry.color,
             url_paste: String::new(),
 
@@ -370,10 +420,10 @@ impl ConnectionFormModal {
             connect_timeout_secs,
 
             name_cursor: entry.name.chars().count(),
-            host_cursor: entry.host.chars().count(),
-            port_cursor: entry.port.to_string().chars().count(),
-            database_cursor: entry.database.chars().count(),
-            user_cursor: entry.user.chars().count(),
+            host_cursor: form_host.chars().count(),
+            port_cursor: form_port.chars().count(),
+            database_cursor: form_database.chars().count(),
+            user_cursor: form_user.chars().count(),
             password_cursor: password.chars().count(),
             op_ref_cursor: op_ref.chars().count(),
             url_paste_cursor: 0,
@@ -386,6 +436,7 @@ impl ConnectionFormModal {
             focused: FormField::Name,
             color_index,
             ssl_mode_index,
+            sqlite_mode_index,
             original_name: Some(entry.name.clone()),
             title: format!("Edit: {}", entry.name),
             modified: false,
@@ -432,6 +483,7 @@ impl ConnectionFormModal {
                 || self.host != "localhost"
                 || self.port != "5432"
                 || self.ssl_mode != SslMode::Disable
+                || self.sqlite_mode != SqliteOpenMode::ReadWrite
                 || !self.description.is_empty()
                 || !self.tags_input.is_empty()
                 || !self.folder.is_empty()
@@ -452,6 +504,7 @@ impl ConnectionFormModal {
                 || self.op_ref != orig.op_ref
                 || self.save_password != orig.save_password
                 || self.ssl_mode != orig.ssl_mode
+                || self.sqlite_mode != orig.sqlite_mode
                 || self.color != orig.color
                 || self.description != orig.description
                 || self.tags_input != orig.tags_input
@@ -663,22 +716,116 @@ impl ConnectionFormModal {
     }
 
     fn next_focus(&self, current: FormField) -> FormField {
-        let mut next = current.next();
-        if !self.onepassword_enabled && next == FormField::OnePasswordRef {
-            next = next.next();
+        let order = self.focus_order();
+        if order.is_empty() {
+            return current;
         }
-        next
+        let current_idx = order.iter().position(|field| *field == current);
+        order[current_idx.map_or(0, |idx| (idx + 1) % order.len())]
     }
 
     fn prev_focus(&self, current: FormField) -> FormField {
-        let mut prev = current.prev();
-        if !self.onepassword_enabled && prev == FormField::OnePasswordRef {
-            prev = prev.prev();
+        let order = self.focus_order();
+        if order.is_empty() {
+            return current;
         }
-        prev
+        let current_idx = order.iter().position(|field| *field == current);
+        order[current_idx.map_or(order.len() - 1, |idx| (idx + order.len() - 1) % order.len())]
+    }
+
+    fn focus_order(&self) -> Vec<FormField> {
+        self.form_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                FormRow::Field(field) => Some(field),
+                FormRow::Separator | FormRow::Help => None,
+            })
+            .collect()
+    }
+
+    fn is_field_visible(&self, field: FormField) -> bool {
+        self.focus_order().contains(&field)
+    }
+
+    fn form_rows(&self) -> Vec<FormRow> {
+        let mut rows = vec![
+            FormRow::Field(FormField::Name),
+            FormRow::Field(FormField::Kind),
+            FormRow::Separator,
+        ];
+
+        match self.kind {
+            DbKind::Postgres => {
+                rows.extend([
+                    FormRow::Field(FormField::User),
+                    FormRow::Field(FormField::Password),
+                ]);
+                if self.onepassword_enabled {
+                    rows.push(FormRow::Field(FormField::OnePasswordRef));
+                }
+                rows.extend([
+                    FormRow::Field(FormField::SavePassword),
+                    FormRow::Field(FormField::SslMode),
+                    FormRow::Separator,
+                    FormRow::Field(FormField::Host),
+                    FormRow::Field(FormField::Port),
+                    FormRow::Field(FormField::Database),
+                ]);
+            }
+            DbKind::Mongo => {
+                rows.extend([
+                    FormRow::Field(FormField::User),
+                    FormRow::Field(FormField::Password),
+                ]);
+                if self.onepassword_enabled {
+                    rows.push(FormRow::Field(FormField::OnePasswordRef));
+                }
+                rows.extend([
+                    FormRow::Field(FormField::SavePassword),
+                    FormRow::Separator,
+                    FormRow::Field(FormField::Host),
+                ]);
+                if self.mongo_scheme() != "mongodb+srv" {
+                    rows.push(FormRow::Field(FormField::Port));
+                }
+                rows.push(FormRow::Field(FormField::Database));
+            }
+            DbKind::Sqlite => {
+                rows.extend([
+                    FormRow::Field(FormField::Host),
+                    FormRow::Field(FormField::SslMode),
+                ]);
+            }
+        }
+
+        rows.extend([
+            FormRow::Separator,
+            FormRow::Field(FormField::Color),
+            FormRow::Field(FormField::Folder),
+            FormRow::Field(FormField::Tags),
+            FormRow::Field(FormField::Description),
+        ]);
+
+        if self.kind == DbKind::Postgres {
+            rows.extend([
+                FormRow::Field(FormField::AppName),
+                FormRow::Field(FormField::ConnectTimeout),
+            ]);
+        }
+
+        rows.extend([
+            FormRow::Field(FormField::UrlPaste),
+            FormRow::Separator,
+            FormRow::Help,
+        ]);
+
+        rows
     }
 
     fn get_current_field_and_cursor(&mut self) -> Option<(&mut String, &mut usize)> {
+        if !self.is_field_visible(self.focused) {
+            return None;
+        }
         match self.focused {
             FormField::Name => Some((&mut self.name, &mut self.name_cursor)),
             FormField::Host => Some((&mut self.host, &mut self.host_cursor)),
@@ -822,7 +969,7 @@ impl ConnectionFormModal {
     }
 
     fn cycle_kind(&mut self, direction: i32) {
-        const ORDER: [DbKind; 2] = [DbKind::Postgres, DbKind::Mongo];
+        const ORDER: [DbKind; 3] = [DbKind::Postgres, DbKind::Mongo, DbKind::Sqlite];
         let current_idx = ORDER.iter().position(|k| *k == self.kind).unwrap_or(0) as i32;
         let next_idx = ((current_idx + direction).rem_euclid(ORDER.len() as i32)) as usize;
         self.kind = ORDER[next_idx];
@@ -841,16 +988,37 @@ impl ConnectionFormModal {
                 }
                 self.mongo_uri = Some(self.build_mongo_uri(None));
             }
+            DbKind::Sqlite => {
+                self.mongo_uri = Some("sqlite://app.db".to_string());
+                self.host = "app.db".to_string();
+                self.host_cursor = Self::char_count(&self.host);
+                self.sqlite_mode = SqliteOpenMode::ReadWrite;
+                self.sqlite_mode_index = self.sqlite_mode.to_index();
+                self.port.clear();
+                self.port_cursor = 0;
+                self.user.clear();
+                self.user_cursor = 0;
+                self.password.clear();
+                self.password_cursor = 0;
+                self.save_password = false;
+                self.database.clear();
+                self.database_cursor = 0;
+            }
         }
     }
 
     fn cycle_ssl_mode(&mut self, direction: i32) {
-        if self.kind == DbKind::Mongo {
-            return;
+        if self.kind == DbKind::Sqlite {
+            let len = 3i32;
+            self.sqlite_mode_index =
+                ((self.sqlite_mode_index as i32 + direction).rem_euclid(len)) as usize;
+            self.sqlite_mode = SqliteOpenMode::from_index(self.sqlite_mode_index);
+        } else if self.kind == DbKind::Postgres {
+            let len = SslMode::COUNT as i32;
+            self.ssl_mode_index =
+                ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
+            self.ssl_mode = SslMode::from_index(self.ssl_mode_index);
         }
-        let len = SslMode::COUNT as i32;
-        self.ssl_mode_index = ((self.ssl_mode_index as i32 + direction).rem_euclid(len)) as usize;
-        self.ssl_mode = SslMode::from_index(self.ssl_mode_index);
     }
 
     fn mongo_scheme(&self) -> &'static str {
@@ -908,6 +1076,30 @@ impl ConnectionFormModal {
             built = built.replacen("mongodb://", "mongodb+srv://", 1);
         }
         built
+    }
+
+    fn build_sqlite_uri(&self) -> String {
+        let raw = self.host.trim();
+        if raw == ":memory:" || raw == "sqlite::memory:" {
+            return "sqlite::memory:".to_string();
+        }
+        let candidate = if raw.starts_with("sqlite://") {
+            raw.to_string()
+        } else {
+            format!("sqlite://{raw}")
+        };
+        let Ok(parts) = parse_sqlite_url(&candidate) else {
+            return candidate;
+        };
+        if raw.contains("mode=") {
+            return parts.uri;
+        }
+        let uri_path = format!("sqlite://{}", parts.path);
+        if self.sqlite_mode == SqliteOpenMode::ReadWrite {
+            uri_path
+        } else {
+            format!("{uri_path}?mode={}", self.sqlite_mode.as_str())
+        }
     }
 
     fn build_entry(&self, name: String, password_for_uri: Option<&str>) -> ConnectionEntry {
@@ -1003,6 +1195,44 @@ impl ConnectionFormModal {
                 connect_timeout_secs: None,
                 ..Default::default()
             },
+            DbKind::Sqlite => {
+                let uri = self.build_sqlite_uri();
+                let parts = parse_sqlite_url(&uri).ok();
+                let path = parts
+                    .as_ref()
+                    .map(|parts| parts.path.clone())
+                    .unwrap_or_else(|| self.host.trim().to_string());
+                ConnectionEntry {
+                    kind: DbKind::Sqlite,
+                    name,
+                    uri: Some(uri),
+                    host: path.clone(),
+                    port: 0,
+                    database: path,
+                    user: String::new(),
+                    password_in_keychain: false,
+                    password_env: None,
+                    password_onepassword: None,
+                    no_password_required: true,
+                    color: self.color,
+                    favorite: None,
+                    ssl_mode: None,
+                    description: if self.description.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.description.trim().to_string())
+                    },
+                    tags: ConnectionEntry::parse_tags(&self.tags_input),
+                    folder: if self.folder.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.folder.trim().to_string())
+                    },
+                    application_name: None,
+                    connect_timeout_secs: None,
+                    ..Default::default()
+                }
+            }
         }
     }
 
@@ -1017,12 +1247,36 @@ impl ConnectionFormModal {
                 // Populate fields from parsed URL
                 self.kind = entry.kind;
                 self.mongo_uri = entry.uri.clone();
-                self.host = entry.host;
-                self.port = entry.port.to_string();
-                self.database = entry.database;
-                self.user = entry.user;
+                if entry.kind == DbKind::Sqlite {
+                    self.host = entry
+                        .uri
+                        .as_deref()
+                        .and_then(|uri| parse_sqlite_url(uri).ok())
+                        .map(|parts| parts.path)
+                        .unwrap_or(entry.host);
+                    self.port.clear();
+                    self.database.clear();
+                    self.user.clear();
+                    self.password.clear();
+                    self.op_ref.clear();
+                    self.save_password = false;
+                } else {
+                    self.host = entry.host;
+                    self.port = entry.port.to_string();
+                    self.database = entry.database;
+                    self.user = entry.user;
+                }
                 self.ssl_mode = entry.ssl_mode.unwrap_or(SslMode::Disable);
                 self.ssl_mode_index = self.ssl_mode.to_index();
+                if entry.kind == DbKind::Sqlite {
+                    self.sqlite_mode = entry
+                        .uri
+                        .as_deref()
+                        .and_then(|uri| parse_sqlite_url(uri).ok())
+                        .map(|parts| parts.mode)
+                        .unwrap_or(SqliteOpenMode::ReadWrite);
+                    self.sqlite_mode_index = self.sqlite_mode.to_index();
+                }
                 self.application_name = entry.application_name.unwrap_or_default();
                 self.connect_timeout_secs = entry
                     .connect_timeout_secs
@@ -1039,6 +1293,8 @@ impl ConnectionFormModal {
                 self.port_cursor = Self::char_count(&self.port);
                 self.database_cursor = Self::char_count(&self.database);
                 self.user_cursor = Self::char_count(&self.user);
+                self.password_cursor = Self::char_count(&self.password);
+                self.op_ref_cursor = Self::char_count(&self.op_ref);
                 self.application_name_cursor = Self::char_count(&self.application_name);
                 self.connect_timeout_cursor = Self::char_count(&self.connect_timeout_secs);
 
@@ -1073,7 +1329,11 @@ impl ConnectionFormModal {
         }
         if self.host.is_empty() {
             self.focused = FormField::Host;
-            return ConnectionFormAction::StatusMessage("Host is required".to_string());
+            return ConnectionFormAction::StatusMessage(if self.kind == DbKind::Sqlite {
+                "SQLite path is required".to_string()
+            } else {
+                "Host is required".to_string()
+            });
         }
         if self.kind == DbKind::Postgres {
             if self.database.is_empty() {
@@ -1086,7 +1346,8 @@ impl ConnectionFormModal {
             }
         }
 
-        let needs_port = self.kind == DbKind::Postgres || self.mongo_scheme() != "mongodb+srv";
+        let needs_port = self.kind == DbKind::Postgres
+            || (self.kind == DbKind::Mongo && self.mongo_scheme() != "mongodb+srv");
         if needs_port {
             match self.port.parse::<u16>() {
                 Ok(p) if p > 0 => p,
@@ -1105,7 +1366,11 @@ impl ConnectionFormModal {
         // attempt proceeds regardless (respecting whatever the user does
         // after seeing the warning).
         let has_persistence = self.save_password || !self.op_ref.trim().is_empty();
-        if !self.password.is_empty() && !has_persistence && !self.password_persist_acknowledged {
+        if self.kind != DbKind::Sqlite
+            && !self.password.is_empty()
+            && !has_persistence
+            && !self.password_persist_acknowledged
+        {
             self.save_password = true;
             self.password_persist_acknowledged = true;
             self.focused = FormField::SavePassword;
@@ -1117,7 +1382,7 @@ impl ConnectionFormModal {
 
         let entry = self.build_entry(self.name.clone(), None);
 
-        let password = if self.password.is_empty() {
+        let password = if self.kind == DbKind::Sqlite || self.password.is_empty() {
             None
         } else {
             Some(self.password.clone())
@@ -1126,7 +1391,7 @@ impl ConnectionFormModal {
         ConnectionFormAction::Save {
             entry,
             password,
-            save_password: self.save_password,
+            save_password: self.kind != DbKind::Sqlite && self.save_password,
             original_name: self.original_name.clone(),
         }
     }
@@ -1134,7 +1399,11 @@ impl ConnectionFormModal {
     fn try_test(&mut self) -> ConnectionFormAction {
         // Basic validation for testing
         if self.host.is_empty() {
-            return ConnectionFormAction::StatusMessage("Host is required for test".to_string());
+            return ConnectionFormAction::StatusMessage(if self.kind == DbKind::Sqlite {
+                "SQLite path is required for test".to_string()
+            } else {
+                "Host is required for test".to_string()
+            });
         }
         if self.kind == DbKind::Postgres {
             if self.database.is_empty() {
@@ -1149,7 +1418,8 @@ impl ConnectionFormModal {
             }
         }
 
-        let needs_port = self.kind == DbKind::Postgres || self.mongo_scheme() != "mongodb+srv";
+        let needs_port = self.kind == DbKind::Postgres
+            || (self.kind == DbKind::Mongo && self.mongo_scheme() != "mongodb+srv");
         if needs_port {
             match self.port.parse::<u16>() {
                 Ok(p) if p > 0 => p,
@@ -1159,7 +1429,7 @@ impl ConnectionFormModal {
             };
         }
 
-        let test_password = if self.password.is_empty() {
+        let test_password = if self.kind == DbKind::Sqlite || self.password.is_empty() {
             None
         } else {
             Some(self.password.clone())
@@ -1181,10 +1451,13 @@ impl ConnectionFormModal {
 
     /// Render the connection form modal.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        // Calculate modal size. Taller now that we have metadata fields
-        // below the core form.
+        let rows = self.form_rows();
+
+        // Calculate modal size from the fields this database type actually
+        // uses so SQLite does not inherit the server-database form shape.
         let modal_width = 72u16.min(area.width.saturating_sub(4));
-        let modal_height = 28u16.min(area.height.saturating_sub(2));
+        let desired_height = rows.len() as u16 + 2;
+        let modal_height = desired_height.min(area.height.saturating_sub(2));
         let modal_x = area.width.saturating_sub(modal_width) / 2;
         let modal_y = area.height.saturating_sub(modal_height) / 2;
 
@@ -1211,167 +1484,125 @@ impl ConnectionFormModal {
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
 
-        // Layout the form fields.
-        // Order: Name → Kind → User → Password → [OnePasswordRef] → SavePassword → SSL Mode → Host → Port → Database → Color → UrlPaste
-        let mut constraints = vec![
-            Constraint::Length(1), // Name
-            Constraint::Length(1), // Kind
-            Constraint::Length(1), // Separator
-            Constraint::Length(1), // User
-            Constraint::Length(1), // Password
-        ];
-        if self.onepassword_enabled {
-            constraints.push(Constraint::Length(1)); // 1Password ref
-        }
-        constraints.extend([
-            Constraint::Length(1), // Save password checkbox
-            Constraint::Length(1), // SSL mode
-            Constraint::Length(1), // Separator
-            Constraint::Length(1), // Host
-            Constraint::Length(1), // Port
-            Constraint::Length(1), // Database
-            Constraint::Length(1), // Separator
-            Constraint::Length(1), // Color
-            Constraint::Length(1), // Folder
-            Constraint::Length(1), // Tags
-            Constraint::Length(1), // Description
-            Constraint::Length(1), // AppName
-            Constraint::Length(1), // Connect timeout
-            Constraint::Length(1), // URL paste
-            Constraint::Length(1), // Separator
-            Constraint::Length(1), // Help line
-        ]);
+        let constraints = vec![Constraint::Length(1); rows.len()];
         let chunks = Layout::vertical(constraints).split(inner);
 
-        let mut i = 0usize;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Name:",
-            &self.name,
-            self.name_cursor,
-            FormField::Name,
-        );
-        i += 1;
-        self.render_kind_field(frame, chunks[i]);
-        i += 1;
-        self.render_separator(frame, chunks[i]);
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "User:",
-            &self.user,
-            self.user_cursor,
-            FormField::User,
-        );
-        i += 1;
-        self.render_password_field(frame, chunks[i]);
-        i += 1;
-        if self.onepassword_enabled {
-            self.render_text_field(
+        for (row, area) in rows.into_iter().zip(chunks.iter()) {
+            match row {
+                FormRow::Field(field) => self.render_form_field(frame, *area, field),
+                FormRow::Separator => self.render_separator(frame, *area),
+                FormRow::Help => self.render_help(frame, *area),
+            }
+        }
+    }
+
+    fn render_form_field(&self, frame: &mut Frame, area: Rect, field: FormField) {
+        match field {
+            FormField::Name => self.render_text_field(
                 frame,
-                chunks[i],
+                area,
+                "Name:",
+                &self.name,
+                self.name_cursor,
+                FormField::Name,
+            ),
+            FormField::Kind => self.render_kind_field(frame, area),
+            FormField::Host => self.render_text_field(
+                frame,
+                area,
+                if self.kind == DbKind::Sqlite {
+                    "Path:"
+                } else {
+                    "Host:"
+                },
+                &self.host,
+                self.host_cursor,
+                FormField::Host,
+            ),
+            FormField::Port => self.render_text_field(
+                frame,
+                area,
+                "Port:",
+                &self.port,
+                self.port_cursor,
+                FormField::Port,
+            ),
+            FormField::Database => self.render_text_field(
+                frame,
+                area,
+                "Database:",
+                &self.database,
+                self.database_cursor,
+                FormField::Database,
+            ),
+            FormField::User => self.render_text_field(
+                frame,
+                area,
+                "User:",
+                &self.user,
+                self.user_cursor,
+                FormField::User,
+            ),
+            FormField::Password => self.render_password_field(frame, area),
+            FormField::OnePasswordRef => self.render_text_field(
+                frame,
+                area,
                 "op ref:",
                 &self.op_ref,
                 self.op_ref_cursor,
                 FormField::OnePasswordRef,
-            );
-            i += 1;
+            ),
+            FormField::SavePassword => self.render_checkbox(
+                frame,
+                area,
+                "Save to keychain",
+                self.save_password,
+                FormField::SavePassword,
+            ),
+            FormField::SslMode => self.render_ssl_mode_field(frame, area),
+            FormField::Color => self.render_color_field(frame, area),
+            FormField::UrlPaste => self.render_url_paste_field(frame, area),
+            FormField::Description => self.render_text_field(
+                frame,
+                area,
+                "Notes:",
+                &self.description,
+                self.description_cursor,
+                FormField::Description,
+            ),
+            FormField::Tags => self.render_text_field(
+                frame,
+                area,
+                "Tags:",
+                &self.tags_input,
+                self.tags_input_cursor,
+                FormField::Tags,
+            ),
+            FormField::Folder => self.render_text_field(
+                frame,
+                area,
+                "Folder:",
+                &self.folder,
+                self.folder_cursor,
+                FormField::Folder,
+            ),
+            FormField::AppName => self.render_text_field(
+                frame,
+                area,
+                "App:",
+                &self.application_name,
+                self.application_name_cursor,
+                FormField::AppName,
+            ),
+            FormField::ConnectTimeout => self.render_text_field(
+                frame,
+                area,
+                "Timeout:",
+                &self.connect_timeout_secs,
+                self.connect_timeout_cursor,
+                FormField::ConnectTimeout,
+            ),
         }
-        self.render_checkbox(
-            frame,
-            chunks[i],
-            "Save to keychain",
-            self.save_password,
-            FormField::SavePassword,
-        );
-        i += 1;
-        self.render_ssl_mode_field(frame, chunks[i]);
-        i += 1;
-        self.render_separator(frame, chunks[i]);
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Host:",
-            &self.host,
-            self.host_cursor,
-            FormField::Host,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Port:",
-            &self.port,
-            self.port_cursor,
-            FormField::Port,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Database:",
-            &self.database,
-            self.database_cursor,
-            FormField::Database,
-        );
-        i += 1;
-        self.render_separator(frame, chunks[i]);
-        i += 1;
-        self.render_color_field(frame, chunks[i]);
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Folder:",
-            &self.folder,
-            self.folder_cursor,
-            FormField::Folder,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Tags:",
-            &self.tags_input,
-            self.tags_input_cursor,
-            FormField::Tags,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Notes:",
-            &self.description,
-            self.description_cursor,
-            FormField::Description,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "App:",
-            &self.application_name,
-            self.application_name_cursor,
-            FormField::AppName,
-        );
-        i += 1;
-        self.render_text_field(
-            frame,
-            chunks[i],
-            "Timeout:",
-            &self.connect_timeout_secs,
-            self.connect_timeout_cursor,
-            FormField::ConnectTimeout,
-        );
-        i += 1;
-        self.render_url_paste_field(frame, chunks[i]);
-        i += 1;
-        self.render_separator(frame, chunks[i]);
-        i += 1;
-        self.render_help(frame, chunks[i]);
     }
 
     fn render_text_field(
@@ -1496,6 +1727,7 @@ impl ConnectionFormModal {
         let kind_name = match self.kind {
             DbKind::Postgres => "Postgres",
             DbKind::Mongo => "MongoDB",
+            DbKind::Sqlite => "SQLite",
         };
         let mut spans = vec![];
         if is_focused {
@@ -1564,33 +1796,39 @@ impl ConnectionFormModal {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let label_widget = Paragraph::new("SSL:").style(label_style);
+        let label = if self.kind == DbKind::Sqlite {
+            "Mode:"
+        } else {
+            "SSL:"
+        };
+        let label_widget = Paragraph::new(label).style(label_style);
         frame.render_widget(label_widget, chunks[0]);
 
-        let mode_name = if self.kind == DbKind::Mongo {
-            "n/a"
-        } else {
-            self.ssl_mode.as_str()
+        let mode_enabled = self.kind != DbKind::Mongo;
+        let mode_name = match self.kind {
+            DbKind::Postgres => self.ssl_mode.as_str(),
+            DbKind::Sqlite => self.sqlite_mode.label(),
+            DbKind::Mongo => "n/a",
         };
         let mut spans = vec![];
-        if is_focused && self.kind == DbKind::Postgres {
+        if is_focused && mode_enabled {
             spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
         }
         spans.push(Span::styled(
             format!("{:<11}", mode_name), // 11 chars to fit "verify-full"
             Style::default()
-                .fg(if self.kind == DbKind::Mongo {
-                    Color::DarkGray
-                } else {
+                .fg(if mode_enabled {
                     Color::White
-                })
-                .add_modifier(if self.kind == DbKind::Mongo {
-                    Modifier::empty()
                 } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if mode_enabled {
                     Modifier::BOLD
+                } else {
+                    Modifier::empty()
                 }),
         ));
-        if is_focused && self.kind == DbKind::Postgres {
+        if is_focused && mode_enabled {
             spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
         }
 
@@ -1617,7 +1855,7 @@ impl ConnectionFormModal {
         // Value with cursor or placeholder
         let (value_spans, style) = if self.url_paste.is_empty() && !is_focused {
             (
-                vec![Span::raw("postgres://... or mongodb://...")],
+                vec![Span::raw("postgres://..., mongodb://..., sqlite://...")],
                 Style::default().fg(Color::DarkGray),
             )
         } else if is_focused {
@@ -1959,6 +2197,34 @@ mod tests {
     }
 
     #[test]
+    fn test_tab_navigation_for_sqlite_skips_server_only_fields() {
+        let mut form = ConnectionFormModal::new();
+        form.kind = DbKind::Sqlite;
+        form.focused = FormField::Name;
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Kind);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Host);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::SslMode);
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focused, FormField::Color);
+
+        assert!(!form.is_field_visible(FormField::User));
+        assert!(!form.is_field_visible(FormField::Password));
+        assert!(!form.is_field_visible(FormField::OnePasswordRef));
+        assert!(!form.is_field_visible(FormField::SavePassword));
+        assert!(!form.is_field_visible(FormField::Port));
+        assert!(!form.is_field_visible(FormField::Database));
+        assert!(!form.is_field_visible(FormField::AppName));
+        assert!(!form.is_field_visible(FormField::ConnectTimeout));
+    }
+
+    #[test]
     fn test_text_input() {
         let mut form = ConnectionFormModal::new();
         form.name.clear();
@@ -2238,6 +2504,73 @@ mod tests {
             }
             other => panic!("Expected Save action, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_save_sqlite_uses_mode_selector() {
+        let mut form = ConnectionFormModal::new();
+        form.name = "local".to_string();
+        form.kind = DbKind::Sqlite;
+        form.host = "data/app.db".to_string();
+        form.sqlite_mode = SqliteOpenMode::ReadWriteCreate;
+        form.sqlite_mode_index = form.sqlite_mode.to_index();
+        form.password = "ignored".to_string();
+        form.save_password = true;
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match action {
+            ConnectionFormAction::Save {
+                entry,
+                password,
+                save_password,
+                ..
+            } => {
+                assert_eq!(entry.kind, DbKind::Sqlite);
+                assert_eq!(entry.uri.as_deref(), Some("sqlite://data/app.db?mode=rwc"));
+                assert_eq!(entry.host, "data/app.db");
+                assert_eq!(entry.port, 0);
+                assert!(password.is_none());
+                assert!(!save_password);
+            }
+            other => panic!("Expected Save action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_url_paste_sqlite_sets_mode_selector() {
+        let mut form = ConnectionFormModal::new();
+        form.focused = FormField::UrlPaste;
+        form.url_paste = "sqlite:///tmp/app.db?mode=ro".to_string();
+
+        let action = form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, ConnectionFormAction::StatusMessage(_)));
+        assert_eq!(form.kind, DbKind::Sqlite);
+        assert_eq!(form.host, "/tmp/app.db");
+        assert_eq!(form.port, "");
+        assert_eq!(form.database, "");
+        assert_eq!(form.sqlite_mode, SqliteOpenMode::ReadOnly);
+    }
+
+    #[test]
+    fn test_edit_sqlite_hides_port_and_loads_mode() {
+        let entry = ConnectionEntry {
+            kind: DbKind::Sqlite,
+            name: "local".to_string(),
+            uri: Some("sqlite://data/app.db?mode=rwc".to_string()),
+            host: "data/app.db".to_string(),
+            port: 0,
+            database: "data/app.db".to_string(),
+            no_password_required: true,
+            ..Default::default()
+        };
+
+        let form = ConnectionFormModal::edit(&entry, None);
+        assert_eq!(form.kind, DbKind::Sqlite);
+        assert_eq!(form.host, "data/app.db");
+        assert_eq!(form.port, "");
+        assert_eq!(form.database, "");
+        assert_eq!(form.sqlite_mode, SqliteOpenMode::ReadWriteCreate);
+        assert!(!form.is_modified());
     }
 
     #[test]

@@ -324,6 +324,8 @@ pub struct AiConfig {
     pub system_prompt_postgres: Option<String>,
     /// Optional custom system prompt for Mongo generation.
     pub system_prompt_mongo: Option<String>,
+    /// Optional custom system prompt for SQLite generation.
+    pub system_prompt_sqlite: Option<String>,
 }
 
 impl Default for AiConfig {
@@ -342,6 +344,7 @@ impl Default for AiConfig {
             max_columns_per_table: 20,
             system_prompt_postgres: None,
             system_prompt_mongo: None,
+            system_prompt_sqlite: None,
         }
     }
 }
@@ -481,6 +484,7 @@ max_schema_tables = 10
 max_columns_per_table = 12
 system_prompt_postgres = "Only output PostgreSQL."
 system_prompt_mongo = "Only output Mongo syntax."
+system_prompt_sqlite = "Only output SQLite syntax."
 
 [[keymap.normal]]
 key = "ctrl+s"
@@ -562,6 +566,10 @@ description = "Export results as CSV"
         assert_eq!(
             config.ai.system_prompt_mongo,
             Some("Only output Mongo syntax.".to_string())
+        );
+        assert_eq!(
+            config.ai.system_prompt_sqlite,
+            Some("Only output SQLite syntax.".to_string())
         );
     }
 

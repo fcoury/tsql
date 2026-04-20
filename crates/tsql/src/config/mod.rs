@@ -11,9 +11,9 @@ mod keymap;
 mod schema;
 
 pub use connections::{
-    connections_path, export_to_path, import_from_path, load_connections, save_connections,
-    write_connections_atomic, ConnectionColor, ConnectionEntry, ConnectionsFile, DbKind,
-    ImportConflict, ImportSummary, SortMode, SslMode,
+    connections_path, export_to_path, import_from_path, load_connections, parse_sqlite_url,
+    save_connections, write_connections_atomic, ConnectionColor, ConnectionEntry, ConnectionsFile,
+    DbKind, ImportConflict, ImportSummary, SortMode, SqliteOpenMode, SqliteUrlParts, SslMode,
 };
 pub use keymap::{Action, KeyBinding, Keymap};
 pub use schema::{

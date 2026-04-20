@@ -768,6 +768,7 @@ impl ConnectionManagerModal {
         let kind_label = match entry.kind {
             crate::config::DbKind::Postgres => "PostgreSQL",
             crate::config::DbKind::Mongo => "MongoDB",
+            crate::config::DbKind::Sqlite => "SQLite",
         };
         lines.push(Line::from(Span::styled(
             kind_label,

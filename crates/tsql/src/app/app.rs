@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,14 +33,17 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
 use tokio_postgres_rustls_improved::MakeRustlsConnect;
+use tokio_rusqlite::rusqlite::{self, types::ValueRef, OpenFlags};
+use tokio_rusqlite::Connection as SqliteConnection;
 use tui_textarea::{CursorMove, Input};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
 use crate::ai::{generate_query, AiProposal, AiRequestContext};
 use crate::config::{
-    load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
-    ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode, WriteSafetyMode,
+    load_connections, parse_sqlite_url, save_connections, Action, ClipboardBackend, Config,
+    ConnectionEntry, ConnectionsFile, DbKind, KeyBinding, Keymap, SqliteOpenMode, SslMode,
+    UpdateMode, WriteSafetyMode,
 };
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
@@ -227,9 +231,12 @@ pub fn validate_connection_url(raw: &str) -> std::result::Result<(), String> {
             return Ok(());
         }
         return Err(format!(
-            "Not a recognised connection URL. Expected postgres://user:pass@host:port/db, mongodb://..., or libpq `host=... user=...`. Got: {}",
+            "Not a recognised connection URL. Expected postgres://user:pass@host:port/db, mongodb://..., sqlite://..., or libpq `host=... user=...`. Got: {}",
             truncate_for_error(s)
         ));
+    }
+    if matches!(s, "sqlite::memory:" | "sqlite:///:memory:") {
+        return Ok(());
     }
     let parsed = url::Url::parse(s).map_err(|e| {
         format!(
@@ -249,8 +256,9 @@ pub fn validate_connection_url(raw: &str) -> std::result::Result<(), String> {
             Ok(())
         }
         "mongodb" | "mongodb+srv" => Ok(()),
+        "sqlite" => parse_sqlite_url(s).map(|_| ()).map_err(|e| e.to_string()),
         other => Err(format!(
-            "Unsupported scheme '{}://'. Use postgres://, postgresql://, mongodb://, or mongodb+srv://",
+            "Unsupported scheme '{}://'. Use postgres://, postgresql://, mongodb://, mongodb+srv://, or sqlite://",
             other
         )),
     }
@@ -392,6 +400,16 @@ async fn probe_connection(url: &str, kind: DbKind) -> std::result::Result<(), St
         client
             .database("admin")
             .run_command(doc! { "ping": 1 })
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if kind == DbKind::Sqlite {
+        let parts = parse_sqlite_url(url).map_err(|e| e.to_string())?;
+        let client = open_sqlite_connection(&parts).await?;
+        client
+            .call(|conn| conn.execute_batch("SELECT 1").map_err(|e| e.to_string()))
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -756,6 +774,10 @@ impl WriteCapabilities {
                 preview_format: WritePreviewFormat::Json,
                 transaction: false,
             }),
+            Some(DbKind::Sqlite) => Some(Self {
+                preview_format: WritePreviewFormat::Sql,
+                transaction: true,
+            }),
             None => None,
         }
     }
@@ -779,6 +801,7 @@ impl WriteCapabilities {
 #[derive(Debug, Clone, PartialEq)]
 enum WriteOperation {
     PostgresSql(String),
+    SqliteSql(String),
     MongoUpdate {
         collection: String,
         filter: Document,
@@ -802,6 +825,7 @@ impl WritePlan {
     fn preview_body(&self) -> String {
         match &self.operation {
             WriteOperation::PostgresSql(sql) => sql.clone(),
+            WriteOperation::SqliteSql(sql) => sql.clone(),
             WriteOperation::MongoUpdate {
                 collection,
                 filter,
@@ -820,7 +844,7 @@ impl WritePlan {
 
     fn body_label(&self) -> &'static str {
         match self.operation {
-            WriteOperation::PostgresSql(_) => "SQL",
+            WriteOperation::PostgresSql(_) | WriteOperation::SqliteSql(_) => "SQL",
             WriteOperation::MongoUpdate { .. } => "JSON",
         }
     }
@@ -853,6 +877,153 @@ impl OwnedWriteTransaction {
 fn bson_document_to_json(doc: &Document) -> serde_json::Value {
     bson::from_bson::<serde_json::Value>(Bson::Document(doc.clone()))
         .unwrap_or_else(|_| serde_json::Value::String(format!("{doc:?}")))
+}
+
+fn sqlite_value_to_grid_cell(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => "NULL".to_string(),
+        ValueRef::Integer(v) => v.to_string(),
+        ValueRef::Real(v) => v.to_string(),
+        ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
+        ValueRef::Blob(v) => format!("<BLOB {} bytes>", v.len()),
+    }
+}
+
+fn sqlite_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sqlite_relation_for_pragma(table: &str) -> String {
+    sqlite_string_literal(table.trim_matches('"'))
+}
+
+fn sqlite_fetch_table_info(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> rusqlite::Result<Vec<(String, String, bool, i64)>> {
+    let pragma = format!("PRAGMA table_xinfo({})", sqlite_relation_for_pragma(table));
+    let mut stmt = conn.prepare(&pragma)?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        let ty: String = row.get(2)?;
+        let not_null: i64 = row.get(3)?;
+        let pk: i64 = row.get(5)?;
+        Ok((name, ty, not_null != 0, pk))
+    })?;
+    rows.collect()
+}
+
+fn sqlite_primary_keys_sync(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    sqlite_fetch_table_info(conn, table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, pk)| *pk > 0)
+        .map(|(name, _, _, _)| name)
+        .collect()
+}
+
+fn sqlite_column_types_sync(
+    conn: &rusqlite::Connection,
+    table: &str,
+    headers: &[String],
+) -> Vec<String> {
+    let type_map = sqlite_fetch_table_info(conn, table)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, ty, _, _)| (name, ty))
+        .collect::<HashMap<_, _>>();
+    headers
+        .iter()
+        .map(|header| type_map.get(header).cloned().unwrap_or_default())
+        .collect()
+}
+
+fn sqlite_query_result_sync(
+    conn: &rusqlite::Connection,
+    query: &str,
+    max_rows: usize,
+    source_table: Option<String>,
+    started: Instant,
+) -> std::result::Result<QueryResult, String> {
+    let trimmed = query.trim();
+    let mut stmt = conn.prepare(trimmed).map_err(|e| e.to_string())?;
+    let column_count = stmt.column_count();
+
+    if column_count == 0 {
+        drop(stmt);
+        conn.execute_batch(trimmed).map_err(|e| e.to_string())?;
+        let changes = conn.changes();
+        return Ok(QueryResult {
+            headers: vec!["status".to_string()],
+            rows: vec![vec![format!("{changes} rows")]],
+            command_tag: Some(format!("{changes} rows")),
+            truncated: false,
+            elapsed: started.elapsed(),
+            source_table: None,
+            primary_keys: Vec::new(),
+            col_types: vec!["string".to_string()],
+        });
+    }
+
+    let headers = stmt
+        .column_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let mut col_types = stmt
+        .columns()
+        .into_iter()
+        .map(|col| col.decl_type().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    let mut query_rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = query_rows.next().map_err(|e| e.to_string())? {
+        if rows.len() >= max_rows {
+            truncated = true;
+            break;
+        }
+        let mut out = Vec::with_capacity(column_count);
+        for idx in 0..column_count {
+            let value = row.get_ref(idx).map_err(|e| e.to_string())?;
+            out.push(sqlite_value_to_grid_cell(value));
+        }
+        rows.push(out);
+    }
+    drop(query_rows);
+    drop(stmt);
+
+    let primary_keys = if let Some(table) = source_table.as_deref() {
+        if col_types.iter().all(|ty| ty.is_empty()) {
+            col_types = sqlite_column_types_sync(conn, table, &headers);
+        }
+        sqlite_primary_keys_sync(conn, table)
+    } else {
+        Vec::new()
+    };
+
+    let (headers, rows, col_types) = if rows.is_empty() {
+        (
+            vec!["status".to_string()],
+            vec![vec!["No rows".to_string()]],
+            vec!["string".to_string()],
+        )
+    } else if headers.is_empty() {
+        (vec!["status".to_string()], rows, vec!["string".to_string()])
+    } else {
+        (headers, rows, col_types)
+    };
+
+    Ok(QueryResult {
+        command_tag: Some(format!("{} rows", rows.len())),
+        headers,
+        rows,
+        truncated,
+        elapsed: started.elapsed(),
+        source_table,
+        primary_keys,
+        col_types,
+    })
 }
 
 /// State for a paged/streaming query using server-side cursors.
@@ -1150,6 +1321,52 @@ fn extract_table_from_query(query: &str) -> Option<String> {
 
 fn is_mongo_connection_string(conn_str: &str) -> bool {
     conn_str.starts_with("mongodb://") || conn_str.starts_with("mongodb+srv://")
+}
+
+fn is_sqlite_connection_string(conn_str: &str) -> bool {
+    conn_str.starts_with("sqlite://") || matches!(conn_str, "sqlite::memory:")
+}
+
+async fn open_sqlite_connection(
+    parts: &crate::config::SqliteUrlParts,
+) -> std::result::Result<SqliteConnection, String> {
+    if parts.in_memory {
+        return SqliteConnection::open_in_memory()
+            .await
+            .map_err(|e| format!("SQLite connection error: {e}"));
+    }
+
+    let path = Path::new(&parts.path);
+    if !path.exists() && !parts.mode.creates_missing_file() {
+        return Err(format!(
+            "SQLite database file '{}' does not exist; add ?mode=rwc to create it",
+            parts.path
+        ));
+    }
+
+    let flags = match parts.mode {
+        SqliteOpenMode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+        SqliteOpenMode::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE,
+        SqliteOpenMode::ReadWriteCreate => {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+        }
+    };
+
+    SqliteConnection::open_with_flags(path, flags)
+        .await
+        .map_err(|e| format!("SQLite connection error: {e}"))
+}
+
+fn sqlite_display_name(uri: &str) -> String {
+    parse_sqlite_url(uri)
+        .map(|parts| {
+            if parts.in_memory {
+                "sqlite::memory:".to_string()
+            } else {
+                parts.path
+            }
+        })
+        .unwrap_or_else(|_| uri.to_string())
 }
 
 fn mongo_database_from_connection_string(conn_str: &str) -> String {
@@ -2220,6 +2437,7 @@ fn mongo_result_from_documents(
 
 pub type SharedClient = Arc<Mutex<Client>>;
 pub type SharedMongoClient = Arc<mongodb::Client>;
+pub type SharedSqliteClient = Arc<SqliteConnection>;
 
 pub enum DbEvent {
     Connected {
@@ -2231,6 +2449,13 @@ pub enum DbEvent {
     MongoConnected {
         client: SharedMongoClient,
         database: String,
+        connect_generation: u64,
+    },
+    SqliteConnected {
+        client: SharedSqliteClient,
+        path: String,
+        read_only: bool,
+        interrupt_handle: Arc<rusqlite::InterruptHandle>,
         connect_generation: u64,
     },
     ConnectError {
@@ -2326,6 +2551,10 @@ pub struct DbSession {
     pub client: Option<SharedClient>,
     pub mongo_client: Option<SharedMongoClient>,
     pub mongo_database: Option<String>,
+    pub sqlite_client: Option<SharedSqliteClient>,
+    pub sqlite_path: Option<String>,
+    pub sqlite_read_only: bool,
+    pub sqlite_interrupt: Option<Arc<rusqlite::InterruptHandle>>,
     pub cancel_token: Option<CancelToken>,
     pub last_command_tag: Option<String>,
     pub last_elapsed: Option<Duration>,
@@ -2345,6 +2574,10 @@ impl DbSession {
             client: None,
             mongo_client: None,
             mongo_database: None,
+            sqlite_client: None,
+            sqlite_path: None,
+            sqlite_read_only: false,
+            sqlite_interrupt: None,
             cancel_token: None,
             last_command_tag: None,
             last_elapsed: None,
@@ -5214,6 +5447,7 @@ impl App {
             let db = match self.db.kind {
                 Some(DbKind::Mongo) => "Mongo",
                 Some(DbKind::Postgres) => "Postgres",
+                Some(DbKind::Sqlite) => "SQLite",
                 None => "This database",
             };
             self.last_error = Some(format!(
@@ -5243,6 +5477,7 @@ impl App {
             WriteSafetyMode::Preview | WriteSafetyMode::Transaction => {
                 let expected_format = match plan.kind {
                     DbKind::Postgres => WritePreviewFormat::Sql,
+                    DbKind::Sqlite => WritePreviewFormat::Sql,
                     DbKind::Mongo => WritePreviewFormat::Json,
                 };
                 debug_assert_eq!(capabilities.preview_format, expected_format);
@@ -5301,6 +5536,9 @@ impl App {
         match plan.operation.clone() {
             WriteOperation::PostgresSql(sql) => {
                 self.execute_postgres_write_plan(plan, sql);
+            }
+            WriteOperation::SqliteSql(sql) => {
+                self.execute_sqlite_write_plan(plan, sql);
             }
             WriteOperation::MongoUpdate {
                 collection,
@@ -5432,6 +5670,8 @@ impl App {
             return;
         }
 
+        let db_kind = self.db.kind.unwrap_or(DbKind::Postgres);
+
         // Generate UPDATE SQL (similar to commit_cell_edit)
         let table = match &self.grid.source_table {
             Some(t) => t.clone(),
@@ -5450,7 +5690,11 @@ impl App {
         };
 
         // Build WHERE clause from primary key values
-        let where_clause = match self.build_update_where_clause(row, col, None) {
+        let where_clause = match db_kind {
+            DbKind::Sqlite => self.build_sqlite_update_where_clause(row, col, None),
+            _ => self.build_update_where_clause(row, col, None),
+        };
+        let where_clause = match where_clause {
             Ok(w) => w,
             Err(msg) => {
                 self.last_error = Some(msg);
@@ -5458,21 +5702,32 @@ impl App {
             }
         };
 
-        let plan = WritePlan {
-            kind: DbKind::Postgres,
-            target: table.clone(),
-            field: column_name.clone(),
-            old_value: self.grid.rows.get(row).and_then(|r| r.get(col)).cloned(),
-            new_value: Some(new_value.clone()),
-            row,
-            col,
-            operation: WriteOperation::PostgresSql(format!(
+        let operation = match db_kind {
+            DbKind::Sqlite => WriteOperation::SqliteSql(format!(
                 "UPDATE {} SET {} = {} WHERE {}",
                 quote_identifier(&table),
                 quote_identifier(&column_name),
                 escape_sql_value(&new_value),
                 where_clause
             )),
+            _ => WriteOperation::PostgresSql(format!(
+                "UPDATE {} SET {} = {} WHERE {}",
+                quote_identifier(&table),
+                quote_identifier(&column_name),
+                escape_sql_value(&new_value),
+                where_clause
+            )),
+        };
+
+        let plan = WritePlan {
+            kind: db_kind,
+            target: table.clone(),
+            field: column_name.clone(),
+            old_value: self.grid.rows.get(row).and_then(|r| r.get(col)).cloned(),
+            new_value: Some(new_value.clone()),
+            row,
+            col,
+            operation,
         };
         self.dispatch_write_plan(plan);
     }
@@ -5496,6 +5751,8 @@ impl App {
             return;
         }
 
+        let db_kind = self.db.kind.unwrap_or(DbKind::Postgres);
+
         // Generate UPDATE SQL
         let table = match &self.grid.source_table {
             Some(t) => t.clone(),
@@ -5515,15 +5772,20 @@ impl App {
             }
         };
 
-        let where_clause =
-            match self.build_update_where_clause(row, col, Some(original_value.as_str())) {
-                Ok(w) => w,
-                Err(msg) => {
-                    self.cell_editor.close();
-                    self.last_error = Some(msg);
-                    return;
-                }
-            };
+        let where_clause = match db_kind {
+            DbKind::Sqlite => {
+                self.build_sqlite_update_where_clause(row, col, Some(original_value.as_str()))
+            }
+            _ => self.build_update_where_clause(row, col, Some(original_value.as_str())),
+        };
+        let where_clause = match where_clause {
+            Ok(w) => w,
+            Err(msg) => {
+                self.cell_editor.close();
+                self.last_error = Some(msg);
+                return;
+            }
+        };
 
         let update_sql = format!(
             "UPDATE {} SET {} = {} WHERE {}",
@@ -5534,14 +5796,17 @@ impl App {
         );
 
         let plan = WritePlan {
-            kind: DbKind::Postgres,
+            kind: db_kind,
             target: table,
             field: column_name,
             old_value: Some(original_value),
             new_value: Some(new_value),
             row,
             col,
-            operation: WriteOperation::PostgresSql(update_sql),
+            operation: match db_kind {
+                DbKind::Sqlite => WriteOperation::SqliteSql(update_sql),
+                _ => WriteOperation::PostgresSql(update_sql),
+            },
         };
 
         // Close editor and dispatch write
@@ -5783,6 +6048,69 @@ impl App {
         });
     }
 
+    fn execute_sqlite_write_plan(&mut self, plan: WritePlan, sql: String) {
+        let Some(client) = self.db.sqlite_client.clone() else {
+            self.last_error = Some("Not connected".to_string());
+            return;
+        };
+
+        if self.db.sqlite_read_only {
+            self.last_error = Some("SQLite connection is read-only".to_string());
+            return;
+        }
+
+        if self.db.running {
+            self.last_error = Some("Another query is running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.last_status = Some("Updating...".to_string());
+        self.query_ui.start();
+        self.executing_write_plan = Some(plan.clone());
+
+        let tx = self.db_events_tx.clone();
+        let use_transaction = self.write_safety_mode == WriteSafetyMode::Transaction;
+        let begin_transaction = use_transaction && !self.owned_write_txn.active;
+
+        self.rt.spawn(async move {
+            let result = client
+                .call(move |conn| {
+                    if begin_transaction {
+                        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+                    }
+                    let affected = conn.execute(&sql, []).map_err(|e| e.to_string())?;
+                    Ok::<usize, String>(affected)
+                })
+                .await;
+
+            match result {
+                Ok(1) => {
+                    let _ = tx.send(DbEvent::CellUpdated {
+                        row: plan.row,
+                        col: plan.col,
+                        value: plan.new_value.unwrap_or_default(),
+                    });
+                }
+                Ok(0) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: "Update affected 0 rows (row may have changed)".to_string(),
+                    });
+                }
+                Ok(affected) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("Update affected {affected} rows (ambiguous match)"),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("SQLite update error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     fn build_update_where_clause(
         &self,
         row: usize,
@@ -5847,6 +6175,69 @@ impl App {
 
         Ok(format!(
             "ctid = (SELECT ctid FROM {} WHERE {} ORDER BY ctid LIMIT 1)",
+            quote_identifier(table),
+            match_conditions.join(" AND ")
+        ))
+    }
+
+    fn build_sqlite_update_where_clause(
+        &self,
+        row: usize,
+        edited_col: usize,
+        edited_original_value: Option<&str>,
+    ) -> Result<String, String> {
+        let table = self
+            .grid
+            .source_table
+            .as_ref()
+            .ok_or_else(|| "Cannot update: unknown source table".to_string())?;
+
+        let pk_conditions: Vec<String> = self
+            .grid
+            .primary_keys
+            .iter()
+            .filter_map(|pk_name| {
+                let pk_col_idx = self.grid.headers.iter().position(|h| h == pk_name)?;
+                let pk_value = self.grid.rows.get(row)?.get(pk_col_idx)?;
+                Some(format!(
+                    "{} IS {}",
+                    quote_identifier(pk_name),
+                    escape_sql_literal_for_where(pk_value)
+                ))
+            })
+            .collect();
+
+        if !pk_conditions.is_empty() {
+            return Ok(pk_conditions.join(" AND "));
+        }
+
+        let row_values = self
+            .grid
+            .rows
+            .get(row)
+            .ok_or_else(|| "Cannot update: invalid row".to_string())?;
+
+        if self.grid.headers.is_empty() || row_values.is_empty() {
+            return Err("Cannot update: no row data".to_string());
+        }
+
+        let mut match_conditions = Vec::new();
+        for (idx, header) in self.grid.headers.iter().enumerate() {
+            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
+            if idx == edited_col {
+                if let Some(original) = edited_original_value {
+                    value = original;
+                }
+            }
+            match_conditions.push(format!(
+                "{} IS {}",
+                quote_identifier(header),
+                escape_sql_literal_for_where(value)
+            ));
+        }
+
+        Ok(format!(
+            "rowid = (SELECT rowid FROM {} WHERE {} ORDER BY rowid LIMIT 1)",
             quote_identifier(table),
             match_conditions.join(" AND ")
         ))
@@ -6003,6 +6394,10 @@ impl App {
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
+                self.db.sqlite_client = None;
+                self.db.sqlite_path = None;
+                self.db.sqlite_read_only = false;
+                self.db.sqlite_interrupt = None;
                 self.db.kind = None;
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
@@ -6067,6 +6462,10 @@ impl App {
             "\\dt" | "dt" => {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.execute_mongo_show_collections();
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.execute_sqlite_query(
+                        "SELECT name, type FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                    );
                 } else {
                     self.execute_meta_query(META_QUERY_TABLES, None);
                 }
@@ -6074,6 +6473,11 @@ impl App {
             "\\dn" | "dn" => {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.last_status = Some("Use ':show dbs' for Mongo databases".to_string());
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.last_status = Some(
+                        "Schemas are not applicable for SQLite; use :\\l for attached databases"
+                            .to_string(),
+                    );
                 } else {
                     self.execute_meta_query(META_QUERY_SCHEMAS, None);
                 }
@@ -6084,6 +6488,14 @@ impl App {
                         self.execute_mongo_show_collections();
                     } else {
                         self.execute_mongo_describe_collection(args);
+                    }
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    if args.is_empty() {
+                        self.execute_sqlite_query(
+                            "SELECT name, type FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                        );
+                    } else {
+                        self.execute_sqlite_describe_table(args);
                     }
                 } else if args.is_empty() {
                     // \d without args is same as \dt
@@ -6097,6 +6509,10 @@ impl App {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.last_status =
                         Some("Mongo index listing via :\\di is not implemented yet".to_string());
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.execute_sqlite_query(
+                        "SELECT name, tbl_name AS table_name, sql FROM sqlite_schema WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY tbl_name, name",
+                    );
                 } else {
                     self.execute_meta_query(META_QUERY_INDEXES, None);
                 }
@@ -6104,6 +6520,8 @@ impl App {
             "\\l" | "l" => {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.execute_mongo_show_databases();
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.execute_sqlite_query("PRAGMA database_list");
                 } else {
                     self.execute_meta_query(META_QUERY_DATABASES, None);
                 }
@@ -6112,6 +6530,9 @@ impl App {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.last_status =
                         Some("Mongo users listing via :\\du is not implemented yet".to_string());
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.last_status =
+                        Some("Roles/users are not applicable for SQLite".to_string());
                 } else {
                     self.execute_meta_query(META_QUERY_ROLES, None);
                 }
@@ -6120,6 +6541,10 @@ impl App {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.last_status =
                         Some("Mongo views listing via :\\dv is not implemented yet".to_string());
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.execute_sqlite_query(
+                        "SELECT name, sql FROM sqlite_schema WHERE type = 'view' ORDER BY name",
+                    );
                 } else {
                     self.execute_meta_query(META_QUERY_VIEWS, None);
                 }
@@ -6128,6 +6553,8 @@ impl App {
                 if self.db.kind == Some(DbKind::Mongo) {
                     self.last_status =
                         Some("Mongo functions via :\\df are not applicable".to_string());
+                } else if self.db.kind == Some(DbKind::Sqlite) {
+                    self.last_status = Some("Functions are not applicable for SQLite".to_string());
                 } else {
                     self.execute_meta_query(META_QUERY_FUNCTIONS, None);
                 }
@@ -6216,10 +6643,6 @@ impl App {
     }
 
     fn commit_owned_write_transaction(&mut self) {
-        let Some(client) = self.db.client.clone() else {
-            self.last_error = Some("Not connected".to_string());
-            return;
-        };
         if !self.owned_write_txn.active {
             self.last_status = Some("No generated transaction to commit".to_string());
             return;
@@ -6238,26 +6661,56 @@ impl App {
         self.query_ui.start();
         self.last_status = Some("Committing...".to_string());
         let tx = self.db_events_tx.clone();
-        self.rt.spawn(async move {
-            let guard = client.lock().await;
-            match guard.simple_query("COMMIT").await {
-                Ok(_) => {
-                    let _ = tx.send(DbEvent::WriteTransactionCommitted);
+
+        if self.db.kind == Some(DbKind::Sqlite) {
+            let Some(client) = self.db.sqlite_client.clone() else {
+                self.db.running = false;
+                self.query_ui.clear();
+                self.last_error = Some("Not connected".to_string());
+                return;
+            };
+            self.rt.spawn(async move {
+                match client
+                    .call(|conn| {
+                        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                        Ok::<(), String>(())
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = tx.send(DbEvent::WriteTransactionCommitted);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Commit failed: {e}"),
+                        });
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(DbEvent::QueryError {
-                        error: format!("Commit failed: {}", format_pg_error(&e)),
-                    });
+            });
+        } else {
+            let Some(client) = self.db.client.clone() else {
+                self.db.running = false;
+                self.query_ui.clear();
+                self.last_error = Some("Not connected".to_string());
+                return;
+            };
+            self.rt.spawn(async move {
+                let guard = client.lock().await;
+                match guard.simple_query("COMMIT").await {
+                    Ok(_) => {
+                        let _ = tx.send(DbEvent::WriteTransactionCommitted);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Commit failed: {}", format_pg_error(&e)),
+                        });
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     fn rollback_owned_write_transaction(&mut self) {
-        let Some(client) = self.db.client.clone() else {
-            self.last_error = Some("Not connected".to_string());
-            return;
-        };
         if !self.owned_write_txn.active {
             self.last_status = Some("No generated transaction to roll back".to_string());
             return;
@@ -6271,19 +6724,53 @@ impl App {
         self.query_ui.start();
         self.last_status = Some("Rolling back...".to_string());
         let tx = self.db_events_tx.clone();
-        self.rt.spawn(async move {
-            let guard = client.lock().await;
-            match guard.simple_query("ROLLBACK").await {
-                Ok(_) => {
-                    let _ = tx.send(DbEvent::WriteTransactionRolledBack);
+
+        if self.db.kind == Some(DbKind::Sqlite) {
+            let Some(client) = self.db.sqlite_client.clone() else {
+                self.db.running = false;
+                self.query_ui.clear();
+                self.last_error = Some("Not connected".to_string());
+                return;
+            };
+            self.rt.spawn(async move {
+                match client
+                    .call(|conn| {
+                        conn.execute_batch("ROLLBACK").map_err(|e| e.to_string())?;
+                        Ok::<(), String>(())
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = tx.send(DbEvent::WriteTransactionRolledBack);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Rollback failed: {e}"),
+                        });
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(DbEvent::QueryError {
-                        error: format!("Rollback failed: {}", format_pg_error(&e)),
-                    });
+            });
+        } else {
+            let Some(client) = self.db.client.clone() else {
+                self.db.running = false;
+                self.query_ui.clear();
+                self.last_error = Some("Not connected".to_string());
+                return;
+            };
+            self.rt.spawn(async move {
+                let guard = client.lock().await;
+                match guard.simple_query("ROLLBACK").await {
+                    Ok(_) => {
+                        let _ = tx.send(DbEvent::WriteTransactionRolledBack);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format!("Rollback failed: {}", format_pg_error(&e)),
+                        });
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     fn show_owned_write_changes(&mut self) {
@@ -6918,6 +7405,96 @@ impl App {
         });
     }
 
+    fn execute_sqlite_query(&mut self, query: &str) {
+        let Some(client) = self.db.sqlite_client.clone() else {
+            self.last_error = Some("Not connected to SQLite.".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+        self.query_ui.start();
+        let tx = self.db_events_tx.clone();
+        self.execute_query_sqlite(
+            client,
+            query.to_string(),
+            effective_max_rows(self.config.connection.max_rows),
+            None,
+            tx,
+        );
+    }
+
+    fn execute_sqlite_describe_table(&mut self, table: &str) {
+        let Some(client) = self.db.sqlite_client.clone() else {
+            self.last_error = Some("Not connected to SQLite.".to_string());
+            return;
+        };
+        if self.db.running {
+            self.last_status = Some("Query already running".to_string());
+            return;
+        }
+
+        self.db.running = true;
+        self.last_status = Some("Running...".to_string());
+        self.query_ui.start();
+        let table = table.to_string();
+        let tx = self.db_events_tx.clone();
+        let started = Instant::now();
+
+        self.rt.spawn(async move {
+            let result = client
+                .call(move |conn| {
+                    let info = sqlite_fetch_table_info(conn, &table).map_err(|e| e.to_string())?;
+                    let rows = info
+                        .into_iter()
+                        .map(|(name, ty, not_null, pk)| {
+                            vec![
+                                name,
+                                ty,
+                                if not_null { "yes" } else { "no" }.to_string(),
+                                if pk > 0 {
+                                    pk.to_string()
+                                } else {
+                                    String::new()
+                                },
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    Ok::<QueryResult, String>(QueryResult {
+                        headers: vec![
+                            "column".to_string(),
+                            "type".to_string(),
+                            "not_null".to_string(),
+                            "pk".to_string(),
+                        ],
+                        rows,
+                        command_tag: Some(format!("describe {table}")),
+                        truncated: false,
+                        elapsed: started.elapsed(),
+                        source_table: None,
+                        primary_keys: Vec::new(),
+                        col_types: Vec::new(),
+                    })
+                })
+                .await;
+
+            match result {
+                Ok(result) => {
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("SQLite describe error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     fn execute_mongo_show_databases(&mut self) {
         let Some(client) = self.db.mongo_client.clone() else {
             self.last_error = Some("Not connected to Mongo.".to_string());
@@ -7139,6 +7716,18 @@ impl App {
                         if let Some(active_db) = self.db.mongo_database.as_ref() {
                             info.database = Some(active_db.clone());
                         }
+                    }
+                    if self.db.kind == Some(DbKind::Sqlite) {
+                        self.last_status = Some(format!(
+                            "Connected to SQLite database \"{}\"{}.",
+                            self.db.sqlite_path.as_deref().unwrap_or(conn_str.as_str()),
+                            if self.db.sqlite_read_only {
+                                " (read-only)"
+                            } else {
+                                ""
+                            }
+                        ));
+                        return;
                     }
                     let user = info.user.as_deref().unwrap_or("unknown");
                     let host = info.host.as_deref().unwrap_or("localhost");
@@ -8303,6 +8892,10 @@ impl App {
         self.db.client = None;
         self.db.mongo_client = None;
         self.db.mongo_database = None;
+        self.db.sqlite_client = None;
+        self.db.sqlite_path = None;
+        self.db.sqlite_read_only = false;
+        self.db.sqlite_interrupt = None;
         self.db.running = false;
         self.query_ui.clear();
         self.db.connected_with_tls = false;
@@ -8338,6 +8931,52 @@ impl App {
                     Err(e) => {
                         let _ = tx.send(DbEvent::ConnectError {
                             error: format!("Mongo connection error: {e}"),
+                            connect_generation,
+                        });
+                    }
+                }
+                return;
+            }
+
+            if is_sqlite_connection_string(&conn_str) {
+                let parts = match parse_sqlite_url(&conn_str) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::ConnectError {
+                            error: e.to_string(),
+                            connect_generation,
+                        });
+                        return;
+                    }
+                };
+                let read_only = parts.mode.is_read_only();
+                let path = sqlite_display_name(&parts.uri);
+                match open_sqlite_connection(&parts).await {
+                    Ok(client) => {
+                        let interrupt = match client
+                            .call(|conn| Ok::<rusqlite::InterruptHandle, String>(conn.get_interrupt_handle()))
+                            .await
+                        {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                let _ = tx.send(DbEvent::ConnectError {
+                                    error: format!("SQLite connection error: {e}"),
+                                    connect_generation,
+                                });
+                                return;
+                            }
+                        };
+                        let _ = tx.send(DbEvent::SqliteConnected {
+                            client: Arc::new(client),
+                            path,
+                            read_only,
+                            interrupt_handle: Arc::new(interrupt),
+                            connect_generation,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::ConnectError {
+                            error: e,
                             connect_generation,
                         });
                     }
@@ -9405,6 +10044,44 @@ impl App {
                         return;
                     }
 
+                    if entry.kind == DbKind::Sqlite {
+                        match parse_sqlite_url(&url) {
+                            Ok(parts) => match open_sqlite_connection(&parts).await {
+                                Ok(client) => {
+                                    match client
+                                        .call(|conn| {
+                                            conn.execute_batch("SELECT 1")
+                                                .map_err(|e| e.to_string())?;
+                                            Ok::<(), String>(())
+                                        })
+                                        .await
+                                    {
+                                        Ok(()) => send_ok(&tx),
+                                        Err(e) => {
+                                            let _ = tx.send(DbEvent::TestConnectionResult {
+                                                success: false,
+                                                message: format!("Connection failed: {e}"),
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(DbEvent::TestConnectionResult {
+                                        success: false,
+                                        message: format!("Connection failed: {e}"),
+                                    });
+                                }
+                            },
+                            Err(e) => {
+                                let _ = tx.send(DbEvent::TestConnectionResult {
+                                    success: false,
+                                    message: format!("Connection failed: {e}"),
+                                });
+                            }
+                        }
+                        return;
+                    }
+
                     let ssl_mode = match resolve_ssl_mode(&url) {
                         Ok(m) => m,
                         Err(msg) => {
@@ -9484,6 +10161,10 @@ impl App {
             self.load_mongo_schema();
             return;
         }
+        if self.db.kind == Some(DbKind::Sqlite) {
+            self.load_sqlite_schema();
+            return;
+        }
 
         let Some(client) = self.db.client.clone() else {
             return;
@@ -9559,6 +10240,76 @@ impl App {
                 }
                 Err(_) => {
                     // Schema loading failed silently - not critical
+                }
+            }
+        });
+    }
+
+    fn load_sqlite_schema(&mut self) {
+        let Some(client) = self.db.sqlite_client.clone() else {
+            return;
+        };
+        let tx = self.db_events_tx.clone();
+
+        self.rt.spawn(async move {
+            let result = client
+                .call(|conn| {
+                    let mut tables = Vec::new();
+                    let databases = {
+                        let mut stmt = conn
+                            .prepare("PRAGMA database_list")
+                            .map_err(|e| e.to_string())?;
+                        let rows = stmt
+                            .query_map([], |row| row.get::<_, String>(1))
+                            .map_err(|e| e.to_string())?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()
+                            .map_err(|e| e.to_string())?
+                    };
+
+                    for db_name in databases {
+                        let schema_query = format!(
+                            "SELECT name FROM {}.sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                            quote_identifier(&db_name)
+                        );
+                        let names = {
+                            let mut stmt = conn
+                                .prepare(&schema_query)
+                                .map_err(|e| e.to_string())?;
+                            let rows = stmt
+                                .query_map([], |row| row.get::<_, String>(0))
+                                .map_err(|e| e.to_string())?;
+                            rows.collect::<rusqlite::Result<Vec<_>>>()
+                                .map_err(|e| e.to_string())?
+                        };
+
+                        for table_name in names {
+                            let columns = sqlite_fetch_table_info(conn, &table_name)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(name, data_type, _, _)| ColumnInfo { name, data_type })
+                                .collect();
+                            tables.push(TableInfo {
+                                schema: db_name.clone(),
+                                name: table_name,
+                                columns,
+                            });
+                        }
+                    }
+                    Ok::<Vec<TableInfo>, String>(tables)
+                })
+                .await;
+
+            match result {
+                Ok(tables) => {
+                    let _ = tx.send(DbEvent::SchemaLoaded {
+                        tables,
+                        source_database: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("SQLite schema load failed: {e}"),
+                    });
                 }
             }
         });
@@ -9775,6 +10526,20 @@ impl App {
                 .unwrap_or_else(|| "admin".to_string());
             self.paged_query = None;
             self.execute_query_mongo(client, db_name, query, max_rows, tx);
+            return;
+        }
+
+        if self.db.kind == Some(DbKind::Sqlite) {
+            let Some(client) = self.db.sqlite_client.clone() else {
+                self.last_error =
+                    Some("Not connected. Use :connect <sqlite://...> first.".to_string());
+                self.db.running = false;
+                self.query_ui.clear();
+                return;
+            };
+            self.paged_query = None;
+            let source_table = extract_table_from_query(&query);
+            self.execute_query_sqlite(client, query, max_rows, source_table, tx);
             return;
         }
 
@@ -10564,6 +11329,36 @@ impl App {
         });
     }
 
+    fn execute_query_sqlite(
+        &self,
+        client: SharedSqliteClient,
+        query: String,
+        max_rows: usize,
+        source_table: Option<String>,
+        tx: mpsc::UnboundedSender<DbEvent>,
+    ) {
+        let started = Instant::now();
+
+        self.rt.spawn(async move {
+            let result = client
+                .call(move |conn| {
+                    sqlite_query_result_sync(conn, &query, max_rows, source_table, started)
+                })
+                .await;
+
+            match result {
+                Ok(result) => {
+                    let _ = tx.send(DbEvent::QueryFinished { result });
+                }
+                Err(e) => {
+                    let _ = tx.send(DbEvent::QueryError {
+                        error: format!("SQLite query error: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     /// Check if we should fetch more rows for a paged query.
     /// Called after grid navigation to implement auto-fetch on scroll.
     fn maybe_fetch_more_rows(&mut self) {
@@ -10612,6 +11407,20 @@ impl App {
             self.last_status = Some(
                 "Mongo cancellation is not yet supported; wait for query completion".to_string(),
             );
+            return;
+        }
+
+        if self.db.kind == Some(DbKind::Sqlite) {
+            let Some(handle) = self.db.sqlite_interrupt.clone() else {
+                self.last_status = Some("No SQLite interrupt handle available".to_string());
+                return;
+            };
+            self.last_status = Some("Cancelling...".to_string());
+            if paged_loading {
+                self.paged_query = None;
+            }
+            handle.interrupt();
+            let _ = self.db_events_tx.send(DbEvent::QueryCancelled);
             return;
         }
 
@@ -10670,6 +11479,10 @@ impl App {
                 self.db.client = Some(client);
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
+                self.db.sqlite_client = None;
+                self.db.sqlite_path = None;
+                self.db.sqlite_read_only = false;
+                self.db.sqlite_interrupt = None;
                 self.db.cancel_token = Some(cancel_token);
                 self.db.running = false;
                 self.db.connected_with_tls = connected_with_tls;
@@ -10692,6 +11505,10 @@ impl App {
                 self.db.client = None;
                 self.db.mongo_client = Some(client);
                 self.db.mongo_database = Some(database.clone());
+                self.db.sqlite_client = None;
+                self.db.sqlite_path = None;
+                self.db.sqlite_read_only = false;
+                self.db.sqlite_interrupt = None;
                 self.db.cancel_token = None;
                 self.db.running = false;
                 self.db.in_transaction = false;
@@ -10699,6 +11516,37 @@ impl App {
                 self.query_ui.clear();
                 self.last_status = Some(format!(
                     "Connected to Mongo ({database}), loading schema..."
+                ));
+                self.record_successful_connect(self.connect_generation_name.clone());
+                self.load_schema();
+            }
+            DbEvent::SqliteConnected {
+                client,
+                path,
+                read_only,
+                interrupt_handle,
+                connect_generation,
+            } => {
+                if connect_generation != self.connect_generation {
+                    return;
+                }
+                self.db.status = DbStatus::Connected;
+                self.db.kind = Some(DbKind::Sqlite);
+                self.db.client = None;
+                self.db.mongo_client = None;
+                self.db.mongo_database = None;
+                self.db.sqlite_client = Some(client);
+                self.db.sqlite_path = Some(path.clone());
+                self.db.sqlite_read_only = read_only;
+                self.db.sqlite_interrupt = Some(interrupt_handle);
+                self.db.cancel_token = None;
+                self.db.running = false;
+                self.db.in_transaction = false;
+                self.db.connected_with_tls = false;
+                self.query_ui.clear();
+                let mode = if read_only { "read-only" } else { "read/write" };
+                self.last_status = Some(format!(
+                    "Connected to SQLite ({path}, {mode}), loading schema..."
                 ));
                 self.record_successful_connect(self.connect_generation_name.clone());
                 self.load_schema();
@@ -10715,6 +11563,10 @@ impl App {
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
+                self.db.sqlite_client = None;
+                self.db.sqlite_path = None;
+                self.db.sqlite_read_only = false;
+                self.db.sqlite_interrupt = None;
                 self.db.running = false;
                 self.query_ui.clear();
                 self.current_connection_name = None;
@@ -10812,7 +11664,7 @@ impl App {
                 if self
                     .executing_write_plan
                     .take()
-                    .is_some_and(|plan| plan.kind == DbKind::Postgres)
+                    .is_some_and(|plan| matches!(plan.kind, DbKind::Postgres | DbKind::Sqlite))
                     && self.write_safety_mode == WriteSafetyMode::Transaction
                 {
                     self.owned_write_txn.active = true;
@@ -10853,7 +11705,7 @@ impl App {
                 if self.write_safety_mode == WriteSafetyMode::Transaction
                     && executed_plan
                         .as_ref()
-                        .is_some_and(|plan| plan.kind == DbKind::Postgres)
+                        .is_some_and(|plan| matches!(plan.kind, DbKind::Postgres | DbKind::Sqlite))
                 {
                     self.owned_write_txn.active = true;
                     self.db.in_transaction = true;
@@ -10865,7 +11717,9 @@ impl App {
                     }
                 }
                 if let Some(plan) = executed_plan {
-                    if self.owned_write_txn.active && plan.kind == DbKind::Postgres {
+                    if self.owned_write_txn.active
+                        && matches!(plan.kind, DbKind::Postgres | DbKind::Sqlite)
+                    {
                         let body = plan.preview_body();
                         self.owned_write_txn.changes.push(AppliedWriteChange {
                             row,
@@ -11592,6 +12446,64 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var("TSQL_CONFIG_DIR");
         }
+    }
+
+    #[test]
+    fn test_sqlite_write_capabilities_support_all_modes() {
+        let capabilities = WriteCapabilities::for_kind(Some(DbKind::Sqlite)).unwrap();
+        assert_eq!(capabilities.preview_format, WritePreviewFormat::Sql);
+        assert!(capabilities.supports(WriteSafetyMode::Immediate));
+        assert!(capabilities.supports(WriteSafetyMode::Preview));
+        assert!(capabilities.supports(WriteSafetyMode::Transaction));
+    }
+
+    #[test]
+    fn test_sqlite_query_result_reads_rows_and_metadata() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            INSERT INTO users (name) VALUES ('Ada'), ('Linus');
+            "#,
+        )
+        .unwrap();
+
+        let result = sqlite_query_result_sync(
+            &conn,
+            "SELECT id, name FROM users ORDER BY id",
+            10,
+            Some("users".to_string()),
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(result.headers, vec!["id", "name"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0], vec!["1", "Ada"]);
+        assert_eq!(result.primary_keys, vec!["id"]);
+        assert_eq!(result.col_types, vec!["INTEGER", "TEXT"]);
+    }
+
+    #[test]
+    fn test_sqlite_open_requires_create_mode_for_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("missing.db");
+        let rw = parse_sqlite_url(&format!("sqlite://{}", db_path.display())).unwrap();
+        let rwc = parse_sqlite_url(&format!("sqlite://{}?mode=rwc", db_path.display())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = rt.block_on(open_sqlite_connection(&rw)).unwrap_err();
+        assert!(err.contains("does not exist"));
+
+        let conn = rt.block_on(open_sqlite_connection(&rwc)).unwrap();
+        rt.block_on(conn.close()).unwrap();
+        assert!(db_path.exists());
     }
 
     // ========== Grid Mouse Tests ==========

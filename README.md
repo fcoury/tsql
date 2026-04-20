@@ -22,8 +22,8 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Results grid** - Scrollable, searchable data grid with column resizing, multi-row selection, and flexible yank (TSV/CSV/JSON/Markdown)
 - **Inline editing** - Edit cells directly in the grid with automatic SQL generation
 - **JSON support** - Detect, format, and edit JSON/JSONB columns with syntax highlighting
-- **Postgres + MongoDB** - Connect with `postgres://...` or `mongodb://...` URLs
-- **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`)
+- **Postgres + MongoDB + SQLite** - Connect with `postgres://...`, `mongodb://...`, or `sqlite://...` URLs
+- **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`) and SQLite metadata
 - **Query history** - Persistent history with fuzzy search, pinning, and deletion
 - **AI query assistant** - Draft DB-aware queries with follow-ups and one-key accept (`:ai` / `Ctrl+G`)
 - **External editor** - Open the current query in `$VISUAL` / `$EDITOR` with `vv`
@@ -56,6 +56,8 @@ Download pre-built binaries from the [GitHub Releases](https://github.com/fcoury
 # Connect with a connection URL
 tsql postgres://user:password@localhost:5432/mydb
 tsql mongodb://user:password@localhost:27017/mydb
+tsql sqlite:///path/to/app.db
+tsql 'sqlite://app.db?mode=rwc' # create if missing
 
 # Or set DATABASE_URL environment variable
 export DATABASE_URL=postgres://user:password@localhost:5432/mydb
@@ -200,6 +202,8 @@ On Linux/macOS startup, legacy config folders are auto-migrated to `~/.tsql`.
 [connection]
 # Default connection URL (can be overridden by CLI arg or DATABASE_URL)
 default_url = "postgres://localhost/mydb"
+# SQLite opens existing files by default. Add ?mode=rwc to create a file.
+# default_url = "sqlite:///path/to/app.db"
 # Enable 1Password CLI support for `password_onepassword` refs
 enable_onepassword = false
 

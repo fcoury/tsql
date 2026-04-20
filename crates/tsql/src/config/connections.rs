@@ -23,6 +23,73 @@ pub enum DbKind {
     #[default]
     Postgres,
     Mongo,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteUrlParts {
+    pub uri: String,
+    pub path: String,
+    pub mode: SqliteOpenMode,
+    pub in_memory: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteOpenMode {
+    ReadOnly,
+    ReadWrite,
+    ReadWriteCreate,
+}
+
+impl SqliteOpenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SqliteOpenMode::ReadOnly => "ro",
+            SqliteOpenMode::ReadWrite => "rw",
+            SqliteOpenMode::ReadWriteCreate => "rwc",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ro" => Some(Self::ReadOnly),
+            "rw" => Some(Self::ReadWrite),
+            "rwc" => Some(Self::ReadWriteCreate),
+            _ => None,
+        }
+    }
+
+    pub fn is_read_only(self) -> bool {
+        self == Self::ReadOnly
+    }
+
+    pub fn creates_missing_file(self) -> bool {
+        self == Self::ReadWriteCreate
+    }
+
+    pub fn to_index(self) -> usize {
+        match self {
+            SqliteOpenMode::ReadWrite => 0,
+            SqliteOpenMode::ReadOnly => 1,
+            SqliteOpenMode::ReadWriteCreate => 2,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        match index % 3 {
+            0 => SqliteOpenMode::ReadWrite,
+            1 => SqliteOpenMode::ReadOnly,
+            _ => SqliteOpenMode::ReadWriteCreate,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SqliteOpenMode::ReadWrite => "read/write",
+            SqliteOpenMode::ReadOnly => "read-only",
+            SqliteOpenMode::ReadWriteCreate => "create",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -338,6 +405,78 @@ fn default_port() -> u16 {
     5432
 }
 
+pub fn parse_sqlite_url(raw: &str) -> Result<SqliteUrlParts> {
+    let trimmed = raw.trim();
+    if matches!(trimmed, "sqlite::memory:" | "sqlite:///:memory:") {
+        return Ok(SqliteUrlParts {
+            uri: "sqlite::memory:".to_string(),
+            path: ":memory:".to_string(),
+            mode: SqliteOpenMode::ReadWriteCreate,
+            in_memory: true,
+        });
+    }
+
+    if !trimmed.starts_with("sqlite://") {
+        return Err(anyhow!("SQLite URL must use sqlite:// scheme"));
+    }
+
+    let url = Url::parse(trimmed).context("Invalid SQLite URL format")?;
+    if url.scheme() != "sqlite" {
+        return Err(anyhow!("SQLite URL must use sqlite:// scheme"));
+    }
+
+    let mut mode = SqliteOpenMode::ReadWrite;
+    for (key, value) in url.query_pairs() {
+        if key.eq_ignore_ascii_case("mode") {
+            mode = SqliteOpenMode::parse(&value)
+                .ok_or_else(|| anyhow!("SQLite mode must be one of ro, rw, or rwc"))?;
+        }
+    }
+
+    let path = if url.host_str().is_none() {
+        let path = url.path();
+        if path.is_empty() {
+            return Err(anyhow!("SQLite URL must include a database path"));
+        }
+        path.to_string()
+    } else {
+        let host = url.host_str().unwrap_or_default();
+        let path = url.path().trim_start_matches('/');
+        if path.is_empty() {
+            host.to_string()
+        } else {
+            format!("{host}/{path}")
+        }
+    };
+
+    if path == ":memory:" {
+        return Ok(SqliteUrlParts {
+            uri: "sqlite::memory:".to_string(),
+            path,
+            mode: SqliteOpenMode::ReadWriteCreate,
+            in_memory: true,
+        });
+    }
+
+    if path.trim().is_empty() {
+        return Err(anyhow!("SQLite URL must include a database path"));
+    }
+
+    let uri_path = format!("sqlite://{path}");
+    let uri = if mode == SqliteOpenMode::ReadWrite {
+        uri_path
+    } else {
+        format!("{uri_path}?mode={}", mode.as_str())
+    };
+
+    Ok(SqliteUrlParts {
+        uri,
+        path,
+        mode,
+        in_memory: false,
+    })
+}
+
 impl Default for ConnectionEntry {
     fn default() -> Self {
         Self {
@@ -411,6 +550,13 @@ impl ConnectionEntry {
                 return sanitize_mongo_uri_fallback(uri);
             }
             return "mongodb://localhost".to_string();
+        }
+
+        if self.kind == DbKind::Sqlite {
+            return self
+                .uri
+                .clone()
+                .unwrap_or_else(|| "sqlite::memory:".to_string());
         }
 
         let mut url = "postgres://".to_string();
@@ -494,16 +640,57 @@ impl ConnectionEntry {
     ///
     /// Returns the entry and the password if one was found in the URL.
     pub fn from_url(name: &str, url_str: &str) -> Result<(Self, Option<String>)> {
+        if matches!(url_str.trim(), "sqlite::memory:" | "sqlite:///:memory:") {
+            let parsed = parse_sqlite_url(url_str)?;
+            let entry = ConnectionEntry {
+                kind: DbKind::Sqlite,
+                name: name.to_string(),
+                uri: Some(parsed.uri),
+                host: parsed.path.clone(),
+                port: 0,
+                database: parsed.path,
+                user: String::new(),
+                no_password_required: true,
+                ..Default::default()
+            };
+            return Ok((entry, None));
+        }
+
         let url = Url::parse(url_str).context("Invalid URL format")?;
         let kind = match url.scheme() {
             "postgres" | "postgresql" => DbKind::Postgres,
             "mongodb" | "mongodb+srv" => DbKind::Mongo,
+            "sqlite" => DbKind::Sqlite,
             _ => {
                 return Err(anyhow!(
-                    "URL must use postgres://, postgresql://, mongodb://, or mongodb+srv:// scheme"
+                    "URL must use postgres://, postgresql://, mongodb://, mongodb+srv://, or sqlite:// scheme"
                 ))
             }
         };
+
+        if kind == DbKind::Sqlite {
+            let parsed = parse_sqlite_url(url_str)?;
+            let entry = ConnectionEntry {
+                kind,
+                name: name.to_string(),
+                uri: Some(parsed.uri),
+                host: parsed.path.clone(),
+                port: 0,
+                database: parsed.path,
+                user: String::new(),
+                password_in_keychain: false,
+                password_env: None,
+                password_onepassword: None,
+                no_password_required: true,
+                color: ConnectionColor::None,
+                favorite: None,
+                ssl_mode: None,
+                application_name: None,
+                connect_timeout_secs: None,
+                ..Default::default()
+            };
+            return Ok((entry, None));
+        }
 
         let host = url
             .host_str()
@@ -513,6 +700,7 @@ impl ConnectionEntry {
         let port = match kind {
             DbKind::Postgres => url.port().unwrap_or(5432),
             DbKind::Mongo => url.port().unwrap_or(27017),
+            DbKind::Sqlite => 0,
         };
 
         let database = url.path().trim_start_matches('/').to_string();
@@ -526,6 +714,7 @@ impl ConnectionEntry {
                     .or_else(|_| std::env::var("USERNAME"))
                     .unwrap_or_else(|_| "postgres".to_string()),
                 DbKind::Mongo => String::new(),
+                DbKind::Sqlite => String::new(),
             }
         } else {
             urlencoding::decode(url.username())
@@ -896,6 +1085,12 @@ impl ConnectionEntry {
             }
             return sanitize_mongo_uri_fallback(uri);
         }
+        if self.kind == DbKind::Sqlite {
+            return self
+                .uri
+                .clone()
+                .unwrap_or_else(|| "sqlite::memory:".to_string());
+        }
         format!(
             "{}@{}:{}/{}",
             self.user, self.host, self.port, self.database
@@ -922,6 +1117,16 @@ impl ConnectionEntry {
             // `user:password@` so a malformed-but-credential-bearing
             // URI doesn't end up on screen verbatim.
             return sanitize_mongo_uri_fallback(&uri);
+        }
+        if self.kind == DbKind::Sqlite {
+            let uri = self.uri.as_deref().unwrap_or("sqlite::memory:");
+            if uri == "sqlite::memory:" {
+                return uri.to_string();
+            }
+            if let Ok(parts) = parse_sqlite_url(uri) {
+                return format!("sqlite://{}", parts.path);
+            }
+            return uri.to_string();
         }
         if self.port == 5432 {
             format!("{}@{}/{}", self.user, self.host, self.database)
@@ -966,6 +1171,12 @@ impl ConnectionEntry {
                         "Mongo URI must use mongodb:// or mongodb+srv:// scheme"
                     ));
                 }
+            }
+            DbKind::Sqlite => {
+                let Some(uri) = self.uri.as_deref() else {
+                    return Err(anyhow!("SQLite connections require a URI"));
+                };
+                parse_sqlite_url(uri)?;
             }
         }
         if let Some(fav) = self.favorite {
@@ -2378,6 +2589,43 @@ user = "me"
         assert_eq!(entry.user, "");
         assert!(password.is_none());
         assert!(entry.uri.is_some());
+    }
+
+    #[test]
+    fn test_connection_from_url_sqlite_absolute_path() {
+        let (entry, password) = ConnectionEntry::from_url("local", "sqlite:///tmp/app.db").unwrap();
+        assert_eq!(entry.kind, DbKind::Sqlite);
+        assert_eq!(entry.uri.as_deref(), Some("sqlite:///tmp/app.db"));
+        assert_eq!(entry.host, "/tmp/app.db");
+        assert_eq!(entry.database, "/tmp/app.db");
+        assert_eq!(entry.port, 0);
+        assert_eq!(entry.user, "");
+        assert_eq!(password, None);
+        assert_eq!(entry.to_url(None), "sqlite:///tmp/app.db");
+    }
+
+    #[test]
+    fn test_connection_from_url_sqlite_relative_create_mode() {
+        let (entry, _) =
+            ConnectionEntry::from_url("local", "sqlite://data/app.db?mode=rwc").unwrap();
+        assert_eq!(entry.kind, DbKind::Sqlite);
+        assert_eq!(entry.uri.as_deref(), Some("sqlite://data/app.db?mode=rwc"));
+        assert_eq!(entry.short_display(), "sqlite://data/app.db");
+    }
+
+    #[test]
+    fn test_parse_sqlite_url_modes() {
+        let read_only = parse_sqlite_url("sqlite:///tmp/app.db?mode=ro").unwrap();
+        assert_eq!(read_only.mode, SqliteOpenMode::ReadOnly);
+        assert!(read_only.mode.is_read_only());
+
+        let create = parse_sqlite_url("sqlite://app.db?mode=rwc").unwrap();
+        assert_eq!(create.mode, SqliteOpenMode::ReadWriteCreate);
+        assert!(create.mode.creates_missing_file());
+
+        let memory = parse_sqlite_url("sqlite::memory:").unwrap();
+        assert!(memory.in_memory);
+        assert_eq!(memory.uri, "sqlite::memory:");
     }
 
     #[test]

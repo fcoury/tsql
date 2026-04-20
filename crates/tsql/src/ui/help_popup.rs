@@ -300,6 +300,7 @@ const SCHEMA_COMMANDS: HelpSection = HelpSection::new(
         KeyBinding::new(":show collections", "Mongo: list collections"),
         KeyBinding::new(":describe <collection>", "Mongo: describe collection"),
         KeyBinding::new(":use <database>", "Mongo: switch active database"),
+        KeyBinding::new("sqlite://... ?mode=rwc", "SQLite: create file if missing"),
         KeyBinding::new(":\\dt", "List tables"),
         KeyBinding::new(":\\d <table>", "Describe table"),
         KeyBinding::new(":\\dn", "List schemas"),

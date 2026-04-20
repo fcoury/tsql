@@ -410,6 +410,15 @@ Return a query that tsql can execute:
 - Keep response concise.",
             config.system_prompt_mongo.as_deref(),
         ),
+        Some(DbKind::Sqlite) => (
+            "You are a SQLite query assistant for tsql.
+Return a single SQLite query or statement block.
+- Prefer portable SQLite syntax.
+- Do not output markdown fences.
+- Keep response concise.
+- If request is ambiguous, choose a safe query and explain assumptions briefly.",
+            config.system_prompt_sqlite.as_deref(),
+        ),
         _ => (
             "You are a PostgreSQL query assistant for tsql.
 Return a single PostgreSQL query or statement block.
@@ -431,6 +440,7 @@ fn build_prompt(config: &AiConfig, context: &AiRequestContext) -> String {
 
     let engine = match context.db_kind {
         Some(DbKind::Mongo) => "mongo",
+        Some(DbKind::Sqlite) => "sqlite",
         _ => "postgres",
     };
     sections.push(format!("engine: {engine}"));

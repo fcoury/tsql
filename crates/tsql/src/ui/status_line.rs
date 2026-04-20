@@ -75,6 +75,9 @@ impl ConnectionInfo {
     /// - postgresql://user:pass@host:port/database
     /// - mongodb://user:pass@host:port/database?params
     /// - mongodb+srv://user:pass@host/database?params
+    /// - sqlite:///absolute/path.db
+    /// - sqlite://relative/path.db
+    /// - sqlite::memory:
     /// - host=localhost user=postgres dbname=mydb port=5432
     pub fn parse(conn_str: &str) -> Self {
         let mut info = ConnectionInfo::default();
@@ -83,6 +86,8 @@ impl ConnectionInfo {
             || conn_str.starts_with("postgresql://")
             || conn_str.starts_with("mongodb://")
             || conn_str.starts_with("mongodb+srv://")
+            || conn_str.starts_with("sqlite://")
+            || conn_str == "sqlite::memory:"
         {
             // URL format
             info.parse_url(conn_str);
@@ -101,6 +106,8 @@ impl ConnectionInfo {
             .or_else(|| conn_str.strip_prefix("postgresql://"))
             .or_else(|| conn_str.strip_prefix("mongodb://"))
             .or_else(|| conn_str.strip_prefix("mongodb+srv://"))
+            .or_else(|| conn_str.strip_prefix("sqlite://"))
+            .or_else(|| conn_str.strip_prefix("sqlite:"))
             .unwrap_or(conn_str);
 
         // Split off query params

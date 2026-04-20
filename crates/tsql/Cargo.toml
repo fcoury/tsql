@@ -28,6 +28,7 @@ serde.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-postgres-rustls-improved.workspace = true
+tokio-rusqlite.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 toml.workspace = true

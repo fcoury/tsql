@@ -20,6 +20,7 @@ ratatui = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tokio-postgres = "0.7"
 tokio-postgres-rustls-improved = "0.16"
+tokio-rusqlite = { version = "0.7", features = ["bundled", "column_decltype"] }
 rustls = "0.23.35"
 webpki-roots = "0.26"
 tui-textarea = { version = "0.7", features = ["search"] }

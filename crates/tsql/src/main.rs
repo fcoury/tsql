@@ -148,6 +148,7 @@ fn print_usage() {
     eprintln!("                    Connection URL or saved connection name");
     eprintln!("                    (e.g., postgres://user:pass@host:5432/dbname)");
     eprintln!("                    (or mongodb://user:pass@host:27017/dbname)");
+    eprintln!("                    (or sqlite:///path/to/database.db)");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -h, --help        Print this help message");
@@ -177,6 +178,8 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
     eprintln!("  tsql mongodb://localhost:27017/mydb");
+    eprintln!("  tsql sqlite:///tmp/app.db");
+    eprintln!("  tsql 'sqlite://app.db?mode=rwc'");
     eprintln!("  tsql -- -prod");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
     eprintln!("  tsql --debug-keys");
