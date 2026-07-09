@@ -1398,8 +1398,12 @@ pub struct DataGrid<'a> {
 
 impl<'a> Widget for DataGrid<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Build title with search info if active
-        let base_title = "Results (j/k rows, h/l cols, +/- resize, = fit/collapse, / search)";
+        // Build a concise title with search info if active.
+        let base_title = if self.focused {
+            " ● Results "
+        } else {
+            " Results "
+        };
         let title = if let Some(search_info) = self.state.search.match_info() {
             format!("{} {}", base_title, search_info)
         } else {
@@ -1414,6 +1418,13 @@ impl<'a> Widget for DataGrid<'a> {
 
         let block = Block::default()
             .title(title)
+            .title_style(if self.focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
             .borders(Borders::ALL)
             .border_style(border_style);
 

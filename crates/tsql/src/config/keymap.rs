@@ -33,6 +33,12 @@ pub enum Action {
     FocusQuery,
     FocusGrid,
     ToggleFocus,
+    FocusNext,
+    FocusPrevious,
+    FocusLeft,
+    FocusDown,
+    FocusUp,
+    FocusRight,
 
     // Editor actions
     DeleteChar,
@@ -132,6 +138,12 @@ impl Action {
             Action::FocusQuery => "Focus query editor",
             Action::FocusGrid => "Focus results grid",
             Action::ToggleFocus => "Toggle focus between panes",
+            Action::FocusNext => "Focus next pane",
+            Action::FocusPrevious => "Focus previous pane",
+            Action::FocusLeft => "Focus pane to the left",
+            Action::FocusDown => "Focus pane below",
+            Action::FocusUp => "Focus pane above",
+            Action::FocusRight => "Focus pane to the right",
             Action::DeleteChar => "Delete character",
             Action::DeleteWord => "Delete word",
             Action::DeleteLine => "Delete line",
@@ -170,7 +182,7 @@ impl Action {
             Action::Help => "Show help",
             Action::ShowHistory => "Show query history",
             Action::OpenAiAssistant => "Open AI query assistant",
-            Action::Refresh => "Refresh/re-run query",
+            Action::Refresh => "Refresh focused schema or last query",
             Action::Connect => "Connect to database",
             Action::Disconnect => "Disconnect from database",
             Action::Reconnect => "Reconnect to database",
@@ -220,6 +232,12 @@ impl FromStr for Action {
             "focus_query" => Ok(Action::FocusQuery),
             "focus_grid" => Ok(Action::FocusGrid),
             "toggle_focus" => Ok(Action::ToggleFocus),
+            "focus_next" => Ok(Action::FocusNext),
+            "focus_previous" => Ok(Action::FocusPrevious),
+            "focus_left" => Ok(Action::FocusLeft),
+            "focus_down" => Ok(Action::FocusDown),
+            "focus_up" => Ok(Action::FocusUp),
+            "focus_right" => Ok(Action::FocusRight),
 
             // Editor actions
             "delete_char" => Ok(Action::DeleteChar),
@@ -463,6 +481,33 @@ impl Keymap {
         &self.bindings
     }
 
+    fn bind_focus_cycle(&mut self) {
+        self.bind(
+            KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
+            Action::FocusNext,
+        );
+        self.bind(
+            KeyBinding::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Action::FocusPrevious,
+        );
+        // Some terminals report Shift+Tab as Tab with the Shift modifier.
+        self.bind(
+            KeyBinding::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            Action::FocusPrevious,
+        );
+    }
+
+    fn bind_directional_focus(&mut self, modifiers: KeyModifiers) {
+        for (key, action) in [
+            ('h', Action::FocusLeft),
+            ('j', Action::FocusDown),
+            ('k', Action::FocusUp),
+            ('l', Action::FocusRight),
+        ] {
+            self.bind(KeyBinding::new(KeyCode::Char(key), modifiers), action);
+        }
+    }
+
     /// Create the default keymap for grid navigation
     pub fn default_grid_keymap() -> Self {
         let mut km = Self::new();
@@ -605,10 +650,9 @@ impl Keymap {
         );
 
         // Focus
-        km.bind(
-            KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
-            Action::ToggleFocus,
-        );
+        km.bind_focus_cycle();
+        km.bind_directional_focus(KeyModifiers::CONTROL);
+        km.bind_directional_focus(KeyModifiers::ALT);
         km.bind(
             KeyBinding::new(KeyCode::Char('i'), KeyModifiers::NONE),
             Action::FocusQuery,
@@ -628,6 +672,10 @@ impl Keymap {
         km.bind(
             KeyBinding::new(KeyCode::Char(':'), KeyModifiers::NONE),
             Action::EnterCommandMode,
+        );
+        km.bind(
+            KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Action::Refresh,
         );
 
         // Sidebar
@@ -776,11 +824,10 @@ impl Keymap {
             Action::ExecuteQuery,
         );
 
-        // Focus grid
-        km.bind(
-            KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
-            Action::ToggleFocus,
-        );
+        // Pane focus
+        km.bind_focus_cycle();
+        km.bind_directional_focus(KeyModifiers::CONTROL);
+        km.bind_directional_focus(KeyModifiers::ALT);
         km.bind(
             KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
             Action::ToggleQueryHeight,
@@ -847,6 +894,7 @@ impl Keymap {
             KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
             Action::ToggleQueryHeight,
         );
+        km.bind_directional_focus(KeyModifiers::ALT);
 
         // Standard editing shortcuts
         km.bind(
@@ -913,6 +961,22 @@ impl Keymap {
             Action::ToggleSidebar,
         );
 
+        km
+    }
+
+    /// Create the default keymap for the query editor in visual mode.
+    pub fn default_editor_visual_keymap() -> Self {
+        let mut km = Self::new();
+        km.bind_directional_focus(KeyModifiers::ALT);
+        km
+    }
+
+    /// Create the default keymap for sidebar pane navigation.
+    pub fn default_sidebar_keymap() -> Self {
+        let mut km = Self::new();
+        km.bind_focus_cycle();
+        km.bind_directional_focus(KeyModifiers::CONTROL);
+        km.bind_directional_focus(KeyModifiers::ALT);
         km
     }
 
@@ -1022,6 +1086,19 @@ mod tests {
         // Query height toggle
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+
+        // Refresh the query backing the results grid
+        let ctrl_r = KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(km.get(&ctrl_r), Some(&Action::Refresh));
+
+        let tab = KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE);
+        let shift_tab = KeyBinding::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let ctrl_h = KeyBinding::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        let alt_l = KeyBinding::new(KeyCode::Char('l'), KeyModifiers::ALT);
+        assert_eq!(km.get(&tab), Some(&Action::FocusNext));
+        assert_eq!(km.get(&shift_tab), Some(&Action::FocusPrevious));
+        assert_eq!(km.get(&ctrl_h), Some(&Action::FocusLeft));
+        assert_eq!(km.get(&alt_l), Some(&Action::FocusRight));
     }
 
     #[test]
@@ -1033,6 +1110,11 @@ mod tests {
 
         let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
+
+        let alt_j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::ALT);
+        let ctrl_j = KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(km.get(&alt_j), Some(&Action::FocusDown));
+        assert_eq!(km.get(&ctrl_j), None);
     }
 
     #[test]
@@ -1044,6 +1126,29 @@ mod tests {
 
         let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
+
+        let tab = KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE);
+        let ctrl_k = KeyBinding::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let alt_k = KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT);
+        assert_eq!(km.get(&tab), Some(&Action::FocusNext));
+        assert_eq!(km.get(&ctrl_k), Some(&Action::FocusUp));
+        assert_eq!(km.get(&alt_k), Some(&Action::FocusUp));
+    }
+
+    #[test]
+    fn test_visual_and_sidebar_focus_keymaps() {
+        let visual = Keymap::default_editor_visual_keymap();
+        let sidebar = Keymap::default_sidebar_keymap();
+
+        let tab = KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE);
+        let alt_h = KeyBinding::new(KeyCode::Char('h'), KeyModifiers::ALT);
+        let ctrl_l = KeyBinding::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+
+        assert_eq!(visual.get(&alt_h), Some(&Action::FocusLeft));
+        assert_eq!(visual.get(&ctrl_l), None);
+        assert_eq!(sidebar.get(&tab), Some(&Action::FocusNext));
+        assert_eq!(sidebar.get(&alt_h), Some(&Action::FocusLeft));
+        assert_eq!(sidebar.get(&ctrl_l), Some(&Action::FocusRight));
     }
 
     #[test]
@@ -1090,6 +1195,15 @@ mod tests {
             "open_ai_assistant".parse::<Action>().unwrap(),
             Action::OpenAiAssistant
         );
+        assert_eq!("focus_next".parse::<Action>().unwrap(), Action::FocusNext);
+        assert_eq!(
+            "focus_previous".parse::<Action>().unwrap(),
+            Action::FocusPrevious
+        );
+        assert_eq!("focus_left".parse::<Action>().unwrap(), Action::FocusLeft);
+        assert_eq!("focus_down".parse::<Action>().unwrap(), Action::FocusDown);
+        assert_eq!("focus_up".parse::<Action>().unwrap(), Action::FocusUp);
+        assert_eq!("focus_right".parse::<Action>().unwrap(), Action::FocusRight);
     }
 
     #[test]

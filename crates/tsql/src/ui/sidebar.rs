@@ -113,9 +113,21 @@ impl Sidebar {
             Style::default().fg(Color::DarkGray)
         };
 
+        let title = if focused {
+            " ● Connections "
+        } else {
+            " Connections "
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Connections ")
+            .title(title)
+            .title_style(if focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
             .border_style(border_style);
 
         let sorted = connections.sorted();
@@ -193,9 +205,17 @@ impl Sidebar {
             Style::default().fg(Color::DarkGray)
         };
 
+        let title = if focused { " ● Schema " } else { " Schema " };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Schema ")
+            .title(title)
+            .title_style(if focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
             .border_style(border_style);
 
         // Handle loading state

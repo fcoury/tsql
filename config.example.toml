@@ -216,6 +216,16 @@ vim_mode = true
 # action = "export_csv"
 # description = "Export results to CSV"
 
+# Custom keybindings for sidebar navigation
+# [[keymap.sidebar]]
+# key = "alt+n"
+# action = "focus_next"
+# description = "Focus the next pane"
+
+# Pane navigation actions can be used in normal, insert, visual, grid, and
+# sidebar keymaps: focus_next, focus_previous, focus_left, focus_down,
+# focus_up, and focus_right.
+
 # Custom keybindings for connection form (add/edit connection modal)
 # Default save key is Ctrl+S. If you have Ctrl+S mapped to something else
 # (e.g., in tmux), you can remap the save action to another key.

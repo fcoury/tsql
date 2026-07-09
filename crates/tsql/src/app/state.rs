@@ -13,7 +13,18 @@ pub enum Focus {
     Sidebar(SidebarSection),
 }
 
-/// Direction for panel navigation (Ctrl+HJKL)
+impl Focus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Focus::Query => "QUERY",
+            Focus::Grid => "RESULTS",
+            Focus::Sidebar(SidebarSection::Connections) => "CONNECTIONS",
+            Focus::Sidebar(SidebarSection::Schema) => "SCHEMA",
+        }
+    }
+}
+
+/// Direction for spatial pane navigation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelDirection {
     Left,
@@ -27,6 +38,16 @@ pub enum Mode {
     Normal,
     Insert,
     Visual,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Visual => "VISUAL",
+        }
+    }
 }
 
 /// Target for the search prompt.

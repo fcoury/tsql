@@ -75,7 +75,12 @@ pub struct HelpPopup {
 const GLOBAL: HelpSection = HelpSection::new(
     "Global",
     &[
-        KeyBinding::new("Tab", "Switch focus (Query/Grid)"),
+        KeyBinding::new(
+            "Tab / Shift-Tab",
+            "Cycle panes clockwise / counter-clockwise (Normal)",
+        ),
+        KeyBinding::new("Ctrl-h/j/k/l", "Move between panes in Normal mode"),
+        KeyBinding::new("Alt-h/j/k/l", "Move between panes in any mode"),
         KeyBinding::new("Alt+M", "Toggle query pane height (min/max)"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
@@ -86,7 +91,7 @@ const GLOBAL: HelpSection = HelpSection::new(
             "Open connection manager (terminal-dependent)",
         ),
         KeyBinding::new("Ctrl+g", "Open AI query assistant"),
-        KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
+        KeyBinding::new("Ctrl+\\", "Toggle sidebar visibility"),
     ],
 );
 
@@ -138,12 +143,12 @@ const SIDEBAR_SCHEMA: HelpSection = HelpSection::new(
         KeyBinding::new("Space", "Toggle node expand/collapse"),
         KeyBinding::new("Enter (schema)", "Toggle schema expand/collapse"),
         KeyBinding::new("Enter (column)", "Insert column name"),
-        KeyBinding::new("Enter (table) then s", "Insert SELECT template"),
-        KeyBinding::new("Enter (table) then i", "Insert INSERT template"),
-        KeyBinding::new("Enter (table) then u", "Insert UPDATE template"),
-        KeyBinding::new("Enter (table) then d", "Insert DELETE template"),
+        KeyBinding::new("Enter (table) then s", "Replace with SELECT template"),
+        KeyBinding::new("Enter (table) then i", "Replace with INSERT template"),
+        KeyBinding::new("Enter (table) then u", "Replace with UPDATE template"),
+        KeyBinding::new("Enter (table) then d", "Replace with DELETE template"),
         KeyBinding::new("Enter (table) then n", "Insert table name"),
-        KeyBinding::new("r", "Refresh schema"),
+        KeyBinding::new("r / Ctrl-r", "Refresh schema"),
     ],
 );
 
@@ -243,6 +248,7 @@ const GRID_ACTIONS: HelpSection = HelpSection::new(
         KeyBinding::new("o", "Open row detail view"),
         KeyBinding::new("/", "Search in results"),
         KeyBinding::new("n/N", "Next/previous match"),
+        KeyBinding::new("Ctrl-r", "Rerun last query"),
     ],
 );
 
@@ -284,6 +290,7 @@ const COMMANDS: HelpSection = HelpSection::new(
             "Import saved connections (+ --overwrite/--skip/--rename)",
         ),
         KeyBinding::new(":update [check|status|apply]", "Check/apply updates"),
+        KeyBinding::new(":refresh", "Refresh focused schema or last query"),
         KeyBinding::new(":sbt / :sidebar-toggle", "Toggle sidebar"),
         KeyBinding::new(":q / :quit", "Quit application"),
         KeyBinding::new(":help / :?", "Show this help"),

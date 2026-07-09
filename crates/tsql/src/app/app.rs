@@ -793,7 +793,9 @@ impl PagedQueryState {
 
 /// Default page size for cursor-based queries.
 const DEFAULT_PAGE_SIZE: usize = 500;
-const REGULAR_QUERY_HEIGHT: u16 = 7;
+const MIN_QUERY_HEIGHT: u16 = 7;
+const MAX_DEFAULT_QUERY_HEIGHT: u16 = 12;
+const DEFAULT_QUERY_HEIGHT_RATIO_DENOM: u16 = 4; // 25%
 const STATUS_HEIGHT: u16 = 1;
 const MIN_GRID_HEIGHT: u16 = 3;
 const QUERY_BORDER_ROWS: u16 = 2;
@@ -855,7 +857,11 @@ fn compute_query_panel_height(
         }
     };
 
-    let regular_height = REGULAR_QUERY_HEIGHT.min(layout_safe_max);
+    // Use more of a tall display by default, while keeping the query pane
+    // compact and leaving most of the screen available for results.
+    let responsive_default = (main_height / DEFAULT_QUERY_HEIGHT_RATIO_DENOM)
+        .clamp(MIN_QUERY_HEIGHT, MAX_DEFAULT_QUERY_HEIGHT);
+    let regular_height = responsive_default.min(layout_safe_max);
 
     let ratio_cap = (main_height / QUERY_EXPANDED_MAX_RATIO_DENOM)
         .max(1)
@@ -2130,6 +2136,10 @@ pub enum DbEvent {
         tables: Vec<TableInfo>,
         source_database: Option<String>,
     },
+    SchemaLoadError {
+        error: String,
+        source_database: Option<String>,
+    },
     /// A cell was successfully updated.
     CellUpdated {
         row: usize,
@@ -2429,6 +2439,10 @@ pub struct App {
     pub editor_normal_keymap: Keymap,
     /// Keymap for editor in insert mode
     pub editor_insert_keymap: Keymap,
+    /// Keymap for editor in visual mode
+    pub editor_visual_keymap: Keymap,
+    /// Keymap for sidebar navigation
+    pub sidebar_keymap: Keymap,
     /// Keymap for connection form
     pub connection_form_keymap: Keymap,
 
@@ -2454,6 +2468,10 @@ pub struct App {
 
     /// State for paged/streaming query using server-side cursor.
     pub paged_query: Option<PagedQueryState>,
+    /// Last editor query dispatched on the current database connection.
+    last_executed_query: Option<String>,
+    /// How the active editor query was started, used when applying its result.
+    active_query_kind: Option<QueryExecutionKind>,
 
     pub grid: GridModel,
     pub grid_state: GridState,
@@ -2582,6 +2600,12 @@ enum QueryHeightMode {
     Maximized,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryExecutionKind {
+    New,
+    Refresh,
+}
+
 /// Groups spinner and timing state for query execution UI.
 /// Keeps the large App struct more maintainable.
 #[derive(Default)]
@@ -2651,6 +2675,8 @@ impl App {
         let grid_keymap = Self::build_grid_keymap(&config);
         let editor_normal_keymap = Self::build_editor_normal_keymap(&config);
         let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
+        let editor_visual_keymap = Self::build_editor_visual_keymap(&config);
+        let sidebar_keymap = Self::build_sidebar_keymap(&config);
         let connection_form_keymap = Self::build_connection_form_keymap(&config);
         let key_sequence_timeout_ms = config.keymap.key_sequence_timeout_ms;
 
@@ -2663,6 +2689,8 @@ impl App {
             grid_keymap,
             editor_normal_keymap,
             editor_insert_keymap,
+            editor_visual_keymap,
+            sidebar_keymap,
             connection_form_keymap,
 
             editor,
@@ -2682,6 +2710,8 @@ impl App {
             db_events_rx,
             db: DbSession::new(),
             paged_query: None,
+            last_executed_query: None,
+            active_query_kind: None,
 
             grid,
             grid_state: GridState::default(),
@@ -2870,6 +2900,36 @@ impl App {
         keymap
     }
 
+    /// Build the editor visual mode keymap from defaults + config overrides
+    fn build_editor_visual_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_editor_visual_keymap();
+
+        for binding in &config.keymap.visual {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
+    }
+
+    /// Build the sidebar keymap from defaults + config overrides
+    fn build_sidebar_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_sidebar_keymap();
+
+        for binding in &config.keymap.sidebar {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
+
+        keymap
+    }
+
     /// Build the connection form keymap from defaults + config overrides
     fn build_connection_form_keymap(config: &Config) -> Keymap {
         let mut keymap = Keymap::default_connection_form_keymap();
@@ -3023,31 +3083,20 @@ impl App {
                 } else {
                     ""
                 };
-                let query_title = match (self.focus, self.mode) {
-                    (Focus::Query, Mode::Normal) => {
-                        format!(
-                            "Query [NORMAL]{} (i insert, Enter run, Ctrl-r history, Tab to grid)",
-                            modified_indicator
-                        )
-                    }
-                    (Focus::Query, Mode::Insert) => {
-                        format!(
-                            "Query [INSERT]{} (Esc normal, Ctrl-r history)",
-                            modified_indicator
-                        )
-                    }
-                    (Focus::Query, Mode::Visual) => {
-                        format!(
-                            "Query [VISUAL]{} (y yank, d delete, Esc cancel)",
-                            modified_indicator
-                        )
-                    }
-                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => "Query (Tab to focus)".to_string(),
+                let query_title = if self.focus == Focus::Query {
+                    format!(" ● Query [{}]{} ", self.mode.label(), modified_indicator)
+                } else {
+                    format!(" Query{} ", modified_indicator)
                 };
 
                 let query_block = Block::default()
                     .borders(Borders::ALL)
                     .title(query_title.as_str())
+                    .title_style(if self.focus == Focus::Query {
+                        query_border.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    })
                     .border_style(query_border);
 
                 // Choose cursor shape based on vim mode
@@ -3970,6 +4019,13 @@ impl App {
             }
         }
 
+        // Pane navigation is configurable per input context and runs before
+        // pane-specific editing/navigation handlers.
+        if let Some(action) = self.focus_navigation_action(&key) {
+            self.handle_focus_action(action);
+            return false;
+        }
+
         // Global keys are only active in Normal mode.
         if self.mode == Mode::Normal {
             match (key.code, key.modifiers) {
@@ -4011,46 +4067,6 @@ impl App {
                     }
                     return false;
                 }
-                (KeyCode::Tab, KeyModifiers::NONE) => {
-                    self.focus = match self.focus {
-                        Focus::Query => Focus::Grid,
-                        Focus::Grid => {
-                            if self.sidebar_visible {
-                                self.sidebar_focus = SidebarSection::Connections;
-                                Focus::Sidebar(SidebarSection::Connections)
-                            } else {
-                                Focus::Query
-                            }
-                        }
-                        Focus::Sidebar(SidebarSection::Connections) => {
-                            self.sidebar_focus = SidebarSection::Schema;
-                            self.sidebar.select_first_schema_if_empty();
-                            Focus::Sidebar(SidebarSection::Schema)
-                        }
-                        Focus::Sidebar(SidebarSection::Schema) => Focus::Query,
-                    };
-                    return false;
-                }
-                (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
-                    self.focus = match self.focus {
-                        Focus::Query => {
-                            if self.sidebar_visible {
-                                self.sidebar_focus = SidebarSection::Schema;
-                                self.sidebar.select_first_schema_if_empty();
-                                Focus::Sidebar(SidebarSection::Schema)
-                            } else {
-                                Focus::Grid
-                            }
-                        }
-                        Focus::Grid => Focus::Query,
-                        Focus::Sidebar(SidebarSection::Schema) => {
-                            self.sidebar_focus = SidebarSection::Connections;
-                            Focus::Sidebar(SidebarSection::Connections)
-                        }
-                        Focus::Sidebar(SidebarSection::Connections) => Focus::Grid,
-                    };
-                    return false;
-                }
                 // Ctrl+\ (and terminals that report it as Ctrl+4): Toggle sidebar
                 (KeyCode::Char('\\') | KeyCode::Char('4'), modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL) =>
@@ -4066,12 +4082,6 @@ impl App {
                 {
                     self.toggle_sidebar();
                     return false;
-                }
-                // Ctrl+HJKL: Directional panel navigation
-                (KeyCode::Char('h' | 'j' | 'k' | 'l'), KeyModifiers::CONTROL) => {
-                    if self.handle_panel_navigation(&key) {
-                        return false;
-                    }
                 }
                 _ => {}
             }
@@ -4112,11 +4122,11 @@ impl App {
                         // Handle special actions at the App level
                         match action {
                             Action::ToggleFocus => {
-                                self.focus = Focus::Query;
+                                self.focus_next();
                                 GridKeyResult::None
                             }
                             Action::FocusQuery => {
-                                self.focus = Focus::Query;
+                                self.set_focus(Focus::Query);
                                 self.mode = Mode::Insert;
                                 GridKeyResult::None
                             }
@@ -4131,6 +4141,10 @@ impl App {
                                 self.toggle_sidebar();
                                 GridKeyResult::None
                             }
+                            Action::Refresh => {
+                                self.refresh_focused();
+                                GridKeyResult::None
+                            }
                             // Goto navigation (custom keybindings for navigation)
                             Action::GotoFirst => {
                                 // In grid context, go to first row
@@ -4138,13 +4152,11 @@ impl App {
                                 GridKeyResult::None
                             }
                             Action::GotoEditor => {
-                                self.focus = Focus::Query;
+                                self.set_focus(Focus::Query);
                                 GridKeyResult::None
                             }
                             Action::GotoConnections => {
-                                self.sidebar_visible = true;
-                                self.sidebar_focus = SidebarSection::Connections;
-                                self.focus = Focus::Sidebar(SidebarSection::Connections);
+                                self.set_focus(Focus::Sidebar(SidebarSection::Connections));
                                 GridKeyResult::None
                             }
                             Action::GotoTables => {
@@ -4153,7 +4165,7 @@ impl App {
                             }
                             Action::GotoResults => {
                                 // Already in grid, this is a no-op but keep focus
-                                self.focus = Focus::Grid;
+                                self.set_focus(Focus::Grid);
                                 GridKeyResult::None
                             }
                             _ => {
@@ -4221,54 +4233,140 @@ impl App {
         false
     }
 
-    /// Handle directional panel navigation (Ctrl+HJKL).
-    /// Returns true if a navigation key was handled (even if no-op).
-    fn handle_panel_navigation(&mut self, key: &KeyEvent) -> bool {
-        // Only handle Ctrl+HJKL
-        if key.modifiers != KeyModifiers::CONTROL {
-            return false;
-        }
+    fn focus_navigation_action(&self, key: &KeyEvent) -> Option<Action> {
+        let action = match self.focus {
+            Focus::Query => match self.mode {
+                Mode::Normal => self.editor_normal_keymap.get_action(key),
+                Mode::Insert => self.editor_insert_keymap.get_action(key),
+                Mode::Visual => self.editor_visual_keymap.get_action(key),
+            },
+            Focus::Grid => self.grid_keymap.get_action(key),
+            Focus::Sidebar(_) => self.sidebar_keymap.get_action(key),
+        }?;
 
-        let direction = match key.code {
-            KeyCode::Char('h') => PanelDirection::Left,
-            KeyCode::Char('j') => PanelDirection::Down,
-            KeyCode::Char('k') => PanelDirection::Up,
-            KeyCode::Char('l') => PanelDirection::Right,
-            _ => return false,
-        };
-
-        // Calculate new focus based on direction and current state
-        let new_focus = self.calculate_focus_for_direction(direction);
-
-        if let Some(focus) = new_focus {
-            self.focus = focus;
-            // Update sidebar focus if moving to sidebar
-            if let Focus::Sidebar(section) = focus {
-                self.sidebar_focus = section;
-            }
-        }
-
-        true // Key was handled (even if no-op)
+        matches!(
+            action,
+            Action::ToggleFocus
+                | Action::FocusNext
+                | Action::FocusPrevious
+                | Action::FocusLeft
+                | Action::FocusDown
+                | Action::FocusUp
+                | Action::FocusRight
+        )
+        .then_some(action)
     }
 
-    /// Calculate the target focus for a given direction.
-    /// Returns None if there is no panel in that direction (boundary/no-op).
-    fn calculate_focus_for_direction(&self, direction: PanelDirection) -> Option<Focus> {
-        // If sidebar hidden, Ctrl+H/L do nothing
-        if !self.sidebar_visible
-            && matches!(direction, PanelDirection::Left | PanelDirection::Right)
-        {
-            return None;
+    fn handle_focus_action(&mut self, action: Action) {
+        match action {
+            Action::ToggleFocus | Action::FocusNext => self.focus_next(),
+            Action::FocusPrevious => self.focus_previous(),
+            Action::FocusLeft => self.focus_direction(PanelDirection::Left),
+            Action::FocusDown => self.focus_direction(PanelDirection::Down),
+            Action::FocusUp => self.focus_direction(PanelDirection::Up),
+            Action::FocusRight => self.focus_direction(PanelDirection::Right),
+            _ => {}
+        }
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        if self.focus == Focus::Query && focus != Focus::Query {
+            if self.editor.textarea.is_selecting() {
+                self.editor.textarea.cancel_selection();
+            }
+            self.mode = Mode::Normal;
         }
 
-        // Navigation is spatially precise based on vertical alignment:
+        match focus {
+            Focus::Sidebar(SidebarSection::Connections) => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Connections;
+                if self.sidebar.connections_state.selected().is_none() {
+                    self.sidebar.select_first_connection();
+                }
+            }
+            Focus::Sidebar(SidebarSection::Schema) => {
+                self.sidebar_visible = true;
+                self.sidebar_focus = SidebarSection::Schema;
+                self.select_first_schema_if_empty();
+            }
+            Focus::Query | Focus::Grid => {}
+        }
+
+        self.focus = focus;
+    }
+
+    fn select_first_schema_if_empty(&mut self) {
+        if !self.sidebar.schema_state.selected().is_empty() {
+            return;
+        }
+
+        let schema_items = self.schema_cache.build_tree_items();
+        if let Some(first) = schema_items.first() {
+            self.sidebar
+                .schema_state
+                .select(vec![first.identifier().clone()]);
+            self.pending_schema_select_first = false;
+        } else {
+            self.pending_schema_select_first = true;
+        }
+    }
+
+    fn focus_next(&mut self) {
+        let next = if self.sidebar_visible {
+            match self.focus {
+                Focus::Query => Focus::Grid,
+                Focus::Grid => Focus::Sidebar(SidebarSection::Schema),
+                Focus::Sidebar(SidebarSection::Schema) => {
+                    Focus::Sidebar(SidebarSection::Connections)
+                }
+                Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+            }
+        } else {
+            match self.focus {
+                Focus::Query | Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
+                Focus::Grid | Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+            }
+        };
+        self.set_focus(next);
+    }
+
+    fn focus_previous(&mut self) {
+        let previous = if self.sidebar_visible {
+            match self.focus {
+                Focus::Query => Focus::Sidebar(SidebarSection::Connections),
+                Focus::Sidebar(SidebarSection::Connections) => {
+                    Focus::Sidebar(SidebarSection::Schema)
+                }
+                Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
+                Focus::Grid => Focus::Query,
+            }
+        } else {
+            match self.focus {
+                Focus::Query | Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
+                Focus::Grid | Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+            }
+        };
+        self.set_focus(previous);
+    }
+
+    fn focus_direction(&mut self, direction: PanelDirection) {
+        if let Some(focus) = self.calculate_focus_for_direction(direction) {
+            self.set_focus(focus);
+        }
+    }
+
+    /// Calculate the spatially adjacent pane, or None at a boundary.
+    fn calculate_focus_for_direction(&self, direction: PanelDirection) -> Option<Focus> {
+        // Navigation follows the visible 2x2 layout. set_focus reveals the sidebar
+        // when a leftward move targets one of its panes.
         // ┌─────────────────┬──────────────────┐
         // │  Connections    │  Query Editor    │  ← Top row
         // ├─────────────────┼──────────────────┤
         // │  Schema         │  Results Grid    │  ← Bottom row
         // └─────────────────┴──────────────────┘
 
-        match (&self.focus, direction) {
+        match (self.focus, direction) {
             // From Query (top-right) - aligned with Connections
             (Focus::Query, PanelDirection::Left) => {
                 Some(Focus::Sidebar(SidebarSection::Connections))
@@ -4340,8 +4438,7 @@ impl App {
                 // Check if at top of schema tree - if so, move to connections section
                 let at_top = self.sidebar.schema_state.selected().is_empty();
                 if at_top {
-                    self.sidebar_focus = SidebarSection::Connections;
-                    self.focus = Focus::Sidebar(SidebarSection::Connections);
+                    self.set_focus(Focus::Sidebar(SidebarSection::Connections));
                 } else {
                     self.sidebar.schema_up();
                 }
@@ -4377,7 +4474,7 @@ impl App {
                     SchemaTreeSelection::Column { column, .. } => {
                         // Column node: preserve existing behavior (insert column name)
                         self.editor.textarea.insert_str(&column);
-                        self.focus = Focus::Query;
+                        self.set_focus(Focus::Query);
                         self.mode = Mode::Insert;
                     }
                     SchemaTreeSelection::Unknown { raw } => {
@@ -4387,7 +4484,7 @@ impl App {
                             .map(|(_, name)| name.to_string())
                             .unwrap_or(raw);
                         self.editor.textarea.insert_str(&insert_name);
-                        self.focus = Focus::Query;
+                        self.set_focus(Focus::Query);
                         self.mode = Mode::Insert;
                     }
                 }
@@ -4396,9 +4493,13 @@ impl App {
             (KeyCode::Char(' '), KeyModifiers::NONE, SidebarSection::Schema) => {
                 self.sidebar.schema_toggle();
             }
-            // 'r' to refresh schema
-            (KeyCode::Char('r'), KeyModifiers::NONE, SidebarSection::Schema) => {
-                self.load_schema();
+            // Refresh schema without changing focus or tree state.
+            (
+                KeyCode::Char('r'),
+                KeyModifiers::NONE | KeyModifiers::CONTROL,
+                SidebarSection::Schema,
+            ) => {
+                self.refresh_focused();
             }
 
             // ':' opens the command prompt from any sidebar section
@@ -4406,9 +4507,9 @@ impl App {
                 self.command.open();
             }
 
-            // Tab or Escape to leave sidebar
-            (KeyCode::Tab, KeyModifiers::NONE, _) | (KeyCode::Esc, KeyModifiers::NONE, _) => {
-                self.focus = Focus::Query;
+            // Escape returns to the query editor; Tab is handled by pane cycling.
+            (KeyCode::Esc, KeyModifiers::NONE, _) => {
+                self.set_focus(Focus::Query);
             }
 
             _ => {}
@@ -4535,11 +4636,7 @@ impl App {
 
                     // Update focus to sidebar if a section was clicked
                     if let Some(section) = section {
-                        self.focus = Focus::Sidebar(section);
-                        self.sidebar_focus = section;
-                        if section == SidebarSection::Schema {
-                            self.sidebar.select_first_schema_if_empty();
-                        }
+                        self.set_focus(Focus::Sidebar(section));
                     }
 
                     // Handle any action from the sidebar
@@ -4578,7 +4675,7 @@ impl App {
             {
                 // Click in query editor - focus it
                 if self.focus != Focus::Query {
-                    self.focus = Focus::Query;
+                    self.set_focus(Focus::Query);
                     self.mode = Mode::Normal;
                 }
                 self.last_grid_click = None;
@@ -4595,8 +4692,7 @@ impl App {
             {
                 // Click in grid - focus it and try to select the row
                 if self.focus != Focus::Grid {
-                    self.focus = Focus::Grid;
-                    self.mode = Mode::Normal;
+                    self.set_focus(Focus::Grid);
                 }
 
                 if let Some(target) = grid_mouse_target(
@@ -4706,15 +4802,17 @@ impl App {
         }
     }
 
-    /// Toggle the sidebar: hide it (moving focus to Query if needed) or open it to the Schema section.
+    /// Toggle sidebar visibility without stealing focus when opening it.
     fn toggle_sidebar(&mut self) {
         if self.sidebar_visible {
             self.sidebar_visible = false;
-            if matches!(self.focus, Focus::Sidebar(_)) {
-                self.focus = Focus::Query;
+            match self.focus {
+                Focus::Sidebar(SidebarSection::Connections) => self.set_focus(Focus::Query),
+                Focus::Sidebar(SidebarSection::Schema) => self.set_focus(Focus::Grid),
+                Focus::Query | Focus::Grid => {}
             }
         } else {
-            self.focus_schema();
+            self.sidebar_visible = true;
         }
     }
 
@@ -4732,23 +4830,7 @@ impl App {
 
     /// Focus on the Schema section of the sidebar, ensuring first item is selected
     fn focus_schema(&mut self) {
-        self.sidebar_visible = true;
-        self.sidebar_focus = SidebarSection::Schema;
-        self.focus = Focus::Sidebar(SidebarSection::Schema);
-
-        // TreeState::select_first relies on a previous render, so when opening the sidebar
-        // we select the first schema item directly from the current schema cache if possible.
-        if self.sidebar.schema_state.selected().is_empty() {
-            let schema_items = self.schema_cache.build_tree_items();
-            if let Some(first) = schema_items.first() {
-                self.sidebar
-                    .schema_state
-                    .select(vec![first.identifier().clone()]);
-                self.pending_schema_select_first = false;
-            } else {
-                self.pending_schema_select_first = true;
-            }
-        }
+        self.set_focus(Focus::Sidebar(SidebarSection::Schema));
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> bool {
@@ -5004,6 +5086,10 @@ impl App {
                 self.open_ai_modal(prefill);
                 false
             }
+            ConfirmContext::ReplaceQuery { query } => {
+                self.replace_editor_with_schema_template(query);
+                false
+            }
         }
     }
 
@@ -5039,6 +5125,9 @@ impl App {
             }
             ConfirmContext::OpenAiAssistant { .. } => {
                 self.last_status = Some("AI assistant open cancelled".to_string());
+            }
+            ConfirmContext::ReplaceQuery { .. } => {
+                self.last_status = Some("Query replacement cancelled".to_string());
             }
         }
     }
@@ -5674,6 +5763,8 @@ impl App {
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
+                self.last_executed_query = None;
+                self.active_query_kind = None;
                 self.current_connection_name = None;
                 self.active_connection_name = None;
                 self.query_ui.clear();
@@ -5726,6 +5817,8 @@ impl App {
                     self.last_status = Some("Usage: :use <database>".to_string());
                 } else {
                     self.db.mongo_database = Some(args.to_string());
+                    self.last_executed_query = None;
+                    self.active_query_kind = None;
                     self.last_status = Some(format!("Switched to Mongo database '{}'", args));
                     self.load_schema();
                 }
@@ -5808,6 +5901,9 @@ impl App {
             }
             "history" => {
                 self.open_history_picker();
+            }
+            "refresh" => {
+                self.refresh_focused();
             }
             "ai" => {
                 let prefill = if args.is_empty() {
@@ -5988,7 +6084,7 @@ impl App {
     fn open_ai_modal(&mut self, prefill: Option<String>) {
         self.ai_modal_previous_mode = Some(self.mode);
         self.ai_modal = Some(AiQueryModal::new(prefill));
-        self.focus = Focus::Query;
+        self.set_focus(Focus::Query);
         self.mode = Mode::Insert;
         self.last_status = Some("AI assistant opened".to_string());
     }
@@ -6060,7 +6156,7 @@ impl App {
                 };
 
                 self.editor.set_text(query.to_string());
-                self.focus = Focus::Query;
+                self.set_focus(Focus::Query);
                 self.mode = Mode::Insert;
                 self.ai_modal = None;
                 self.ai_modal_previous_mode = None;
@@ -6359,7 +6455,7 @@ impl App {
         };
 
         self.grid_state.cursor_row = target_row;
-        self.focus = Focus::Grid;
+        self.set_focus(Focus::Grid);
         self.last_status = Some(format!(
             "Row {} of {}",
             target_row + 1,
@@ -6868,7 +6964,7 @@ impl App {
             self.editor.textarea.select_all();
             self.editor.textarea.cut();
             self.editor.textarea.insert_str(&generated);
-            self.focus = Focus::Query;
+            self.set_focus(Focus::Query);
             self.mode = Mode::Normal;
             self.last_status = Some(format!(
                 "Generated {} Mongo command statement{}{}",
@@ -6918,7 +7014,7 @@ impl App {
         self.editor.textarea.insert_str(&sql);
 
         // Move focus to the editor so user can review/edit
-        self.focus = Focus::Query;
+        self.set_focus(Focus::Query);
         self.mode = Mode::Normal;
 
         let row_count = row_indices.len();
@@ -6998,10 +7094,10 @@ impl App {
 
             // Focus
             Action::ToggleFocus => {
-                self.focus = Focus::Grid;
+                self.focus_next();
             }
             Action::FocusGrid => {
-                self.focus = Focus::Grid;
+                self.set_focus(Focus::Grid);
             }
 
             // Editor actions
@@ -7072,6 +7168,9 @@ impl App {
             Action::OpenAiAssistant => {
                 self.request_open_ai_modal(None);
             }
+            Action::Refresh => {
+                self.refresh_focused();
+            }
             Action::ToggleSidebar => {
                 self.toggle_sidebar();
             }
@@ -7084,18 +7183,16 @@ impl App {
             }
             Action::GotoEditor => {
                 // Already in editor, this is a no-op but keep focus
-                self.focus = Focus::Query;
+                self.set_focus(Focus::Query);
             }
             Action::GotoConnections => {
-                self.sidebar_visible = true;
-                self.sidebar_focus = SidebarSection::Connections;
-                self.focus = Focus::Sidebar(SidebarSection::Connections);
+                self.set_focus(Focus::Sidebar(SidebarSection::Connections));
             }
             Action::GotoTables => {
                 self.focus_schema();
             }
             Action::GotoResults => {
-                self.focus = Focus::Grid;
+                self.set_focus(Focus::Grid);
             }
 
             // Actions not applicable to editor
@@ -7612,8 +7709,12 @@ impl App {
                             self.execute_query();
                             return;
                         }
+                        Action::Refresh => {
+                            self.refresh_focused();
+                            return;
+                        }
                         Action::ToggleFocus => {
-                            self.focus = Focus::Grid;
+                            self.focus_next();
                             return;
                         }
                         Action::Undo => {
@@ -7652,9 +7753,7 @@ impl App {
                             return;
                         }
                         Action::GotoConnections => {
-                            self.sidebar_visible = true;
-                            self.sidebar_focus = SidebarSection::Connections;
-                            self.focus = Focus::Sidebar(SidebarSection::Connections);
+                            self.set_focus(Focus::Sidebar(SidebarSection::Connections));
                             return;
                         }
                         Action::GotoTables => {
@@ -7662,7 +7761,7 @@ impl App {
                             return;
                         }
                         Action::GotoResults => {
-                            self.focus = Focus::Grid;
+                            self.set_focus(Focus::Grid);
                             return;
                         }
                         Action::ToggleSidebar => {
@@ -7826,6 +7925,8 @@ impl App {
         self.db.mongo_client = None;
         self.db.mongo_database = None;
         self.db.running = false;
+        self.last_executed_query = None;
+        self.active_query_kind = None;
         self.query_ui.clear();
         self.db.connected_with_tls = false;
 
@@ -8405,8 +8506,26 @@ impl App {
 
     fn insert_into_editor_and_focus(&mut self, text: &str) {
         self.editor.textarea.insert_str(text);
-        self.focus = Focus::Query;
+        self.set_focus(Focus::Query);
         self.mode = Mode::Insert;
+    }
+
+    fn replace_editor_with_schema_template(&mut self, query: String) {
+        self.editor.set_text(query);
+        self.set_focus(Focus::Query);
+        self.mode = Mode::Insert;
+        self.last_status = Some("Query replaced with schema template".to_string());
+    }
+
+    fn confirm_or_replace_with_schema_template(&mut self, query: String) {
+        if self.query_editor_has_content() {
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                "Replace the current query with the generated schema template?",
+                ConfirmContext::ReplaceQuery { query },
+            ));
+        } else {
+            self.replace_editor_with_schema_template(query);
+        }
     }
 
     /// Execute a completed key sequence (action + optional context).
@@ -8428,25 +8547,22 @@ impl App {
                     }
                     Focus::Sidebar(_) => {
                         // In sidebar, just go to first item (connections section)
-                        self.sidebar_focus = SidebarSection::Connections;
-                        self.focus = Focus::Sidebar(SidebarSection::Connections);
+                        self.set_focus(Focus::Sidebar(SidebarSection::Connections));
                         self.sidebar.select_first_connection();
                     }
                 }
             }
             KeySequenceAction::GotoEditor => {
-                self.focus = Focus::Query;
+                self.set_focus(Focus::Query);
             }
             KeySequenceAction::GotoConnections => {
-                self.sidebar_visible = true;
-                self.sidebar_focus = SidebarSection::Connections;
-                self.focus = Focus::Sidebar(SidebarSection::Connections);
+                self.set_focus(Focus::Sidebar(SidebarSection::Connections));
             }
             KeySequenceAction::GotoTables => {
                 self.focus_schema();
             }
             KeySequenceAction::GotoResults => {
-                self.focus = Focus::Grid;
+                self.set_focus(Focus::Grid);
             }
             KeySequenceAction::GotoHistory => {
                 self.open_history_picker();
@@ -8515,7 +8631,11 @@ impl App {
                     _ => return,
                 };
 
-                self.insert_into_editor_and_focus(&sql);
+                if completed.action == KeySequenceAction::SchemaTableName {
+                    self.insert_into_editor_and_focus(&sql);
+                } else {
+                    self.confirm_or_replace_with_schema_template(sql);
+                }
             }
         }
     }
@@ -8762,7 +8882,7 @@ impl App {
             SidebarAction::InsertText(text) => {
                 // Insert text into query editor
                 self.editor.textarea.insert_str(&text);
-                self.focus = Focus::Query;
+                self.set_focus(Focus::Query);
             }
             SidebarAction::OpenAddConnection => {
                 self.connection_form = Some(ConnectionFormModal::with_keymap_and_onepassword(
@@ -8791,13 +8911,10 @@ impl App {
                 }
             }
             SidebarAction::RefreshSchema => {
-                if self.db.status == DbStatus::Connected {
-                    self.schema_cache.loaded = false;
-                    self.load_schema();
-                }
+                self.refresh_schema();
             }
             SidebarAction::FocusEditor => {
-                self.focus = Focus::Query;
+                self.set_focus(Focus::Query);
             }
         }
     }
@@ -8994,6 +9111,37 @@ impl App {
         }
     }
 
+    fn refresh_focused(&mut self) {
+        match self.focus {
+            Focus::Sidebar(SidebarSection::Schema) => self.refresh_schema(),
+            Focus::Query | Focus::Grid => self.refresh_last_query(),
+            Focus::Sidebar(SidebarSection::Connections) => {
+                self.last_status =
+                    Some("Nothing to refresh while connections are focused".to_string());
+            }
+        }
+    }
+
+    fn refresh_schema(&mut self) {
+        if self.db.status != DbStatus::Connected {
+            self.last_status = Some("Not connected; cannot refresh schema".to_string());
+            return;
+        }
+
+        self.schema_cache.loaded = false;
+        self.last_status = Some("Refreshing schema...".to_string());
+        self.load_schema();
+    }
+
+    fn refresh_last_query(&mut self) {
+        let Some(query) = self.last_executed_query.clone() else {
+            self.last_status = Some("No previous query to refresh".to_string());
+            return;
+        };
+
+        self.execute_query_text(query, QueryExecutionKind::Refresh);
+    }
+
     fn load_schema(&mut self) {
         if self.db.kind == Some(DbKind::Mongo) {
             self.load_mongo_schema();
@@ -9072,8 +9220,11 @@ impl App {
                         source_database: None,
                     });
                 }
-                Err(_) => {
-                    // Schema loading failed silently - not critical
+                Err(e) => {
+                    let _ = tx.send(DbEvent::SchemaLoadError {
+                        error: format!("Schema load failed: {}", format_pg_error(&e)),
+                        source_database: None,
+                    });
                 }
             }
         });
@@ -9121,8 +9272,9 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(DbEvent::QueryError {
+                    let _ = tx.send(DbEvent::SchemaLoadError {
                         error: format!("Mongo schema load failed: {e}"),
+                        source_database: Some(db_name),
                     });
                 }
             }
@@ -9247,20 +9399,26 @@ impl App {
     }
 
     fn execute_query(&mut self) {
-        let query = self.editor.text();
+        self.execute_query_text(self.editor.text(), QueryExecutionKind::New);
+    }
+
+    fn execute_query_text(&mut self, query: String, kind: QueryExecutionKind) {
         if query.trim().is_empty() {
             self.last_status = Some("No query to run".to_string());
             return;
         }
 
-        // Push to both editor history (for Ctrl-p/n navigation) and persistent history.
-        self.editor.push_history(query.clone());
-        let conn_info = self
-            .db
-            .conn_str
-            .as_ref()
-            .map(|s| ConnectionInfo::parse(s).format(50));
-        self.history.push(query.clone(), conn_info);
+        if kind == QueryExecutionKind::New {
+            // Push new executions to both editor history (for Ctrl-p/n navigation)
+            // and persistent history. Refreshes intentionally do not add duplicates.
+            self.editor.push_history(query.clone());
+            let conn_info = self
+                .db
+                .conn_str
+                .as_ref()
+                .map(|s| ConnectionInfo::parse(s).format(50));
+            self.history.push(query.clone(), conn_info);
+        }
 
         // Only block if a query is actively running (not just an idle paged cursor)
         if self.db.running {
@@ -9269,7 +9427,13 @@ impl App {
         }
 
         self.db.running = true;
-        self.last_status = Some("Running...".to_string());
+        self.last_status = Some(
+            match kind {
+                QueryExecutionKind::New => "Running...",
+                QueryExecutionKind::Refresh => "Refreshing last query...",
+            }
+            .to_string(),
+        );
         self.query_ui.start();
 
         let tx = self.db_events_tx.clone();
@@ -9288,6 +9452,8 @@ impl App {
                 .mongo_database
                 .clone()
                 .unwrap_or_else(|| "admin".to_string());
+            self.last_executed_query = Some(query.clone());
+            self.active_query_kind = Some(kind);
             self.paged_query = None;
             self.execute_query_mongo(client, db_name, query, max_rows, tx);
             return;
@@ -9300,6 +9466,9 @@ impl App {
             self.query_ui.clear();
             return;
         };
+
+        self.last_executed_query = Some(query.clone());
+        self.active_query_kind = Some(kind);
 
         // If a previous paged query is still active, abandon it so we can run a new one.
         // Dropping `paged_query` closes the fetch-more channel; the background cursor task
@@ -10231,6 +10400,8 @@ impl App {
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
                 self.db.running = false;
+                self.last_executed_query = None;
+                self.active_query_kind = None;
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
@@ -10251,6 +10422,8 @@ impl App {
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
                 self.db.running = false;
+                self.last_executed_query = None;
+                self.active_query_kind = None;
                 self.query_ui.clear();
                 self.current_connection_name = None;
                 self.active_connection_name = None;
@@ -10259,6 +10432,7 @@ impl App {
                 self.last_error = Some(format!("Connection lost: {}", error));
             }
             DbEvent::QueryFinished { result } => {
+                let query_kind = self.active_query_kind.take();
                 // Always clear running state after first page loads - the "Executing..."
                 // dialog should only show during initial query, not while waiting for
                 // on-demand scroll fetches. Subsequent page fetches show status line only.
@@ -10303,10 +10477,17 @@ impl App {
                 }
 
                 // Move focus to grid to show results
-                self.focus = Focus::Grid;
+                self.set_focus(Focus::Grid);
 
-                // Mark the query as "saved" since it was successfully executed
-                self.editor.mark_saved();
+                // A refresh may complete after the user has edited the buffer. Only
+                // mark a newly executed buffer as saved when it still matches the SQL
+                // that produced these results.
+                let current_query = self.editor.text();
+                if query_kind == Some(QueryExecutionKind::New)
+                    && self.last_executed_query.as_deref() == Some(current_query.as_str())
+                {
+                    self.editor.mark_saved();
+                }
 
                 // Set status
                 if is_paged {
@@ -10321,6 +10502,7 @@ impl App {
             }
             DbEvent::QueryError { error } => {
                 self.db.running = false;
+                self.active_query_kind = None;
                 self.query_ui.clear();
                 self.paged_query = None; // Clear paged query state on error
                 self.last_status = Some("Query error (see above)".to_string());
@@ -10329,6 +10511,7 @@ impl App {
             DbEvent::QueryCancelled => {
                 self.paged_query = None; // Clear paged query state on cancel
                 self.db.running = false;
+                self.active_query_kind = None;
                 self.query_ui.clear();
                 self.last_status = Some("Query cancelled".to_string());
             }
@@ -10349,6 +10532,20 @@ impl App {
                     "Schema loaded: {} tables",
                     self.schema_cache.tables.len()
                 ));
+            }
+            DbEvent::SchemaLoadError {
+                error,
+                source_database,
+            } => {
+                if self.db.kind == Some(DbKind::Mongo)
+                    && source_database.as_deref() != self.db.mongo_database.as_deref()
+                {
+                    return;
+                }
+                // Keep the previous cache visible and stop the loading indicator.
+                self.schema_cache.loaded = true;
+                self.last_status = Some("Schema refresh failed (see error)".to_string());
+                self.last_error = Some(error);
             }
             DbEvent::CellUpdated { row, col, value } => {
                 self.db.running = false;
@@ -10610,11 +10807,24 @@ impl App {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let focus_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let navigation_hint = if self.focus == Focus::Query && self.mode != Mode::Normal {
+            "Alt-hjkl move · Esc then Tab/S-Tab cycle"
+        } else {
+            "Tab/S-Tab cycle · Ctrl/Alt-hjkl move · g… jump"
+        };
 
         // Build status line with priority-based segments
         let line = StatusLineBuilder::new()
             // Critical: Mode (always shown)
             .segment(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
+            // Critical: active pane (always shown)
+            .segment(
+                StatusSegment::new(format!("[{}]", self.focus.label()), Priority::Critical)
+                    .style(focus_style),
+            )
             // Critical: Connection info
             .segment(
                 StatusSegment::new(conn_segment, Priority::Critical)
@@ -10652,6 +10862,12 @@ impl App {
                 StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
                     .style(Style::default().fg(Color::DarkGray))
                     .min_width(80),
+            )
+            // Low: navigation reminder on wider terminals.
+            .segment(
+                StatusSegment::new(navigation_hint, Priority::Low)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .min_width(105),
             )
             // Right-aligned: Status message
             .segment(
@@ -11474,12 +11690,27 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_query_panel_height_non_insert_mode_respects_min_and_max() {
+    fn test_compute_query_panel_height_non_insert_mode_respects_default_and_max() {
         let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Minimized, 100);
-        assert_eq!(height, REGULAR_QUERY_HEIGHT);
+        assert_eq!(height, 10);
 
         let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Maximized, 100);
         assert_eq!(height, 20);
+    }
+
+    #[test]
+    fn test_compute_query_panel_height_scales_with_tall_displays() {
+        for (main_height, expected_query_height) in
+            [(24, MIN_QUERY_HEIGHT), (32, 8), (48, 12), (80, 12)]
+        {
+            let height = compute_query_panel_height(
+                main_height,
+                Mode::Normal,
+                QueryHeightMode::Minimized,
+                1,
+            );
+            assert_eq!(height, expected_query_height);
+        }
     }
 
     #[test]
@@ -11487,7 +11718,7 @@ mod tests {
         // Low content keeps regular height.
         let low_content =
             compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 2);
-        assert_eq!(low_content, REGULAR_QUERY_HEIGHT);
+        assert_eq!(low_content, 10);
 
         // High content expands, capped at 50% of main area.
         let high_content =
@@ -11968,6 +12199,7 @@ mod tests {
 
         // Initially focus should be on Query
         assert_eq!(app.focus, Focus::Query, "Initial focus should be Query");
+        app.mode = Mode::Insert;
 
         // Simulate a query finishing with results
         let result = QueryResult {
@@ -11988,6 +12220,11 @@ mod tests {
             app.focus,
             Focus::Grid,
             "Focus should move to Grid after query finishes"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "Leaving the query pane should restore Normal mode"
         );
     }
 
@@ -12524,6 +12761,142 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_crud_templates_request_confirmation_for_nonempty_editor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        let context = SchemaTableContext {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+        };
+
+        for action in [
+            KeySequenceAction::SchemaTableSelect,
+            KeySequenceAction::SchemaTableInsert,
+            KeySequenceAction::SchemaTableUpdate,
+            KeySequenceAction::SchemaTableDelete,
+        ] {
+            app.editor.set_text("SELECT current;".to_string());
+            app.focus = Focus::Sidebar(SidebarSection::Schema);
+            app.mode = Mode::Normal;
+            app.last_status = None;
+
+            app.execute_key_sequence_completion(KeySequenceCompletion {
+                action,
+                context: Some(context.clone()),
+            });
+
+            assert_eq!(app.editor.text(), "SELECT current;");
+            assert!(matches!(
+                app.confirm_prompt.as_ref().map(|prompt| prompt.context()),
+                Some(ConfirmContext::ReplaceQuery { query }) if !query.trim().is_empty()
+            ));
+
+            app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+            assert!(app.confirm_prompt.is_none());
+            assert_eq!(app.editor.text(), "SELECT current;");
+            assert_eq!(app.focus, Focus::Sidebar(SidebarSection::Schema));
+            assert_eq!(
+                app.last_status.as_deref(),
+                Some("Query replacement cancelled")
+            );
+        }
+    }
+
+    #[test]
+    fn test_confirming_schema_template_replaces_query_and_focuses_editor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.editor.set_text("SELECT current;".to_string());
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        let context = SchemaTableContext {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+        };
+        let expected = app.build_select_template(&context);
+
+        app.execute_key_sequence_completion(KeySequenceCompletion {
+            action: KeySequenceAction::SchemaTableSelect,
+            context: Some(context),
+        });
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(app.editor.text(), expected);
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Query replaced with schema template")
+        );
+    }
+
+    #[test]
+    fn test_schema_template_replaces_empty_editor_without_confirmation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        let context = SchemaTableContext {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+        };
+        let expected = app.build_delete_template(&context);
+
+        app.execute_key_sequence_completion(KeySequenceCompletion {
+            action: KeySequenceAction::SchemaTableDelete,
+            context: Some(context),
+        });
+
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(app.editor.text(), expected);
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn test_schema_table_name_still_inserts_at_cursor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.editor.set_text("SELECT * FROM ".to_string());
+        app.editor.textarea.move_cursor(CursorMove::End);
+
+        app.execute_key_sequence_completion(KeySequenceCompletion {
+            action: KeySequenceAction::SchemaTableName,
+            context: Some(SchemaTableContext {
+                schema: "public".to_string(),
+                table: "users".to_string(),
+            }),
+        });
+
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(app.editor.text(), "SELECT * FROM users");
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
     fn test_ctrl_r_binding_exists_in_editor_normal_keymap() {
         let keymap = crate::config::Keymap::default_editor_normal_keymap();
         let ctrl_r = KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
@@ -12532,6 +12905,193 @@ mod tests {
             Some(&Action::ShowHistory),
             "Ctrl+R should remain bound to history search in normal mode"
         );
+    }
+
+    #[test]
+    fn test_ctrl_r_and_plain_r_refresh_schema_when_schema_focused() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+        app.db.status = DbStatus::Connected;
+
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::NONE] {
+            app.schema_cache.loaded = true;
+            app.last_status = None;
+
+            let quit = app.on_key(KeyEvent::new(KeyCode::Char('r'), modifiers));
+
+            assert!(!quit);
+            assert!(!app.schema_cache.loaded);
+            assert_eq!(app.last_status.as_deref(), Some("Refreshing schema..."));
+            assert_eq!(app.focus, Focus::Sidebar(SidebarSection::Schema));
+        }
+    }
+
+    #[test]
+    fn test_ctrl_r_refreshes_last_query_when_grid_focused() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Grid;
+        app.editor.set_text("SELECT draft".to_string());
+        app.last_executed_query = Some("SELECT original".to_string());
+        app.history = History::new_empty(10);
+        app.db.running = true;
+
+        let quit = app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert!(!quit);
+        assert_eq!(app.last_status.as_deref(), Some("Query already running"));
+        assert_eq!(app.editor.text(), "SELECT draft");
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn test_refreshed_result_does_not_mark_edited_buffer_as_saved() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.editor.set_text("SELECT draft".to_string());
+        app.last_executed_query = Some("SELECT original".to_string());
+        app.active_query_kind = Some(QueryExecutionKind::Refresh);
+        app.db.running = true;
+        assert!(app.editor.is_modified());
+
+        app.apply_db_event(DbEvent::QueryFinished {
+            result: QueryResult {
+                headers: vec!["value".to_string()],
+                rows: vec![vec!["1".to_string()]],
+                command_tag: Some("SELECT 1".to_string()),
+                truncated: false,
+                elapsed: Duration::ZERO,
+                source_table: None,
+                primary_keys: Vec::new(),
+                col_types: vec!["int4".to_string()],
+            },
+        });
+
+        assert_eq!(app.editor.text(), "SELECT draft");
+        assert!(app.editor.is_modified());
+    }
+
+    #[test]
+    fn test_ctrl_r_grid_reports_when_there_is_no_query_to_refresh() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Grid;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No previous query to refresh")
+        );
+    }
+
+    #[test]
+    fn test_refresh_command_uses_current_focus() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        app.focus = Focus::Query;
+        app.execute_command("refresh");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No previous query to refresh")
+        );
+
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.execute_command("refresh");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Nothing to refresh while connections are focused")
+        );
+    }
+
+    #[test]
+    fn test_custom_refresh_binding_dispatches_in_query_editor() {
+        use crate::config::CustomKeyBinding;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = Config::default();
+        config.keymap.normal.push(CustomKeyBinding {
+            key: "f5".to_string(),
+            action: "refresh".to_string(),
+            description: None,
+        });
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.focus = Focus::Query;
+        app.last_executed_query = Some("SELECT original".to_string());
+        app.db.running = true;
+
+        app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+
+        assert_eq!(app.last_status.as_deref(), Some("Query already running"));
+    }
+
+    #[test]
+    fn test_disconnect_clears_last_query_for_refresh() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.last_executed_query = Some("SELECT 1".to_string());
+
+        app.execute_command("disconnect");
+
+        assert!(app.last_executed_query.is_none());
     }
 
     #[test]
@@ -12645,6 +13205,40 @@ mod tests {
         assert!(app.schema_cache.loaded);
         assert_eq!(app.schema_cache.tables.len(), 1);
         assert_eq!(app.schema_cache.tables[0].name, "events");
+    }
+
+    #[test]
+    fn test_schema_load_error_preserves_cached_tables() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.db.kind = Some(DbKind::Postgres);
+        app.schema_cache.tables = vec![TableInfo {
+            schema: "public".to_string(),
+            name: "users".to_string(),
+            columns: Vec::new(),
+        }];
+        app.schema_cache.loaded = false;
+
+        app.apply_db_event(DbEvent::SchemaLoadError {
+            error: "permission denied".to_string(),
+            source_database: None,
+        });
+
+        assert!(app.schema_cache.loaded);
+        assert_eq!(app.schema_cache.tables.len(), 1);
+        assert_eq!(app.schema_cache.tables[0].name, "users");
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Schema refresh failed (see error)")
+        );
+        assert_eq!(app.last_error.as_deref(), Some("permission denied"));
     }
 
     #[test]
@@ -13560,7 +14154,7 @@ mod tests {
     // ========== Tab Cycling Focus Tests ==========
 
     #[test]
-    fn test_tab_from_connections_to_schema_updates_sidebar_focus() {
+    fn test_tab_from_connections_to_query_follows_clockwise_order() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -13578,25 +14172,20 @@ mod tests {
         app.focus = Focus::Sidebar(SidebarSection::Connections);
         app.sidebar_focus = SidebarSection::Connections;
 
-        // Press Tab to move from Connections to Schema
+        // Connections is the last pane in the clockwise cycle.
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         app.on_key(key);
 
-        // Both focus and sidebar_focus should be updated to Schema
-        assert_eq!(
-            app.focus,
-            Focus::Sidebar(SidebarSection::Schema),
-            "focus should move to Schema"
-        );
+        assert_eq!(app.focus, Focus::Query, "focus should wrap to Query");
         assert_eq!(
             app.sidebar_focus,
-            SidebarSection::Schema,
-            "sidebar_focus should also be updated to Schema"
+            SidebarSection::Connections,
+            "leaving the sidebar should preserve its last section"
         );
     }
 
     #[test]
-    fn test_shift_tab_from_schema_to_connections_updates_sidebar_focus() {
+    fn test_shift_tab_from_schema_to_grid_follows_reverse_order() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -13614,25 +14203,20 @@ mod tests {
         app.focus = Focus::Sidebar(SidebarSection::Schema);
         app.sidebar_focus = SidebarSection::Schema;
 
-        // Press Shift+Tab to move from Schema to Connections
+        // Results precedes Schema in the clockwise cycle.
         let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         app.on_key(key);
 
-        // Both focus and sidebar_focus should be updated to Connections
-        assert_eq!(
-            app.focus,
-            Focus::Sidebar(SidebarSection::Connections),
-            "focus should move to Connections"
-        );
+        assert_eq!(app.focus, Focus::Grid, "focus should move to Results");
         assert_eq!(
             app.sidebar_focus,
-            SidebarSection::Connections,
-            "sidebar_focus should also be updated to Connections"
+            SidebarSection::Schema,
+            "leaving the sidebar should preserve its last section"
         );
     }
 
     #[test]
-    fn test_tab_from_grid_to_connections_updates_sidebar_focus() {
+    fn test_tab_from_grid_to_schema_updates_sidebar_focus() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -13650,25 +14234,25 @@ mod tests {
         app.focus = Focus::Grid;
         app.sidebar_focus = SidebarSection::Schema; // This simulates the bug condition
 
-        // Press Tab to move from Grid to Connections
+        // Press Tab to move from Results to Schema.
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         app.on_key(key);
 
-        // Both focus and sidebar_focus should be Connections
+        // Both focus and sidebar_focus should be Schema.
         assert_eq!(
             app.focus,
-            Focus::Sidebar(SidebarSection::Connections),
-            "focus should move to Connections"
+            Focus::Sidebar(SidebarSection::Schema),
+            "focus should move to Schema"
         );
         assert_eq!(
             app.sidebar_focus,
-            SidebarSection::Connections,
-            "sidebar_focus should be updated to Connections"
+            SidebarSection::Schema,
+            "sidebar_focus should be updated to Schema"
         );
     }
 
     #[test]
-    fn test_shift_tab_from_query_to_schema_updates_sidebar_focus() {
+    fn test_shift_tab_from_query_to_connections_updates_sidebar_focus() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -13686,21 +14270,46 @@ mod tests {
         app.focus = Focus::Query;
         app.sidebar_focus = SidebarSection::Connections; // This simulates the bug condition
 
-        // Press Shift+Tab to move from Query to Schema
+        // Press Shift+Tab to wrap from Query to Connections.
         let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         app.on_key(key);
 
-        // Both focus and sidebar_focus should be Schema
+        // Both focus and sidebar_focus should be Connections.
         assert_eq!(
             app.focus,
-            Focus::Sidebar(SidebarSection::Schema),
-            "focus should move to Schema"
+            Focus::Sidebar(SidebarSection::Connections),
+            "focus should move to Connections"
         );
         assert_eq!(
             app.sidebar_focus,
-            SidebarSection::Schema,
-            "sidebar_focus should be updated to Schema"
+            SidebarSection::Connections,
+            "sidebar_focus should be updated to Connections"
         );
+    }
+
+    #[test]
+    fn test_tab_cycle_skips_sidebar_when_hidden() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.sidebar_visible = false;
+        app.mode = Mode::Normal;
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Grid);
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Query);
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.focus, Focus::Grid);
     }
 
     // ========== Panel Navigation Tests (Ctrl+HJKL) ==========
@@ -13785,7 +14394,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ctrl_h_noop_when_sidebar_hidden() {
+    fn test_ctrl_h_from_query_reveals_hidden_sidebar() {
         let _guard = ConfigDirGuard::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -13812,16 +14421,51 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
         app.on_key(key);
 
+        assert!(app.sidebar_visible, "Ctrl+H should reveal the sidebar");
         assert_eq!(
             app.focus,
-            Focus::Query,
-            "Ctrl+H should be no-op when sidebar is hidden"
+            Focus::Sidebar(SidebarSection::Connections),
+            "Ctrl+H from Query should focus the aligned Connections pane"
         );
     }
 
     #[test]
     #[serial]
-    fn test_ctrl_shift_b_opens_sidebar_and_focuses_schema() {
+    fn test_ctrl_h_from_grid_reveals_hidden_schema() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Grid;
+        app.sidebar_visible = false;
+        app.mode = Mode::Normal;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+
+        assert!(app.sidebar_visible, "Ctrl+H should reveal the sidebar");
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar(SidebarSection::Schema),
+            "Ctrl+H from Results should focus the aligned Schema pane"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ctrl_shift_b_opens_sidebar_without_stealing_focus() {
         let _guard = ConfigDirGuard::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -13841,27 +14485,6 @@ mod tests {
         app.connection_manager = None;
         app.connection_picker = None;
 
-        // Seed schema cache so focus_schema can select an item without requiring a render pass.
-        app.schema_cache.tables = vec![
-            TableInfo {
-                schema: "_sqlx_test".to_string(),
-                name: "t".to_string(),
-                columns: vec![ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: "int4".to_string(),
-                }],
-            },
-            TableInfo {
-                schema: "public".to_string(),
-                name: "u".to_string(),
-                columns: vec![ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: "int4".to_string(),
-                }],
-            },
-        ];
-        app.schema_cache.loaded = true;
-
         app.focus = Focus::Query;
         app.sidebar_visible = false;
         app.mode = Mode::Normal;
@@ -13876,20 +14499,11 @@ mod tests {
             app.sidebar_visible,
             "Ctrl+Shift+B should show the sidebar when it was hidden"
         );
-        assert_eq!(
-            app.focus,
-            Focus::Sidebar(SidebarSection::Schema),
-            "Ctrl+Shift+B should focus Schema when opening the sidebar"
-        );
+        assert_eq!(app.focus, Focus::Query, "opening should preserve focus");
         assert_eq!(
             app.sidebar_focus,
-            SidebarSection::Schema,
-            "Ctrl+Shift+B should set sidebar_focus to Schema"
-        );
-        assert_eq!(
-            app.sidebar.schema_state.selected(),
-            &["schema:_sqlx_test".to_string()],
-            "Ctrl+Shift+B should select the first schema item"
+            SidebarSection::Connections,
+            "opening should preserve the last sidebar section"
         );
     }
 
@@ -13995,8 +14609,8 @@ mod tests {
         );
         assert_eq!(
             app.focus,
-            Focus::Query,
-            "When hiding the sidebar, focus should return to Query"
+            Focus::Grid,
+            "Hiding Schema should move focus to the aligned Results pane"
         );
     }
 
@@ -14037,7 +14651,7 @@ mod tests {
         assert_eq!(
             app.focus,
             Focus::Query,
-            "When hiding the sidebar, focus should return to Query"
+            "Hiding Connections should move focus to the aligned Query pane"
         );
     }
 
@@ -14077,8 +14691,8 @@ mod tests {
         );
         assert_eq!(
             app.focus,
-            Focus::Query,
-            "When hiding the sidebar, focus should return to Query"
+            Focus::Grid,
+            "Hiding Schema should move focus to the aligned Results pane"
         );
     }
 
@@ -14339,6 +14953,116 @@ mod tests {
             Focus::Query,
             "Ctrl+H should be no-op in Insert mode"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_alt_h_moves_panes_from_insert_mode() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.sidebar_visible = false;
+        app.mode = Mode::Insert;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+
+        assert!(app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Sidebar(SidebarSection::Connections));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    #[serial]
+    fn test_alt_j_moves_panes_and_clears_visual_selection() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            Config::default(),
+        );
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Normal;
+        app.editor.set_text("select 1".to_string());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.editor.textarea.is_selecting());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT));
+
+        assert_eq!(app.focus, Focus::Grid);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.editor.textarea.is_selecting());
+    }
+
+    #[test]
+    #[serial]
+    fn test_custom_focus_bindings_apply_to_visual_and_sidebar_contexts() {
+        let _guard = ConfigDirGuard::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut config = Config::default();
+        config.keymap.visual.push(crate::config::CustomKeyBinding {
+            key: "alt+x".to_string(),
+            action: "focus_down".to_string(),
+            description: None,
+        });
+        config.keymap.sidebar.push(crate::config::CustomKeyBinding {
+            key: "alt+x".to_string(),
+            action: "focus_right".to_string(),
+            description: None,
+        });
+
+        let mut app = App::with_config(
+            GridModel::empty(),
+            rt.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.connection_manager = None;
+        app.connection_picker = None;
+        app.focus = Focus::Query;
+        app.mode = Mode::Visual;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Grid);
+
+        app.focus = Focus::Sidebar(SidebarSection::Connections);
+        app.sidebar_visible = true;
+        app.sidebar_focus = SidebarSection::Connections;
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Query);
     }
 
     #[test]

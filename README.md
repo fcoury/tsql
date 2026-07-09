@@ -69,22 +69,50 @@ Once connected:
 
 1. Type a SQL query in the editor pane
 2. Press `Enter` to execute
-3. Use `Tab` to switch between editor and results grid
+3. Use `Tab` / `Shift-Tab` to cycle panes, or `Ctrl-h/j/k/l` to move spatially
 4. Press `?` for help with all keybindings (type `/` inside the help popup to filter)
 
 ## Keybindings
 
 ### Global
 
+Pane movement follows the screen layout:
+
+```text
+Connections <-> Query
+     ^           ^
+     v           v
+  Schema    <-> Results
+```
+
 | Key                                  | Action                                             |
 | ------------------------------------ | -------------------------------------------------- |
-| `Tab`                                | Switch focus between query editor and results grid |
+| `Tab` / `Shift-Tab`                  | Cycle panes clockwise / counter-clockwise in Normal mode |
+| `Ctrl-h/j/k/l`                       | Move between panes in Normal mode                  |
+| `Alt-h/j/k/l`                        | Move between panes in any mode                     |
 | `?`                                  | Toggle help popup (`/` to filter inside)           |
 | `Ctrl+Shift+B` / `Ctrl+\` / `Ctrl+4` | Toggle sidebar                                     |
 | `Ctrl+O`                             | Open connection picker                             |
 | `Ctrl+Shift+C` / `gm`                | Open connection manager                            |
 | `q`                                  | Quit application                                   |
 | `Esc`                                | Return to normal mode / close popups               |
+
+Moving left from Query or Results automatically reveals the aligned hidden
+sidebar pane. Opening the sidebar with its toggle keeps the current pane
+focused.
+
+On taller terminals, the query editor grows from 7 to as many as 12 rows by
+default. `Alt+M` still toggles the pane between its compact and maximized size.
+
+### Schema Sidebar
+
+| Key            | Action         |
+| -------------- | -------------- |
+| `r` / `Ctrl-r` | Refresh schema |
+
+The table template actions (`Enter`, then `s`/`i`/`u`/`d`) replace the query
+editor. When it already contains a query, tsql asks for confirmation first.
+`Enter`, then `n` still inserts only the table name at the cursor.
 
 ### Query Editor (Normal Mode)
 
@@ -126,6 +154,7 @@ Once connected:
 | `/`         | Search in results                             |
 | `+/-`       | Widen/narrow column                           |
 | `=`         | Fit/collapse column                           |
+| `Ctrl-r`    | Rerun the last query                          |
 
 Yank commands operate on all selected rows when a selection is active, or the cursor row otherwise.
 
@@ -175,6 +204,7 @@ tsql --debug-keys --mouse
 | `:ai [prompt]`                  | Open AI query assistant |
 | `:export csv\|json\|tsv <path>` | Export results      |
 | `:update [check\|status\|apply]` | Check/apply updates |
+| `:refresh`                      | Refresh focused schema or last query |
 | `:sbt` / `:sidebar-toggle`      | Toggle sidebar      |
 | `:q` / `:quit`                  | Quit                |
 | `:\dt`                          | List tables         |

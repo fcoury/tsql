@@ -195,6 +195,9 @@ pub struct KeymapConfig {
     /// Custom keybindings for grid navigation
     #[serde(default)]
     pub grid: Vec<CustomKeyBinding>,
+    /// Custom keybindings for sidebar navigation
+    #[serde(default)]
+    pub sidebar: Vec<CustomKeyBinding>,
     /// Custom keybindings for connection form
     #[serde(default)]
     pub connection_form: Vec<CustomKeyBinding>,
@@ -209,6 +212,7 @@ impl Default for KeymapConfig {
             insert: Vec::new(),
             visual: Vec::new(),
             grid: Vec::new(),
+            sidebar: Vec::new(),
             connection_form: Vec::new(),
         }
     }
@@ -448,6 +452,11 @@ description = "Save the current query"
 key = "ctrl+e"
 action = "export_csv"
 description = "Export results as CSV"
+
+[[keymap.sidebar]]
+key = "alt+n"
+action = "focus_next"
+description = "Focus the next pane"
 "#;
 
         let config: Config = toml::from_str(toml).unwrap();
@@ -484,6 +493,10 @@ description = "Export results as CSV"
 
         assert_eq!(config.keymap.grid.len(), 1);
         assert_eq!(config.keymap.grid[0].key, "ctrl+e");
+
+        assert_eq!(config.keymap.sidebar.len(), 1);
+        assert_eq!(config.keymap.sidebar[0].key, "alt+n");
+        assert_eq!(config.keymap.sidebar[0].action, "focus_next");
 
         // Updates
         assert!(config.updates.enabled);
