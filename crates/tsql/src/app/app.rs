@@ -798,6 +798,8 @@ const DEFAULT_QUERY_HEIGHT_RATIO_DENOM: u16 = 4; // 25%
 const STATUS_HEIGHT: u16 = 1;
 const MIN_GRID_HEIGHT: u16 = 3;
 const QUERY_CHROME_ROWS: u16 = 1;
+const QUERY_GAP_ROWS: u16 = 1;
+const MIN_CONTENT_QUERY_HEIGHT: u16 = 3; // label row + two content rows
 const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
 /// Check if a query is suitable for cursor-based paging.
@@ -849,9 +851,9 @@ fn compute_query_panel_height(
         return 0;
     }
 
-    // Preserve space for a minimal grid when possible.
+    // Preserve space for the base-tone gap row and a minimal grid when possible.
     let layout_safe_max = {
-        let max_with_min_grid = main_height.saturating_sub(MIN_GRID_HEIGHT);
+        let max_with_min_grid = main_height.saturating_sub(MIN_GRID_HEIGHT + QUERY_GAP_ROWS);
         if max_with_min_grid > 0 {
             max_with_min_grid
         } else {
@@ -859,8 +861,7 @@ fn compute_query_panel_height(
         }
     };
 
-    // Use more of a tall display by default, while keeping the query pane
-    // compact and leaving most of the screen available for results.
+    // Cap the compact query card so most of the screen stays with results.
     let responsive_default = (main_height / DEFAULT_QUERY_HEIGHT_RATIO_DENOM)
         .clamp(MIN_QUERY_HEIGHT, MAX_DEFAULT_QUERY_HEIGHT);
     let regular_height = responsive_default.min(layout_safe_max);
@@ -870,14 +871,20 @@ fn compute_query_panel_height(
         .min(layout_safe_max);
     let maximized_height = ratio_cap.max(regular_height);
 
+    // The query pane hugs its content like a floating card; Insert mode may
+    // grow it up to the expanded cap, Normal mode stays within the compact cap.
+    let content_height = (editor_line_count as u16).saturating_add(QUERY_CHROME_ROWS);
+
     if mode == Mode::Insert {
-        let desired_content_height = (editor_line_count as u16).saturating_add(QUERY_CHROME_ROWS);
-        let desired_height = desired_content_height.max(regular_height);
-        return desired_height.min(maximized_height);
+        return content_height
+            .max(MIN_CONTENT_QUERY_HEIGHT)
+            .min(maximized_height);
     }
 
     match non_insert_mode {
-        QueryHeightMode::Minimized => regular_height,
+        QueryHeightMode::Minimized => content_height
+            .max(MIN_CONTENT_QUERY_HEIGHT)
+            .min(regular_height),
         QueryHeightMode::Maximized => maximized_height,
     }
 }
@@ -3084,12 +3091,21 @@ impl App {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(query_height),
+                        Constraint::Length(QUERY_GAP_ROWS),
                         Constraint::Min(MIN_GRID_HEIGHT),
                     ])
                     .split(main_area);
 
                 let query_area = chunks[0];
-                let grid_area = chunks[1];
+                let query_gap = chunks[1];
+                let grid_area = chunks[2];
+
+                // Base-tone breathing row: lets the elevated query card float
+                // instead of butting against the results zone.
+                frame.render_widget(
+                    Paragraph::new("").style(Style::default().bg(self.ui_theme.bg_base)),
+                    query_gap,
+                );
 
                 // Store rendered areas for mouse click handling
                 self.render_query_area = Some(query_area);
@@ -3212,8 +3228,10 @@ impl App {
 
                 // Results grid.
                 let grid_focused = self.focus == Focus::Grid;
+                let row_count = self.grid.rows.len();
+                let row_word = if row_count == 1 { "row" } else { "rows" };
                 let mut grid_details = vec![Span::styled(
-                    format!(" · {} rows", self.grid.rows.len()),
+                    format!(" · {row_count} {row_word}"),
                     self.ui_theme.text_muted,
                 )];
                 if let Some(elapsed) = self.db.last_elapsed {
@@ -10825,18 +10843,6 @@ impl App {
             None
         };
 
-        // Query timing info
-        let timing_info = if let Some(ref tag) = self.db.last_command_tag {
-            let time_part = self
-                .db
-                .last_elapsed
-                .map(|e| format!(" ({}ms)", e.as_millis()))
-                .unwrap_or_default();
-            Some(format!("{}{}", tag, time_part))
-        } else {
-            None
-        };
-
         // Running/loading indicator
         let paged_loading = self.paged_query.as_ref().is_some_and(|p| p.loading);
         let running_indicator = if self.db.running {
@@ -10906,13 +10912,6 @@ impl App {
                 StatusSegment::new(selection_info.unwrap_or_default(), Priority::Medium)
                     .style(Style::default().fg(self.ui_theme.accent))
                     .min_width(60),
-            )
-            // Low: Query timing
-            .segment_if(
-                timing_info.is_some(),
-                StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
-                    .style(Style::default().fg(self.ui_theme.text_muted))
-                    .min_width(80),
             )
             // Low: navigation reminder on wider terminals.
             .segment(
@@ -11814,26 +11813,34 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_query_panel_height_scales_with_tall_displays() {
-        for (main_height, expected_query_height) in
-            [(24, MIN_QUERY_HEIGHT), (32, 8), (48, 12), (80, 12)]
-        {
+    fn test_compute_query_panel_height_hugs_content_in_normal_mode() {
+        // Short queries collapse to a compact card (label row + content),
+        // never below the minimum card height.
+        for main_height in [24, 32, 48, 80] {
             let height = compute_query_panel_height(
                 main_height,
                 Mode::Normal,
                 QueryHeightMode::Minimized,
                 1,
             );
-            assert_eq!(height, expected_query_height);
+            assert_eq!(height, MIN_CONTENT_QUERY_HEIGHT);
         }
+
+        // Mid-size content is content-fit: lines + label row.
+        let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Minimized, 8);
+        assert_eq!(height, 9);
+
+        // Long content stays within the compact responsive cap.
+        let height = compute_query_panel_height(48, Mode::Normal, QueryHeightMode::Minimized, 100);
+        assert_eq!(height, 12);
     }
 
     #[test]
     fn test_compute_query_panel_height_expands_by_content_in_insert_mode() {
-        // Low content keeps regular height.
+        // Low content keeps the compact card (no jump when entering Insert).
         let low_content =
             compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 2);
-        assert_eq!(low_content, 10);
+        assert_eq!(low_content, 3);
 
         // Tonal chrome reserves one label row above the editor content.
         let content_driven =
@@ -11849,9 +11856,9 @@ mod tests {
     #[test]
     fn test_compute_query_panel_height_respects_layout_safety_cap() {
         // main_height=6 is the content height (status is split off separately).
-        // With min grid reservation (3), query max should be 3.
+        // With gap row (1) + min grid reservation (3), query max should be 2.
         let height = compute_query_panel_height(6, Mode::Insert, QueryHeightMode::Minimized, 50);
-        assert_eq!(height, 3);
+        assert_eq!(height, 2);
     }
 
     #[test]

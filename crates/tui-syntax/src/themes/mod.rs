@@ -207,7 +207,8 @@ fg = "#DCDFE4"
 fg = "#9DA5B4"
 
 ["ui.label"]
-fg = "#9DA5B4"
+fg = "#DCDFE4"
+modifiers = ["bold"]
 
 ["ui.label.focused"]
 fg = "#56B6C2"
@@ -473,7 +474,8 @@ fg = "#1F2328"
 fg = "#57606A"
 
 ["ui.label"]
-fg = "#57606A"
+fg = "#1F2328"
+modifiers = ["bold"]
 
 ["ui.label.focused"]
 fg = "#0969DA"

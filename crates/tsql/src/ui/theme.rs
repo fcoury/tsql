@@ -66,7 +66,7 @@ impl UiTheme {
             bg_status: ink,
             text,
             text_muted,
-            label: Style::default().fg(text_muted),
+            label: Style::default().fg(text).add_modifier(Modifier::BOLD),
             label_focused: Style::default().fg(accent).add_modifier(Modifier::BOLD),
             accent,
             accent_insert: rgb(0x98, 0xC3, 0x79),

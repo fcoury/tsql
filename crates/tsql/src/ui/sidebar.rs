@@ -96,8 +96,9 @@ impl Sidebar {
         self.connections_area = Some(chunks[0]);
         self.schema_area = Some(chunks[2]);
 
+        // Base-tone groove so the two panel sections read as separate cards.
         frame.render_widget(
-            Paragraph::new("").style(Style::default().fg(theme.text).bg(theme.bg_panel)),
+            Paragraph::new("").style(Style::default().fg(theme.text).bg(theme.bg_base)),
             chunks[1],
         );
 
@@ -190,10 +191,12 @@ impl Sidebar {
             })
             .collect();
 
+        // Unfocused selection stays calm: bold text instead of accent color,
+        // so focus reads only from the accent edge and label.
         let highlight_style = if focused {
             theme.selection
         } else {
-            Style::default().fg(theme.accent)
+            Style::default().add_modifier(Modifier::BOLD)
         };
 
         let list = List::new(items)
@@ -259,10 +262,12 @@ impl Sidebar {
             return;
         }
 
+        // Unfocused selection stays calm: bold text instead of accent color,
+        // so focus reads only from the accent edge and label.
         let highlight_style = if focused {
             theme.selection
         } else {
-            Style::default().fg(theme.accent)
+            Style::default().add_modifier(Modifier::BOLD)
         };
 
         match Tree::new(schema_items) {
@@ -574,7 +579,8 @@ mod tests {
             buffer.cell((0, schema_area.y + 1)).unwrap().fg,
             theme.bg_panel
         );
-        assert_eq!(buffer.cell((5, spacer_y)).unwrap().bg, theme.bg_panel);
+        // The spacer is a base-tone groove separating the two panel cards.
+        assert_eq!(buffer.cell((5, spacer_y)).unwrap().bg, theme.bg_base);
         assert!(!sidebar.is_over_connections(5, spacer_y));
         assert!(!sidebar.is_over_schema(5, spacer_y));
     }

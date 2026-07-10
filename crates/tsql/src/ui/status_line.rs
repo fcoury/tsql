@@ -326,18 +326,27 @@ impl StatusLineBuilder {
         let mut right_segments = right_segments;
         right_segments.sort_by_key(|s| s.priority);
 
-        // Calculate widths
-        let right_width: u16 = right_segments.iter().map(|s| s.width()).sum();
-        let right_sep_width = if !right_segments.is_empty() && !left_segments.is_empty() {
-            separator_width
+        // Calculate widths. The padding gap separates the left and right
+        // groups, so no separator is reserved between them — only between
+        // right segments themselves.
+        let right_width: u16 = right_segments
+            .iter()
+            .map(|s| s.width())
+            .sum::<u16>()
+            .saturating_add(
+                separator_width.saturating_mul(right_segments.len().saturating_sub(1) as u16),
+            );
+
+        // Available width for left segments (keep at least one padding column
+        // between the groups when both are present).
+        let group_gap = if !right_segments.is_empty() && !left_segments.is_empty() {
+            1
         } else {
             0
         };
-
-        // Available width for left segments
         let left_available = available_width
             .saturating_sub(right_width)
-            .saturating_sub(right_sep_width);
+            .saturating_sub(group_gap);
 
         // Select left segments that fit
         let mut left_used: u16 = 0;
@@ -371,20 +380,15 @@ impl StatusLineBuilder {
         let current_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let padding_needed = (available_width as usize)
             .saturating_sub(current_width)
-            .saturating_sub(right_width as usize)
-            .saturating_sub(if !right_segments.is_empty() && !selected_left.is_empty() {
-                separator_width as usize
-            } else {
-                0
-            });
+            .saturating_sub(right_width as usize);
 
         if padding_needed > 0 {
             spans.push(Span::raw(" ".repeat(padding_needed)));
         }
 
-        // Add right segments
+        // Add right segments; the padding gap already separates the groups.
         for (i, segment) in right_segments.iter().enumerate() {
-            if i > 0 || !selected_left.is_empty() {
+            if i > 0 {
                 spans.push(Span::styled(self.separator.clone(), self.separator_style));
             }
             spans.push(Span::styled(segment.content.clone(), segment.style));

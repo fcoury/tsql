@@ -1531,8 +1531,10 @@ impl<'a> Widget for DataGrid<'a> {
                 self.theme,
             );
 
-            // Determine cursor column for this row (only if this is the cursor row)
-            let cursor_col = if is_cursor {
+            // Determine cursor column for this row. The full-strength cursor
+            // cell only renders while the grid is focused; unfocused panes
+            // keep the calmer selection row.
+            let cursor_col = if is_cursor && self.focused {
                 Some(self.state.cursor_col)
             } else {
                 None
@@ -1633,11 +1635,12 @@ fn render_marker_cell(
         current_x += row_number_width;
     }
 
-    // Render cursor and selection markers
-    let cursor_ch = if is_cursor { '>' } else { ' ' };
+    // Render the selection marker. The cursor row no longer gets a `>`
+    // glyph: the selection background and cursor cell already carry that
+    // signal. Geometry is preserved (the column stays reserved).
     let sel_ch = if is_selected { '*' } else { ' ' };
 
-    let markers = format!("{}{} ", cursor_ch, sel_ch);
+    let markers = format!(" {} ", sel_ch);
     buf.set_string(current_x, y, &markers, style);
 }
 
