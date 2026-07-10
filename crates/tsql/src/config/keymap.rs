@@ -105,7 +105,8 @@ pub enum Action {
 
     // Sidebar
     ToggleSidebar,
-    ToggleQueryHeight,
+    #[serde(alias = "toggle_query_height")]
+    ToggleResultsMaximized,
 
     // Goto sequences (triggered by g + key)
     GotoFirst,
@@ -190,7 +191,7 @@ impl Action {
             Action::TestConnection => "Test connection",
             Action::ClearField => "Clear current field",
             Action::ToggleSidebar => "Toggle sidebar",
-            Action::ToggleQueryHeight => "Toggle query pane height (min/max)",
+            Action::ToggleResultsMaximized => "Toggle maximized results view",
             Action::GotoFirst => "Go to first row/document start",
             Action::GotoEditor => "Go to query editor",
             Action::GotoConnections => "Go to connections sidebar",
@@ -304,7 +305,9 @@ impl FromStr for Action {
 
             // Sidebar
             "toggle_sidebar" => Ok(Action::ToggleSidebar),
-            "toggle_query_height" => Ok(Action::ToggleQueryHeight),
+            "toggle_results_maximized" | "toggle_query_height" => {
+                Ok(Action::ToggleResultsMaximized)
+            }
 
             // Goto sequences
             "goto_first" => Ok(Action::GotoFirst),
@@ -659,7 +662,7 @@ impl Keymap {
         );
         km.bind(
             KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
-            Action::ToggleQueryHeight,
+            Action::ToggleResultsMaximized,
         );
 
         // Display
@@ -830,7 +833,7 @@ impl Keymap {
         km.bind_directional_focus(KeyModifiers::ALT);
         km.bind(
             KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
-            Action::ToggleQueryHeight,
+            Action::ToggleResultsMaximized,
         );
 
         // Show history picker
@@ -892,7 +895,7 @@ impl Keymap {
         );
         km.bind(
             KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
-            Action::ToggleQueryHeight,
+            Action::ToggleResultsMaximized,
         );
         km.bind_directional_focus(KeyModifiers::ALT);
 
@@ -1083,9 +1086,9 @@ mod tests {
         let slash = KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE);
         assert_eq!(km.get(&slash), Some(&Action::StartSearch));
 
-        // Query height toggle
+        // Results maximization toggle
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
-        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleResultsMaximized));
 
         // Refresh the query backing the results grid
         let ctrl_r = KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
@@ -1106,7 +1109,7 @@ mod tests {
         let km = Keymap::default_editor_insert_keymap();
 
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
-        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleResultsMaximized));
 
         let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
@@ -1122,7 +1125,7 @@ mod tests {
         let km = Keymap::default_editor_normal_keymap();
 
         let alt_m = KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT);
-        assert_eq!(km.get(&alt_m), Some(&Action::ToggleQueryHeight));
+        assert_eq!(km.get(&alt_m), Some(&Action::ToggleResultsMaximized));
 
         let ctrl_g = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(km.get(&ctrl_g), Some(&Action::OpenAiAssistant));
@@ -1189,7 +1192,11 @@ mod tests {
         );
         assert_eq!(
             "toggle_query_height".parse::<Action>().unwrap(),
-            Action::ToggleQueryHeight
+            Action::ToggleResultsMaximized
+        );
+        assert_eq!(
+            "toggle_results_maximized".parse::<Action>().unwrap(),
+            Action::ToggleResultsMaximized
         );
         assert_eq!(
             "open_ai_assistant".parse::<Action>().unwrap(),

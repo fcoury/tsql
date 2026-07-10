@@ -836,12 +836,7 @@ fn is_row_returning_query(query: &str) -> bool {
         || first.eq_ignore_ascii_case("explain")
 }
 
-fn compute_query_panel_height(
-    main_height: u16,
-    mode: Mode,
-    non_insert_mode: QueryHeightMode,
-    editor_line_count: usize,
-) -> u16 {
+fn compute_query_panel_height(main_height: u16, mode: Mode, editor_line_count: usize) -> u16 {
     let available_for_query = main_height.saturating_sub(STATUS_HEIGHT);
     if available_for_query == 0 {
         return 0;
@@ -874,9 +869,36 @@ fn compute_query_panel_height(
         return desired_height.min(maximized_height);
     }
 
-    match non_insert_mode {
-        QueryHeightMode::Minimized => regular_height,
-        QueryHeightMode::Maximized => maximized_height,
+    regular_height
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceAreas {
+    sidebar: Rect,
+    query: Rect,
+    grid: Rect,
+    status: Rect,
+}
+
+fn compute_workspace_areas(area: Rect, sidebar_width: u16, query_height: u16) -> WorkspaceAreas {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(sidebar_width), Constraint::Min(60)])
+        .split(area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(query_height),
+            Constraint::Min(MIN_GRID_HEIGHT),
+            Constraint::Length(STATUS_HEIGHT),
+        ])
+        .split(horizontal[1]);
+
+    WorkspaceAreas {
+        sidebar: horizontal[0],
+        query: vertical[0],
+        grid: vertical[1],
+        status: vertical[2],
     }
 }
 
@@ -2576,8 +2598,8 @@ pub struct App {
     update_state: UpdateState,
     /// True while an update apply flow is running in the background.
     update_apply_in_flight: bool,
-    /// Query pane size mode used outside Insert mode.
-    query_height_mode: QueryHeightMode,
+    /// Workspace state captured before entering the maximized results view.
+    maximized_results_restore: Option<WorkspaceLayoutSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2595,9 +2617,11 @@ enum CachedCursorStyle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueryHeightMode {
-    Minimized,
-    Maximized,
+struct WorkspaceLayoutSnapshot {
+    focus: Focus,
+    mode: Mode,
+    sidebar_visible: bool,
+    sidebar_focus: SidebarSection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2768,7 +2792,7 @@ impl App {
             query_ui: QueryRunUi::default(),
             update_state: UpdateState::default(),
             update_apply_in_flight: false,
-            query_height_mode: QueryHeightMode::Minimized,
+            maximized_results_restore: None,
         };
 
         // Load saved connections
@@ -2813,7 +2837,9 @@ impl App {
             },
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
-            sidebar_visible: self.sidebar_visible,
+            sidebar_visible: self
+                .maximized_results_restore
+                .map_or(self.sidebar_visible, |state| state.sidebar_visible),
         }
     }
 
@@ -2994,27 +3020,31 @@ impl App {
 
             terminal.draw(|frame| {
                 let size = frame.area();
-
-                // Split horizontally for sidebar + main content
-                let horizontal = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(if self.sidebar_visible {
-                            self.sidebar_width
-                        } else {
-                            0
-                        }),
-                        Constraint::Min(60), // Main content minimum width
-                    ])
-                    .split(size);
-
-                let sidebar_area = horizontal[0];
-                let main_area = horizontal[1];
+                let results_maximized = self.maximized_results_restore.is_some();
+                let sidebar_visible = self.sidebar_visible && !results_maximized;
+                let query_height = if results_maximized {
+                    0
+                } else {
+                    compute_query_panel_height(
+                        size.height,
+                        self.mode,
+                        self.editor.textarea.lines().len(),
+                    )
+                };
+                let areas = compute_workspace_areas(
+                    size,
+                    if sidebar_visible {
+                        self.sidebar_width
+                    } else {
+                        0
+                    },
+                    query_height,
+                );
 
                 // Render sidebar if visible
-                if self.sidebar_visible && sidebar_area.width > 0 {
+                if sidebar_visible && areas.sidebar.width > 0 {
                     // Store sidebar area for mouse click handling
-                    self.render_sidebar_area = Some(sidebar_area);
+                    self.render_sidebar_area = Some(areas.sidebar);
 
                     let schema_items = self.schema_cache.build_tree_items();
                     let has_focus = matches!(self.focus, Focus::Sidebar(_));
@@ -3030,7 +3060,7 @@ impl App {
 
                     self.sidebar.render(
                         frame,
-                        sidebar_area,
+                        areas.sidebar,
                         &self.connections,
                         self.current_connection_name.as_deref(),
                         &schema_items,
@@ -3043,29 +3073,9 @@ impl App {
                     self.render_sidebar_area = None;
                 }
 
-                let query_height = compute_query_panel_height(
-                    main_area.height,
-                    self.mode,
-                    self.query_height_mode,
-                    self.editor.textarea.lines().len(),
-                );
-
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(query_height),
-                        Constraint::Min(MIN_GRID_HEIGHT),
-                        Constraint::Length(STATUS_HEIGHT),
-                    ])
-                    .split(main_area);
-
-                let query_area = chunks[0];
-                let grid_area = chunks[1];
-                let status_area = chunks[2];
-
                 // Store rendered areas for mouse click handling
-                self.render_query_area = Some(query_area);
-                self.render_grid_area = Some(grid_area);
+                self.render_query_area = (!results_maximized).then_some(areas.query);
+                self.render_grid_area = Some(areas.grid);
 
                 // Query editor with syntax highlighting
                 let query_border = match (self.focus, self.mode) {
@@ -3114,12 +3124,16 @@ impl App {
                         .cursor_shape(cursor_shape);
 
                 // Get cursor screen position before rendering (for Bar/Underline cursors)
-                let cursor_pos = highlighted_editor.cursor_screen_position(query_area);
+                let cursor_pos = (!results_maximized)
+                    .then(|| highlighted_editor.cursor_screen_position(areas.query))
+                    .flatten();
 
-                frame.render_widget(highlighted_editor, query_area);
+                if !results_maximized {
+                    frame.render_widget(highlighted_editor, areas.query);
+                }
 
                 // For Bar/Underline cursor shapes, use the terminal's native cursor
-                if is_editor_focused && cursor_shape != CursorShape::Block {
+                if !results_maximized && is_editor_focused && cursor_shape != CursorShape::Block {
                     if let Some(pos) = cursor_pos {
                         frame.set_cursor_position(pos);
                     }
@@ -3127,21 +3141,23 @@ impl App {
 
                 // Update editor scroll based on cursor position
                 // The inner area height is query_area.height - 2 (for borders)
-                let inner_height = query_area.height.saturating_sub(2) as usize;
-                let inner_width = query_area.width.saturating_sub(2) as usize;
+                let inner_height = areas.query.height.saturating_sub(2) as usize;
+                let inner_width = areas.query.width.saturating_sub(2) as usize;
                 let (cursor_row, cursor_col) = self.editor.textarea.cursor();
-                self.editor_scroll = calculate_editor_scroll(
-                    cursor_row,
-                    cursor_col,
-                    self.editor_scroll,
-                    inner_height,
-                    inner_width,
-                );
+                if !results_maximized {
+                    self.editor_scroll = calculate_editor_scroll(
+                        cursor_row,
+                        cursor_col,
+                        self.editor_scroll,
+                        inner_height,
+                        inner_width,
+                    );
+                }
 
                 // Render scrollbar for query editor if content exceeds visible area
                 let total_lines = self.editor.textarea.lines().len();
-                if total_lines > inner_height && inner_height > 0 {
-                    let inner_area = query_block.inner(query_area);
+                if !results_maximized && total_lines > inner_height && inner_height > 0 {
+                    let inner_area = query_block.inner(areas.query);
                     let scrollbar_area = Rect {
                         x: inner_area.x + inner_area.width.saturating_sub(1),
                         y: inner_area.y,
@@ -3173,9 +3189,9 @@ impl App {
                 // Inner area: grid_area minus borders (2 for borders)
                 // Body area: inner minus header row (1)
                 // Data width: inner width minus marker column (3)
-                let inner_height = grid_area.height.saturating_sub(2);
+                let inner_height = areas.grid.height.saturating_sub(2);
                 let body_height = inner_height.saturating_sub(1); // minus header
-                let inner_width = grid_area.width.saturating_sub(2);
+                let inner_width = areas.grid.width.saturating_sub(2);
                 let data_width = inner_width.saturating_sub(3); // minus marker column
 
                 // Update grid state scroll position based on viewport
@@ -3198,17 +3214,17 @@ impl App {
                     show_row_numbers: self.config.display.show_row_numbers,
                     show_scrollbar: true,
                 };
-                frame.render_widget(grid_widget, grid_area);
+                frame.render_widget(grid_widget, areas.grid);
 
                 // Loading overlay when query is running (only if grid area is large enough)
-                if self.db.running && grid_area.width >= 20 && grid_area.height >= 5 {
+                if self.db.running && areas.grid.width >= 20 && areas.grid.height >= 5 {
                     // Calculate centered overlay area (40% width, minimum 20 chars, 5 lines height)
-                    let overlay_width = (grid_area.width * 40 / 100).max(20).min(grid_area.width);
-                    let overlay_height = 5u16.min(grid_area.height);
+                    let overlay_width = (areas.grid.width * 40 / 100).max(20).min(areas.grid.width);
+                    let overlay_height = 5u16.min(areas.grid.height);
                     let overlay_x =
-                        grid_area.x + (grid_area.width.saturating_sub(overlay_width)) / 2;
+                        areas.grid.x + (areas.grid.width.saturating_sub(overlay_width)) / 2;
                     let overlay_y =
-                        grid_area.y + (grid_area.height.saturating_sub(overlay_height)) / 2;
+                        areas.grid.y + (areas.grid.height.saturating_sub(overlay_height)) / 2;
                     let overlay_area = Rect {
                         x: overlay_x,
                         y: overlay_y,
@@ -3266,7 +3282,7 @@ impl App {
                 }
 
                 // Status.
-                frame.render_widget(self.status_line(status_area.width), status_area);
+                frame.render_widget(self.status_line(areas.status.width), areas.status);
 
                 if let Some(ref mut help) = self.help_popup {
                     help.render(frame, size);
@@ -3341,9 +3357,9 @@ impl App {
                     if !visible.is_empty() {
                         // Position popup near the cursor
                         let (cursor_row, cursor_col) = self.editor.textarea.cursor();
-                        // Estimate position (query_area starts at y=0, each line is 1 row)
-                        let popup_y = query_area.y + 1 + cursor_row as u16;
-                        let popup_x = query_area.x
+                        // Estimate position (query area starts at y=0, each line is 1 row)
+                        let popup_y = areas.query.y + 1 + cursor_row as u16;
+                        let popup_x = areas.query.x
                             + 1
                             + cursor_col.saturating_sub(self.completion.prefix.len()) as u16;
 
@@ -3462,7 +3478,7 @@ impl App {
                     let popup_width = desired_width.clamp(min_width, max_width);
                     let popup_height = 5u16;
                     let popup_x = (size.width.saturating_sub(popup_width)) / 2;
-                    let popup_y = grid_area.y + 2; // Near top of grid
+                    let popup_y = areas.grid.y + 2; // Near top of grid
 
                     let popup_area = Rect {
                         x: popup_x,
@@ -3885,13 +3901,13 @@ impl App {
             return false;
         }
 
-        // Query pane height toggle (non-insert modes, independent of focus).
+        // Results maximization toggle (non-insert modes, independent of focus).
         if self.mode != Mode::Insert {
             let toggle_key = self.editor_normal_keymap.get_action(&key)
-                == Some(Action::ToggleQueryHeight)
-                || self.grid_keymap.get_action(&key) == Some(Action::ToggleQueryHeight);
+                == Some(Action::ToggleResultsMaximized)
+                || self.grid_keymap.get_action(&key) == Some(Action::ToggleResultsMaximized);
             if toggle_key {
-                self.toggle_query_height_mode();
+                self.toggle_results_maximized();
                 return false;
             }
         }
@@ -4270,6 +4286,10 @@ impl App {
     }
 
     fn set_focus(&mut self, focus: Focus) {
+        if self.maximized_results_restore.is_some() && focus != Focus::Grid {
+            return;
+        }
+
         if self.focus == Focus::Query && focus != Focus::Query {
             if self.editor.textarea.is_selecting() {
                 self.editor.textarea.cancel_selection();
@@ -4804,6 +4824,11 @@ impl App {
 
     /// Toggle sidebar visibility without stealing focus when opening it.
     fn toggle_sidebar(&mut self) {
+        if self.maximized_results_restore.is_some() {
+            self.last_status = Some("Results are maximized".to_string());
+            return;
+        }
+
         if self.sidebar_visible {
             self.sidebar_visible = false;
             match self.focus {
@@ -4816,16 +4841,26 @@ impl App {
         }
     }
 
-    fn toggle_query_height_mode(&mut self) {
-        self.query_height_mode = match self.query_height_mode {
-            QueryHeightMode::Minimized => QueryHeightMode::Maximized,
-            QueryHeightMode::Maximized => QueryHeightMode::Minimized,
-        };
-        let label = match self.query_height_mode {
-            QueryHeightMode::Minimized => "minimized",
-            QueryHeightMode::Maximized => "maximized",
-        };
-        self.last_status = Some(format!("Query pane {label}"));
+    fn toggle_results_maximized(&mut self) {
+        if let Some(state) = self.maximized_results_restore.take() {
+            self.focus = state.focus;
+            self.mode = state.mode;
+            self.sidebar_visible = state.sidebar_visible;
+            self.sidebar_focus = state.sidebar_focus;
+            self.last_status = Some("Workspace restored".to_string());
+            return;
+        }
+
+        self.maximized_results_restore = Some(WorkspaceLayoutSnapshot {
+            focus: self.focus,
+            mode: self.mode,
+            sidebar_visible: self.sidebar_visible,
+            sidebar_focus: self.sidebar_focus,
+        });
+        self.focus = Focus::Grid;
+        self.mode = Mode::Normal;
+        self.sidebar_visible = false;
+        self.last_status = Some("Results maximized".to_string());
     }
 
     /// Focus on the Schema section of the sidebar, ensuring first item is selected
@@ -7775,8 +7810,8 @@ impl App {
                             self.toggle_sidebar();
                             return;
                         }
-                        Action::ToggleQueryHeight => {
-                            self.toggle_query_height_mode();
+                        Action::ToggleResultsMaximized => {
+                            self.toggle_results_maximized();
                             return;
                         }
                         Action::OpenAiAssistant => {
@@ -11719,12 +11754,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_query_panel_height_non_insert_mode_respects_default_and_max() {
-        let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Minimized, 100);
+    fn test_compute_query_panel_height_non_insert_mode_uses_responsive_default() {
+        let height = compute_query_panel_height(40, Mode::Normal, 100);
         assert_eq!(height, 10);
-
-        let height = compute_query_panel_height(40, Mode::Normal, QueryHeightMode::Maximized, 100);
-        assert_eq!(height, 20);
     }
 
     #[test]
@@ -11732,12 +11764,7 @@ mod tests {
         for (main_height, expected_query_height) in
             [(24, MIN_QUERY_HEIGHT), (32, 8), (48, 12), (80, 12)]
         {
-            let height = compute_query_panel_height(
-                main_height,
-                Mode::Normal,
-                QueryHeightMode::Minimized,
-                1,
-            );
+            let height = compute_query_panel_height(main_height, Mode::Normal, 1);
             assert_eq!(height, expected_query_height);
         }
     }
@@ -11745,13 +11772,11 @@ mod tests {
     #[test]
     fn test_compute_query_panel_height_expands_by_content_in_insert_mode() {
         // Low content keeps regular height.
-        let low_content =
-            compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 2);
+        let low_content = compute_query_panel_height(40, Mode::Insert, 2);
         assert_eq!(low_content, 10);
 
         // High content expands, capped at 50% of main area.
-        let high_content =
-            compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 50);
+        let high_content = compute_query_panel_height(40, Mode::Insert, 50);
         assert_eq!(high_content, 20);
     }
 
@@ -11759,7 +11784,7 @@ mod tests {
     fn test_compute_query_panel_height_respects_layout_safety_cap() {
         // main_height=6 leaves 5 rows after status line.
         // With min grid reservation (3), query max should be 2.
-        let height = compute_query_panel_height(6, Mode::Insert, QueryHeightMode::Minimized, 50);
+        let height = compute_query_panel_height(6, Mode::Insert, 50);
         assert_eq!(height, 2);
     }
 
@@ -11773,43 +11798,117 @@ mod tests {
     }
 
     #[test]
-    fn test_alt_m_toggles_query_height_mode_outside_insert_independent_of_focus() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    fn test_maximized_results_layout_gives_grid_the_workspace() {
+        let areas = compute_workspace_areas(Rect::new(0, 0, 120, 40), 0, 0);
 
-        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
-        app.connection_picker = None;
-        app.connection_manager = None;
-        app.focus = Focus::Sidebar(SidebarSection::Schema);
-        app.mode = Mode::Normal;
-        app.query_height_mode = QueryHeightMode::Minimized;
-
-        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
-        assert_eq!(app.query_height_mode, QueryHeightMode::Maximized);
-
-        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
-        assert_eq!(app.query_height_mode, QueryHeightMode::Minimized);
+        assert_eq!(areas.sidebar.width, 0);
+        assert_eq!(areas.query.height, 0);
+        assert_eq!(areas.grid, Rect::new(0, 0, 120, 39));
+        assert_eq!(areas.status, Rect::new(0, 39, 120, 1));
     }
 
     #[test]
-    fn test_alt_m_toggles_in_insert_mode() {
+    fn test_alt_m_maximizes_results_and_restores_workspace() {
+        let cases = [
+            (Focus::Query, Mode::Insert, true, SidebarSection::Schema),
+            (
+                Focus::Query,
+                Mode::Visual,
+                false,
+                SidebarSection::Connections,
+            ),
+            (Focus::Grid, Mode::Normal, true, SidebarSection::Connections),
+            (
+                Focus::Sidebar(SidebarSection::Connections),
+                Mode::Normal,
+                true,
+                SidebarSection::Connections,
+            ),
+            (
+                Focus::Sidebar(SidebarSection::Schema),
+                Mode::Normal,
+                true,
+                SidebarSection::Schema,
+            ),
+        ];
+
+        for (focus, mode, sidebar_visible, sidebar_focus) in cases {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+            app.connection_picker = None;
+            app.connection_manager = None;
+            app.focus = focus;
+            app.mode = mode;
+            app.sidebar_visible = sidebar_visible;
+            app.sidebar_focus = sidebar_focus;
+
+            app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+            assert!(app.maximized_results_restore.is_some());
+            assert_eq!(app.focus, Focus::Grid);
+            assert_eq!(app.mode, Mode::Normal);
+            assert!(!app.sidebar_visible);
+            assert_eq!(app.last_status.as_deref(), Some("Results maximized"));
+
+            app.set_focus(Focus::Query);
+            app.toggle_sidebar();
+            assert_eq!(app.focus, Focus::Grid);
+            assert!(!app.sidebar_visible);
+
+            app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+            assert!(app.maximized_results_restore.is_none());
+            assert_eq!(app.focus, focus);
+            assert_eq!(app.mode, mode);
+            assert_eq!(app.sidebar_visible, sidebar_visible);
+            assert_eq!(app.sidebar_focus, sidebar_focus);
+            assert_eq!(app.last_status.as_deref(), Some("Workspace restored"));
+        }
+    }
+
+    #[test]
+    fn test_alt_m_preserves_visual_selection_when_workspace_is_restored() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
         app.connection_picker = None;
         app.connection_manager = None;
-        app.mode = Mode::Insert;
-        app.query_height_mode = QueryHeightMode::Minimized;
+        app.focus = Focus::Query;
+        app.mode = Mode::Visual;
+        app.editor.set_text("SELECT 1".to_string());
+        app.editor.textarea.start_selection();
 
         app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
-        assert_eq!(app.query_height_mode, QueryHeightMode::Maximized);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Visual);
+        assert!(app.editor.textarea.is_selecting());
+    }
+
+    #[test]
+    fn test_session_capture_uses_pre_maximized_sidebar_visibility() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.sidebar_visible = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+        assert!(!app.sidebar_visible);
+        assert!(app.capture_session_state().sidebar_visible);
     }
 
     // ========== CellEditor Tests ==========

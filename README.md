@@ -102,7 +102,8 @@ sidebar pane. Opening the sidebar with its toggle keeps the current pane
 focused.
 
 On taller terminals, the query editor grows from 7 to as many as 12 rows by
-default. `Alt+M` still toggles the pane between its compact and maximized size.
+default. `Alt+M` toggles a maximized results view that hides the query editor
+and sidebar, then restores the previous workspace layout when pressed again.
 
 ### Schema Sidebar
 
