@@ -259,6 +259,20 @@ fg = "#E5C07B"
 ["ui.error"]
 fg = "#E06C75"
 
+["ui.transaction"]
+fg = "#C678DD"
+
+["ui.overlay"]
+fg = "#DCDFE4"
+bg = "#333B49"
+
+["ui.overlay.border"]
+fg = "#5C6673"
+
+["ui.overlay.title"]
+fg = "#56B6C2"
+modifiers = ["bold"]
+
 ["ui.scrollbar"]
 fg = "#9DA5B4"
 
@@ -510,6 +524,20 @@ fg = "#9A6700"
 
 ["ui.error"]
 fg = "#CF222E"
+
+["ui.transaction"]
+fg = "#8250DF"
+
+["ui.overlay"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.overlay.border"]
+fg = "#AFB8C1"
+
+["ui.overlay.title"]
+fg = "#0969DA"
+modifiers = ["bold"]
 
 ["ui.scrollbar"]
 fg = "#57606A"

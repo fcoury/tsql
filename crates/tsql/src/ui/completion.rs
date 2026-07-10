@@ -497,10 +497,8 @@ pub fn determine_context(text: &str, cursor_col: usize) -> CompletionContext {
         let second_last = tokens[tokens.len() - 2];
         match second_last {
             "ORDER" | "GROUP" => return CompletionContext::General,
-            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" => {
-                if tokens.last() == Some(&"JOIN") {
-                    return CompletionContext::AfterFrom;
-                }
+            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" if tokens.last() == Some(&"JOIN") => {
+                return CompletionContext::AfterFrom;
             }
             _ => {}
         }

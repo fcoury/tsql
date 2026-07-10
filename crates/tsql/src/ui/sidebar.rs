@@ -76,8 +76,17 @@ impl Sidebar {
         has_focus: bool,
         theme: &UiTheme,
     ) {
+        // Size connections to its content (label row + one row per entry,
+        // or the empty-state hint), capped so schema keeps most of the space.
+        let connection_count = connections.sorted().len();
+        let connections_height = if connection_count == 0 {
+            6
+        } else {
+            connection_count as u16 + 1
+        };
+        let connections_cap = (area.height * 2 / 5).max(3);
         let chunks = Layout::vertical([
-            Constraint::Percentage(30),
+            Constraint::Length(connections_height.min(connections_cap)),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -120,15 +129,22 @@ impl Sidebar {
         focused: bool,
         theme: &UiTheme,
     ) {
+        let sorted = connections.sorted();
+        let details = if sorted.is_empty() {
+            Vec::new()
+        } else {
+            vec![Span::styled(
+                format!(" · {}", sorted.len()),
+                theme.text_muted,
+            )]
+        };
         let block = zone_block(
-            zone_label("CONNECTIONS", Vec::new(), focused, theme.accent, theme),
+            zone_label("CONNECTIONS", details, focused, theme.accent, theme),
             theme.bg_panel,
             theme.text,
             focused,
             theme.accent,
         );
-
-        let sorted = connections.sorted();
         if sorted.is_empty() {
             let empty = Paragraph::new(vec![
                 Line::from(""),
@@ -199,8 +215,17 @@ impl Sidebar {
         focused: bool,
         theme: &UiTheme,
     ) {
+        let table_count: usize = schema_items.iter().map(|item| item.children().len()).sum();
+        let details = if table_count == 0 {
+            Vec::new()
+        } else {
+            vec![Span::styled(
+                format!(" · {table_count} tables"),
+                theme.text_muted,
+            )]
+        };
         let block = zone_block(
-            zone_label("SCHEMA", Vec::new(), focused, theme.accent, theme),
+            zone_label("SCHEMA", details, focused, theme.accent, theme),
             theme.bg_panel,
             theme.text,
             focused,

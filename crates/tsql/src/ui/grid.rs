@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{
@@ -441,12 +441,10 @@ impl GridState {
             }
 
             // o to open row detail view
-            (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                if row_count > 0 {
-                    return GridKeyResult::OpenRowDetail {
-                        row: self.cursor_row,
-                    };
-                }
+            (KeyCode::Char('o'), KeyModifiers::NONE) if row_count > 0 => {
+                return GridKeyResult::OpenRowDetail {
+                    row: self.cursor_row,
+                };
             }
 
             _ => {}
@@ -1416,9 +1414,17 @@ impl<'a> Widget for DataGrid<'a> {
         }
 
         if self.model.headers.is_empty() {
-            Paragraph::new("No columns")
+            // Center the empty-state hint so the blank zone reads as intentional.
+            let message_area = Rect {
+                x: inner.x,
+                y: inner.y + inner.height / 2,
+                width: inner.width,
+                height: 1,
+            };
+            Paragraph::new("No results · press Enter in the Query pane to run")
+                .alignment(Alignment::Center)
                 .style(Style::default().fg(self.theme.text_muted))
-                .render(inner, buf);
+                .render(message_area, buf);
             return;
         }
 

@@ -8,11 +8,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
+use super::{overlay_block, UiTheme};
 use crate::config::ConnectionEntry;
 
 /// Result of handling input in the password prompt.
@@ -69,7 +70,7 @@ impl PasswordPrompt {
     }
 
     /// Render the password prompt dialog.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate centered dialog size
         let dialog_width = 50u16.min(area.width.saturating_sub(4));
         let dialog_height = 7u16;
@@ -82,13 +83,7 @@ impl PasswordPrompt {
         // Clear the area behind the dialog
         frame.render_widget(Clear, dialog_area);
 
-        // Create the dialog block
-        let title = format!(" Password for {} ", self.entry.name);
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block(&format!("Password for {}", self.entry.name), theme);
 
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
@@ -109,7 +104,7 @@ impl PasswordPrompt {
             self.entry.user, self.entry.host, self.entry.port, self.entry.database
         );
         let info_paragraph = Paragraph::new(info)
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(theme.text_muted))
             .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(info_paragraph, chunks[0]);
 
@@ -119,8 +114,8 @@ impl PasswordPrompt {
         let display = format!("{}{}", masked, cursor);
 
         let password_line = Line::from(vec![
-            Span::styled("Password: ", Style::default().fg(Color::White)),
-            Span::styled(display, Style::default().fg(Color::Yellow)),
+            Span::styled("Password: ", Style::default().fg(theme.text)),
+            Span::styled(display, Style::default().fg(theme.warning)),
         ]);
         let password_paragraph = Paragraph::new(password_line);
         frame.render_widget(password_paragraph, chunks[2]);
@@ -130,13 +125,15 @@ impl PasswordPrompt {
             Span::styled(
                 "Enter",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" submit  "),
             Span::styled(
                 "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" cancel"),
         ]);

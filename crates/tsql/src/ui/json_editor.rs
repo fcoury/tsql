@@ -9,15 +9,13 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
-use tui_syntax::{html, json, themes, Highlighter};
+use tui_syntax::{html, json, Highlighter, Theme};
 
 use crate::ui::HighlightedTextArea;
 use crate::util::{
@@ -25,7 +23,7 @@ use crate::util::{
 };
 use crate::vim::{Motion, VimCommand, VimConfig, VimHandler, VimMode};
 
-use super::style::{selected_muted_style, selected_row_style};
+use super::{overlay_block, UiTheme};
 
 /// The result of handling a key event in the JSON editor.
 pub enum JsonEditorAction {
@@ -86,6 +84,7 @@ impl<'a> JsonEditorModal<'a> {
         column_type: String,
         row: usize,
         col: usize,
+        syntax_theme: Theme,
     ) -> Self {
         // Try to pretty-print the JSON
         let formatted_value = try_format_json(&value).unwrap_or_else(|| value.clone());
@@ -105,7 +104,7 @@ impl<'a> JsonEditorModal<'a> {
         textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
         // Create highlighter with JSON and HTML support
-        let mut highlighter = Highlighter::new(themes::one_dark());
+        let mut highlighter = Highlighter::new(syntax_theme);
         let _ = highlighter.register_language(json());
         let _ = highlighter.register_language(html());
 
@@ -531,7 +530,7 @@ impl<'a> JsonEditorModal<'a> {
     }
 
     /// Render the JSON editor modal.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate modal size (80% of screen)
         let modal_width = (area.width as f32 * 0.8) as u16;
         let modal_height = (area.height as f32 * 0.8) as u16;
@@ -563,7 +562,7 @@ impl<'a> JsonEditorModal<'a> {
         // Build title with [+] indicator if modified
         let modified_indicator = if self.is_modified() { " [+]" } else { "" };
         let title = format!(
-            " Edit: {} ({}){} - {} ",
+            "Edit: {} ({}){} - {}",
             self.column_name,
             self.column_type,
             modified_indicator,
@@ -574,27 +573,27 @@ impl<'a> JsonEditorModal<'a> {
         let content = self.content();
         let content_type = detect_content_type(&content);
 
-        // Border color: green for valid JSON (if JSON column), yellow otherwise, red for invalid JSON in JSON column
+        // Semantic border override: validation state matters more than the
+        // calm overlay recipe here (green = valid JSON, red = invalid).
         let border_color = if self.is_json_column() {
             if self.is_valid_json {
-                Color::Green
+                Some(theme.success)
             } else {
-                Color::Red
+                Some(theme.error)
             }
         } else {
-            // Non-JSON column: show detected type in title color
             match content_type {
-                ContentType::Json => Color::Green,
-                ContentType::Html => Color::Cyan,
-                ContentType::Sql => Color::Yellow,
-                ContentType::Plain => Color::White,
+                ContentType::Json => Some(theme.success),
+                ContentType::Html => Some(theme.accent),
+                ContentType::Sql => Some(theme.warning),
+                ContentType::Plain => None,
             }
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(border_color));
+        let mut block = overlay_block(&title, theme);
+        if let Some(color) = border_color {
+            block = block.border_style(Style::default().fg(color));
+        }
 
         // Apply syntax highlighting based on detected content type
         let highlighted_lines = if let Some(lang) = content_type.language_name() {
@@ -609,6 +608,8 @@ impl<'a> JsonEditorModal<'a> {
         // Render highlighted textarea
         let highlighted_textarea = HighlightedTextArea::new(&self.textarea, highlighted_lines)
             .block(block.clone())
+            .cursor_style(theme.editor_cursor)
+            .selection_style(theme.editor_selection)
             .scroll(self.scroll_offset);
 
         frame.render_widget(highlighted_textarea, editor_area);
@@ -639,12 +640,14 @@ impl<'a> JsonEditorModal<'a> {
                     .end_symbol(Some("▼"))
                     .thumb_symbol("█")
                     .track_symbol(Some("░"))
+                    .style(theme.scrollbar)
             } else {
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
                     .end_symbol(None)
                     .thumb_symbol("█")
                     .track_symbol(Some("│"))
+                    .style(theme.scrollbar)
             };
 
             let mut scrollbar_state =
@@ -661,34 +664,37 @@ impl<'a> JsonEditorModal<'a> {
         let type_span = match content_type {
             ContentType::Json => {
                 if self.is_valid_json {
-                    Span::styled(" ✓ JSON ", Style::default().fg(Color::Green))
+                    Span::styled(" ✓ JSON ", Style::default().fg(theme.success))
                 } else {
-                    Span::styled(" ✗ JSON ", Style::default().fg(Color::Red))
+                    Span::styled(" ✗ JSON ", Style::default().fg(theme.error))
                 }
             }
-            ContentType::Html => Span::styled(" HTML ", Style::default().fg(Color::Cyan)),
-            ContentType::Sql => Span::styled(" SQL ", Style::default().fg(Color::Yellow)),
-            ContentType::Plain => Span::styled(" TEXT ", Style::default().fg(Color::White)),
+            ContentType::Html => Span::styled(" HTML ", Style::default().fg(theme.accent)),
+            ContentType::Sql => Span::styled(" SQL ", Style::default().fg(theme.warning)),
+            ContentType::Plain => Span::styled(" TEXT ", Style::default().fg(theme.text)),
         };
 
         // For JSON columns, also show validation status
         let validity_span = if self.is_json_column() && !self.is_valid_json {
             Some(Span::styled(
                 " (invalid for JSONB) ",
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             ))
         } else {
             None
         };
 
         let mode_color = match self.mode {
-            VimMode::Normal => Color::Cyan,
-            VimMode::Insert => Color::Green,
-            VimMode::Visual => Color::Magenta,
+            VimMode::Normal => theme.accent,
+            VimMode::Insert => theme.accent_insert,
+            VimMode::Visual => theme.accent_visual,
         };
         let mode_span = Span::styled(
             format!(" {} ", self.mode.label()),
-            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.pill_fg)
+                .bg(mode_color)
+                .add_modifier(Modifier::BOLD),
         );
 
         let pos_span = Span::raw(format!(
@@ -698,28 +704,27 @@ impl<'a> JsonEditorModal<'a> {
             cursor_col + 1
         ));
 
+        // Status strip shares the app status-bar tone.
+        let strip_style = Style::default().fg(theme.text).bg(theme.bg_status);
+        let muted = Style::default().fg(theme.text_muted);
+
         // If command mode is active, show command prompt instead of help
         if self.command_active {
             let command_line = Line::from(vec![
-                Span::styled(":", Style::default().fg(Color::Yellow)),
+                Span::styled(":", Style::default().fg(theme.warning)),
                 Span::raw(&self.command_buffer),
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             ]);
-            let status = Paragraph::new(command_line).style(selected_row_style());
+            let status = Paragraph::new(command_line).style(strip_style);
             frame.render_widget(status, status_area);
         } else {
             let help_span = match self.mode {
                 VimMode::Normal => Span::styled(
                     " i:insert  v:visual  :format  Ctrl+S:save  q/Esc:close ",
-                    selected_muted_style(),
+                    muted,
                 ),
-                VimMode::Insert => {
-                    Span::styled(" Esc:normal  Ctrl+Enter:save ", selected_muted_style())
-                }
-                VimMode::Visual => Span::styled(
-                    " y:yank  d:delete  c:change  Esc:cancel ",
-                    selected_muted_style(),
-                ),
+                VimMode::Insert => Span::styled(" Esc:normal  Ctrl+Enter:save ", muted),
+                VimMode::Visual => Span::styled(" y:yank  d:delete  c:change  Esc:cancel ", muted),
             };
 
             let mut spans = vec![mode_span, type_span];
@@ -731,7 +736,7 @@ impl<'a> JsonEditorModal<'a> {
 
             let status_line = Line::from(spans);
 
-            let status = Paragraph::new(status_line).style(selected_row_style());
+            let status = Paragraph::new(status_line).style(strip_style);
 
             frame.render_widget(status, status_area);
         }
@@ -741,10 +746,11 @@ impl<'a> JsonEditorModal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::{Duration, Instant};
+    use tui_syntax::themes;
 
     #[test]
     fn test_json_editor_with_valid_json() {
@@ -754,6 +760,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         assert!(editor.is_valid_json);
         // JSON content should be detected as JSON type
@@ -769,15 +776,16 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| editor.render(frame, frame.area()))
+            .draw(|frame| editor.render(frame, frame.area(), &UiTheme::fallback()))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]
@@ -788,6 +796,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         editor.command_active = true;
         editor.command_buffer = "format".to_string();
@@ -796,10 +805,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| editor.render(frame, frame.area()))
+            .draw(|frame| editor.render(frame, frame.area(), &UiTheme::fallback()))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]
@@ -810,6 +819,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         assert!(!editor.is_valid_json);
         // Plain text should be detected as Plain type
@@ -827,6 +837,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         assert!(!editor.is_valid_json);
         let content_type = detect_content_type(&editor.content());
@@ -850,6 +861,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         let creation_time = start.elapsed();
 
@@ -878,6 +890,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Content should be formatted (pretty-printed)
@@ -894,6 +907,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
         assert_eq!(editor.mode, VimMode::Normal);
     }
@@ -908,6 +922,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Press ':' to enter command mode
@@ -948,6 +963,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Press ':' to enter command mode
@@ -980,6 +996,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // For formatted JSON, content equals original so not modified
@@ -1006,6 +1023,7 @@ mod tests {
             "jsonb".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // After formatting, content differs from the input
@@ -1030,6 +1048,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         assert_eq!(editor.content(), plain);
@@ -1052,6 +1071,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Press Esc in Normal mode with no changes
@@ -1074,6 +1094,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Should start unmodified
@@ -1122,6 +1143,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Press 'q' in Normal mode
@@ -1144,6 +1166,7 @@ mod tests {
             "text".to_string(),
             0,
             0,
+            themes::one_dark(),
         );
 
         // Should start unmodified

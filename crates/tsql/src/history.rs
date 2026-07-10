@@ -251,7 +251,7 @@ impl History {
             .collect();
 
         // Sort by score descending (best matches first).
-        matches.sort_by(|a, b| b.score.cmp(&a.score));
+        matches.sort_by_key(|b| std::cmp::Reverse(b.score));
 
         matches
     }

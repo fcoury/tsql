@@ -46,4 +46,6 @@ pub use password_prompt::{PasswordPrompt, PasswordPromptResult};
 pub use row_detail::{RowDetailAction, RowDetailModal, YankFormat};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};
-pub use theme::{load_theme, zone_block, zone_inner, zone_label, zone_scrollbar_area, UiTheme};
+pub use theme::{
+    load_theme, overlay_block, zone_block, zone_inner, zone_label, zone_scrollbar_area, UiTheme,
+};

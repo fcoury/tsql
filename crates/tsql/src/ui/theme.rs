@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding};
+use ratatui::widgets::{Block, BorderType, Borders, Padding};
 use tui_syntax::{themes, Theme};
 
 use crate::app::Mode;
@@ -35,9 +35,13 @@ pub struct UiTheme {
     pub success: Color,
     pub warning: Color,
     pub error: Color,
+    pub transaction: Color,
     pub pill_fg: Color,
     pub scrollbar: Style,
     pub grid_header: Style,
+    pub overlay: Style,
+    pub overlay_border: Style,
+    pub overlay_title: Style,
 }
 
 impl Default for UiTheme {
@@ -76,12 +80,16 @@ impl UiTheme {
             success: rgb(0x98, 0xC3, 0x79),
             warning: rgb(0xE5, 0xC0, 0x7B),
             error: rgb(0xE0, 0x6C, 0x75),
+            transaction: rgb(0xC6, 0x78, 0xDD),
             pill_fg: ink,
             scrollbar: Style::default().fg(text_muted),
             grid_header: Style::default()
                 .fg(text)
                 .bg(rgb(0x2C, 0x31, 0x3A))
                 .add_modifier(Modifier::BOLD),
+            overlay: Style::default().fg(text).bg(rgb(0x33, 0x3B, 0x49)),
+            overlay_border: Style::default().fg(rgb(0x5C, 0x66, 0x73)),
+            overlay_title: Style::default().fg(accent).add_modifier(Modifier::BOLD),
         }
     }
 
@@ -158,9 +166,13 @@ impl UiTheme {
             success: resolve_color(theme, "ui.success", fallback.success),
             warning: resolve_color(theme, "ui.warning", fallback.warning),
             error: resolve_color(theme, "ui.error", fallback.error),
+            transaction: resolve_color(theme, "ui.transaction", fallback.transaction),
             pill_fg: resolve_color(theme, "ui.statusline.mode", fallback.pill_fg),
             scrollbar: resolve_style(theme, "ui.scrollbar", fallback.scrollbar),
             grid_header: resolve_style(theme, "ui.grid.header", fallback.grid_header),
+            overlay: normalize_explicit(resolve_style(theme, "ui.overlay", fallback.overlay)),
+            overlay_border: resolve_style(theme, "ui.overlay.border", fallback.overlay_border),
+            overlay_title: resolve_style(theme, "ui.overlay.title", fallback.overlay_title),
         }
     }
 
@@ -260,6 +272,24 @@ pub fn zone_scrollbar_area(area: Rect) -> Rect {
         y: area.y.saturating_add(1).min(area.bottom()),
         width: u16::from(area.width > 0),
         height: area.height.saturating_sub(1),
+    }
+}
+
+/// Build the standard floating-overlay block: a rounded border and themed
+/// title on the overlay surface tone.
+pub fn overlay_block(title: &str, theme: &UiTheme) -> Block<'static> {
+    let block = Block::default()
+        .style(theme.overlay)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.overlay_border);
+    if title.is_empty() {
+        block
+    } else {
+        block.title_top(Line::from(Span::styled(
+            format!(" {title} "),
+            theme.overlay_title,
+        )))
     }
 }
 
@@ -413,6 +443,10 @@ mod tests {
                 "ui.success",
                 "ui.warning",
                 "ui.error",
+                "ui.transaction",
+                "ui.overlay",
+                "ui.overlay.border",
+                "ui.overlay.title",
                 "ui.scrollbar",
                 "ui.grid.header",
             ] {
@@ -454,6 +488,7 @@ mod tests {
                 ui.editor_selection,
                 ui.search_match,
                 ui.search_match_current,
+                ui.overlay,
             ] {
                 let foreground = style.fg.expect("explicit style foreground");
                 let background = style.bg.expect("explicit style background");

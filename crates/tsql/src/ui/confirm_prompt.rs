@@ -14,6 +14,7 @@ use ratatui::widgets::{BorderType, Borders};
 use ratatui::Frame;
 use tui_confirm_dialog_with_mouse::{ConfirmDialog, ConfirmDialogState};
 
+use super::UiTheme;
 use crate::config::ConnectionEntry;
 use crate::update::UpdateInfo;
 
@@ -131,18 +132,21 @@ impl ConfirmPrompt {
     }
 
     /// Render the confirmation dialog.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        // Confirmations keep a warning-colored border on purpose: they are the
+        // one overlay that should read as urgent.
         let dialog = ConfirmDialog::new()
+            .bg(theme.overlay.bg.unwrap_or(Color::Reset))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
-            .button_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme.warning))
+            .button_style(Style::default().fg(theme.text))
             .selected_button_style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )
-            .text_style(Style::default().fg(Color::White));
+            .text_style(Style::default().fg(theme.text));
 
         frame.render_stateful_widget(dialog, area, &mut self.state);
     }

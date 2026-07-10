@@ -19,9 +19,7 @@ use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Terminal;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -45,16 +43,16 @@ use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
-    load_theme, quote_identifier, zone_block, zone_inner, zone_label, zone_scrollbar_area,
-    AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup,
-    ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
-    ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, CursorShape, DataGrid,
-    FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
-    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
-    KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
-    PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
-    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
-    UiTheme, YankFormat,
+    load_theme, overlay_block, quote_identifier, zone_block, zone_inner, zone_label,
+    zone_scrollbar_area, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt,
+    CompletionKind, CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult,
+    ConnectionFormAction, ConnectionFormModal, ConnectionInfo, ConnectionManagerAction,
+    ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker, GridKeyResult, GridModel,
+    GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction, JsonEditorModal,
+    KeyHintPopup, KeySequenceAction, KeySequenceCompletion, KeySequenceHandlerWithContext,
+    KeySequenceResult, PasswordPrompt, PasswordPromptResult, PendingKey, PickerAction, Priority,
+    QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
+    SidebarAction, StatusLineBuilder, StatusSegment, TableInfo, UiTheme, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -837,24 +835,27 @@ fn is_row_returning_query(query: &str) -> bool {
         || first.eq_ignore_ascii_case("explain")
 }
 
+/// Compute the query panel height from the main-column content height.
+///
+/// `main_height` excludes the full-width status strip, which is split off
+/// before the sidebar/main division.
 fn compute_query_panel_height(
     main_height: u16,
     mode: Mode,
     non_insert_mode: QueryHeightMode,
     editor_line_count: usize,
 ) -> u16 {
-    let available_for_query = main_height.saturating_sub(STATUS_HEIGHT);
-    if available_for_query == 0 {
+    if main_height == 0 {
         return 0;
     }
 
-    // Preserve space for the status line and (when possible) a minimal grid.
+    // Preserve space for a minimal grid when possible.
     let layout_safe_max = {
-        let max_with_min_grid = main_height.saturating_sub(STATUS_HEIGHT + MIN_GRID_HEIGHT);
+        let max_with_min_grid = main_height.saturating_sub(MIN_GRID_HEIGHT);
         if max_with_min_grid > 0 {
             max_with_min_grid
         } else {
-            available_for_query
+            main_height
         }
     };
 
@@ -2437,6 +2438,9 @@ pub struct App {
     /// Resolved theme for UI chrome.
     pub ui_theme: UiTheme,
 
+    /// Loaded syntax theme, shared with modal-local highlighters.
+    pub syntax_theme: tui_syntax::Theme,
+
     /// Diagnostics produced while constructing the application.
     startup_warnings: Vec<String>,
 
@@ -2705,7 +2709,8 @@ impl App {
             connection_form_keymap,
 
             editor,
-            highlighter: create_sql_highlighter(syntax_theme),
+            highlighter: create_sql_highlighter(syntax_theme.clone()),
+            syntax_theme,
             search: SearchPrompt::new(),
             search_target: SearchTarget::Editor,
             command: CommandPrompt::new(),
@@ -3011,7 +3016,15 @@ impl App {
             terminal.draw(|frame| {
                 let size = frame.area();
 
-                // Split horizontally for sidebar + main content
+                // Reserve the bottom row for a full-width status strip, then
+                // split the remaining content into sidebar + main.
+                let vertical = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
+                    .split(size);
+                let content_area = vertical[0];
+                let status_area = vertical[1];
+
                 let horizontal = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
@@ -3022,7 +3035,7 @@ impl App {
                         }),
                         Constraint::Min(60), // Main content minimum width
                     ])
-                    .split(size);
+                    .split(content_area);
 
                 let sidebar_area = horizontal[0];
                 let main_area = horizontal[1];
@@ -3072,13 +3085,11 @@ impl App {
                     .constraints([
                         Constraint::Length(query_height),
                         Constraint::Min(MIN_GRID_HEIGHT),
-                        Constraint::Length(STATUS_HEIGHT),
                     ])
                     .split(main_area);
 
                 let query_area = chunks[0];
                 let grid_area = chunks[1];
-                let status_area = chunks[2];
 
                 // Store rendered areas for mouse click handling
                 self.render_query_area = Some(query_area);
@@ -3253,11 +3264,7 @@ impl App {
                     // Clear the overlay area
                     frame.render_widget(Clear, overlay_area);
 
-                    // Create bordered block
-                    let block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .style(Style::default().bg(Color::Black));
+                    let block = overlay_block("", &self.ui_theme);
 
                     let inner = block.inner(overlay_area);
                     frame.render_widget(block, overlay_area);
@@ -3274,10 +3281,10 @@ impl App {
                     // Render spinner with label
                     let throbber = Throbber::default()
                         .label(" Executing...")
-                        .style(Style::default().fg(Color::White))
+                        .style(Style::default().fg(self.ui_theme.text))
                         .throbber_style(
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(self.ui_theme.accent)
                                 .add_modifier(Modifier::BOLD),
                         )
                         .throbber_set(BRAILLE_SIX);
@@ -3293,7 +3300,7 @@ impl App {
                         let elapsed = start_time.elapsed();
                         let elapsed_text = format!("{:.1}s elapsed", elapsed.as_secs_f64());
                         let elapsed_widget = Paragraph::new(elapsed_text)
-                            .style(Style::default().fg(Color::DarkGray))
+                            .style(Style::default().fg(self.ui_theme.text_muted))
                             .alignment(Alignment::Center);
                         frame.render_widget(elapsed_widget, chunks[1]);
                     }
@@ -3303,17 +3310,17 @@ impl App {
                 frame.render_widget(self.status_line(status_area.width), status_area);
 
                 if let Some(ref mut help) = self.help_popup {
-                    help.render(frame, size);
+                    help.render(frame, size, &self.ui_theme);
                 }
 
                 // Render history picker if open
                 if let Some(ref mut picker) = self.history_picker {
-                    picker.render(frame, size);
+                    picker.render(frame, size, &self.ui_theme);
                 }
 
                 // Render connection picker if open
                 if let Some(ref mut picker) = self.connection_picker {
-                    picker.render(frame, size);
+                    picker.render(frame, size, &self.ui_theme);
                 }
 
                 if self.search.active {
@@ -3332,12 +3339,12 @@ impl App {
                         SearchTarget::Grid => "/ Search Grid (Enter apply, Esc cancel)",
                     };
 
-                    self.search.textarea.set_block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(search_title)
-                            .border_style(Style::default().fg(Color::Yellow)),
-                    );
+                    self.search
+                        .textarea
+                        .set_block(overlay_block(search_title, &self.ui_theme));
+                    self.search
+                        .textarea
+                        .set_cursor_style(self.ui_theme.editor_cursor);
 
                     frame.render_widget(Clear, area);
                     frame.render_widget(&self.search.textarea, area);
@@ -3354,12 +3361,13 @@ impl App {
                         height: h,
                     };
 
-                    self.command.textarea.set_block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(": Command (Enter run, Esc cancel)")
-                            .border_style(Style::default().fg(Color::Magenta)),
-                    );
+                    self.command.textarea.set_block(overlay_block(
+                        ": Command (Enter run, Esc cancel)",
+                        &self.ui_theme,
+                    ));
+                    self.command
+                        .textarea
+                        .set_cursor_style(self.ui_theme.editor_cursor);
 
                     frame.render_widget(Clear, area);
                     frame.render_widget(&self.command.textarea, area);
@@ -3412,24 +3420,22 @@ impl App {
                                     CompletionKind::Function => "F",
                                 };
                                 let style = if is_selected {
-                                    Style::default().bg(Color::Blue).fg(Color::White)
+                                    self.ui_theme.selection
                                 } else {
                                     Style::default()
                                 };
                                 Line::from(vec![
                                     Span::styled(
                                         format!("{} ", prefix),
-                                        Style::default().fg(Color::DarkGray),
+                                        Style::default().fg(self.ui_theme.text_muted),
                                     ),
                                     Span::styled(&item.label, style),
                                 ])
                             })
                             .collect();
 
-                        let completion_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title("Completions (Tab select, Esc cancel)")
-                            .border_style(Style::default().fg(Color::Cyan));
+                        let completion_block =
+                            overlay_block("Completions (Tab select, Esc cancel)", &self.ui_theme);
 
                         let completion_list = Paragraph::new(lines).block(completion_block.clone());
 
@@ -3452,12 +3458,14 @@ impl App {
                                     .end_symbol(Some("▼"))
                                     .thumb_symbol("█")
                                     .track_symbol(Some("░"))
+                                    .style(self.ui_theme.scrollbar)
                             } else {
                                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                                     .begin_symbol(None)
                                     .end_symbol(None)
                                     .thumb_symbol("█")
                                     .track_symbol(Some("│"))
+                                    .style(self.ui_theme.scrollbar)
                             };
 
                             let scroll_offset = self.completion.scroll_offset(max_visible);
@@ -3519,10 +3527,7 @@ impl App {
                         "Edit: {}{} (Enter confirm, Esc cancel)",
                         col_name, modified_indicator
                     );
-                    let edit_block = Block::default()
-                        .borders(Borders::ALL)
-                        .title(title)
-                        .border_style(Style::default().fg(Color::Yellow));
+                    let edit_block = overlay_block(&title, &self.ui_theme);
 
                     // Get visible text with cursor position
                     let (visible_text, cursor_pos) = self.cell_editor.visible_text(inner_width);
@@ -3540,16 +3545,13 @@ impl App {
                         display_spans.push(Span::raw(before));
                         display_spans.push(Span::styled(
                             cursor_char.to_string(),
-                            Style::default().bg(Color::White).fg(Color::Black),
+                            self.ui_theme.editor_cursor,
                         ));
                         display_spans.push(Span::raw(after));
                     } else {
                         // Cursor is at end
                         display_spans.push(Span::raw(visible_text));
-                        display_spans.push(Span::styled(
-                            " ",
-                            Style::default().bg(Color::White).fg(Color::Black),
-                        ));
+                        display_spans.push(Span::styled(" ", self.ui_theme.editor_cursor));
                     }
 
                     // Show scroll indicators if needed
@@ -3569,9 +3571,7 @@ impl App {
                         ""
                     };
 
-                    let edit_content = Paragraph::new(Line::from(display_spans))
-                        .block(edit_block)
-                        .style(Style::default().fg(Color::White));
+                    let edit_content = Paragraph::new(Line::from(display_spans)).block(edit_block);
 
                     frame.render_widget(Clear, popup_area);
                     frame.render_widget(edit_content, popup_area);
@@ -3592,48 +3592,48 @@ impl App {
                             width: popup_area.width.saturating_sub(2),
                             height: 1,
                         };
-                        let info_widget =
-                            Paragraph::new(info).style(Style::default().fg(Color::DarkGray));
+                        let info_widget = Paragraph::new(info)
+                            .style(Style::default().fg(self.ui_theme.text_muted));
                         frame.render_widget(info_widget, info_area);
                     }
                 }
 
                 // Render JSON editor modal if active
                 if let Some(ref mut json_editor) = self.json_editor {
-                    json_editor.render(frame, size);
+                    json_editor.render(frame, size, &self.ui_theme);
                 }
 
                 // Render row detail modal if active
                 if let Some(ref mut row_detail) = self.row_detail {
-                    row_detail.render(frame, size);
+                    row_detail.render(frame, size, &self.ui_theme);
                 }
 
                 // Render connection manager modal if active
                 if let Some(ref mut manager) = self.connection_manager {
-                    manager.render(frame, size);
+                    manager.render(frame, size, &self.ui_theme);
                 }
 
                 // Render connection form modal if active (on top of manager)
                 if let Some(ref form) = self.connection_form {
-                    form.render(frame, size);
+                    form.render(frame, size, &self.ui_theme);
                 }
 
                 // Render key hint popup if active (shows after timeout when 'g' is pending)
                 if show_key_hint {
                     if let Some(pending_key) = pending_key_for_hint {
                         let hint_popup = KeyHintPopup::new(pending_key);
-                        hint_popup.render(frame, size);
+                        hint_popup.render(frame, size, &self.ui_theme);
                     }
                 }
 
                 // Render password prompt if active
                 if let Some(ref prompt) = self.password_prompt {
-                    prompt.render(frame, size);
+                    prompt.render(frame, size, &self.ui_theme);
                 }
 
                 // Render AI assistant modal.
                 if let Some(ref mut modal) = self.ai_modal {
-                    modal.render(frame, size);
+                    modal.render(frame, size, &self.ui_theme);
                 }
 
                 // Error popup (modal).
@@ -3667,15 +3667,19 @@ impl App {
                             height: popup_height,
                         };
 
-                        let block = Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .title(" Error (Enter/Esc dismiss) ")
-                            .border_style(Style::default().fg(Color::Red));
+                        // Errors keep a red border on purpose — the semantic
+                        // exception to the calm overlay recipe.
+                        let block = overlay_block("", &self.ui_theme)
+                            .title_top(Line::from(Span::styled(
+                                " Error (Enter/Esc dismiss) ",
+                                Style::default()
+                                    .fg(self.ui_theme.error)
+                                    .add_modifier(Modifier::BOLD),
+                            )))
+                            .border_style(Style::default().fg(self.ui_theme.error));
 
                         let text = Paragraph::new(err.as_str())
                             .block(block)
-                            .style(Style::default().fg(Color::White))
                             .wrap(ratatui::widgets::Wrap { trim: false });
 
                         frame.render_widget(Clear, popup_area);
@@ -3685,7 +3689,7 @@ impl App {
 
                 // Render confirmation prompt if active (topmost layer)
                 if let Some(ref mut prompt) = self.confirm_prompt {
-                    prompt.render(frame, size);
+                    prompt.render(frame, size, &self.ui_theme);
                 }
             })?;
 
@@ -3719,10 +3723,8 @@ impl App {
                             break;
                         }
                     }
-                    Event::Mouse(mouse) => {
-                        if self.on_mouse(mouse) {
-                            break;
-                        }
+                    Event::Mouse(mouse) if self.on_mouse(mouse) => {
+                        break;
                     }
                     _ => {}
                 }
@@ -4997,7 +4999,14 @@ impl App {
         // Determine if we should use the multiline JSON editor
         if should_use_multiline_editor(&value) || is_json_column_type(&col_type) {
             // Open JSON editor modal
-            self.json_editor = Some(JsonEditorModal::new(value, col_name, col_type, row, col));
+            self.json_editor = Some(JsonEditorModal::new(
+                value,
+                col_name,
+                col_type,
+                row,
+                col,
+                self.syntax_theme.clone(),
+            ));
         } else {
             // Use inline editor for simple values
             self.cell_editor.open(row, col, value);
@@ -5014,7 +5023,13 @@ impl App {
         let values = self.grid.rows[row].clone();
         let col_types = self.grid.col_types.clone();
 
-        self.row_detail = Some(RowDetailModal::new(headers, values, col_types, row));
+        self.row_detail = Some(RowDetailModal::new(
+            headers,
+            values,
+            col_types,
+            row,
+            self.syntax_theme.clone(),
+        ));
     }
 
     /// Handle key events for the row detail modal.
@@ -10836,6 +10851,8 @@ impl App {
         let status = self.last_status.as_deref().unwrap_or("Ready").to_string();
         let status_style = if self.last_error.is_some() {
             Style::default().fg(self.ui_theme.error)
+        } else if self.last_status.is_none() {
+            Style::default().fg(self.ui_theme.success)
         } else {
             Style::default().fg(self.ui_theme.text_muted)
         };
@@ -10850,12 +10867,13 @@ impl App {
 
         // Build status line with priority-based segments
         let line = StatusLineBuilder::new()
+            .separator(" · ")
             .separator_style(Style::default().fg(self.ui_theme.text_muted))
             // Critical: Mode (always shown)
             .segment(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
             // Critical: active pane (always shown)
             .segment(
-                StatusSegment::new(format!("[{}]", self.focus.label()), Priority::Critical)
+                StatusSegment::new(self.focus.label().to_string(), Priority::Critical)
                     .style(focus_style),
             )
             // Critical: Connection info
@@ -10878,7 +10896,7 @@ impl App {
             .segment_if(
                 self.db.in_transaction,
                 StatusSegment::new("TXN", Priority::High)
-                    .style(Style::default().fg(self.ui_theme.accent_visual)),
+                    .style(Style::default().fg(self.ui_theme.transaction)),
             )
             // Medium: Row info
             .segment(StatusSegment::new(row_info, Priority::Medium).min_width(50))
@@ -11830,10 +11848,10 @@ mod tests {
 
     #[test]
     fn test_compute_query_panel_height_respects_layout_safety_cap() {
-        // main_height=6 leaves 5 rows after status line.
-        // With min grid reservation (3), query max should be 2.
+        // main_height=6 is the content height (status is split off separately).
+        // With min grid reservation (3), query max should be 3.
         let height = compute_query_panel_height(6, Mode::Insert, QueryHeightMode::Minimized, 50);
-        assert_eq!(height, 2);
+        assert_eq!(height, 3);
     }
 
     #[test]

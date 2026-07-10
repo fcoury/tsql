@@ -8,18 +8,16 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
-use tui_syntax::{html, json, themes, Highlighter};
+use tui_syntax::{html, json, Highlighter, Theme};
 
 use crate::util::{detect_content_type, ContentType};
 
-use super::style::{on_selected_bg, selected_muted_style, selected_row_style};
+use super::{overlay_block, UiTheme};
 
 /// Format to use when yanking from the row detail view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,11 +80,12 @@ impl RowDetailModal {
         values: Vec<String>,
         col_types: Vec<String>,
         row_index: usize,
+        syntax_theme: Theme,
     ) -> Self {
         let field_count = headers.len();
 
         // Create highlighter with JSON and HTML support
-        let mut highlighter = Highlighter::new(themes::one_dark());
+        let mut highlighter = Highlighter::new(syntax_theme);
         let _ = highlighter.register_language(json());
         let _ = highlighter.register_language(html());
 
@@ -260,7 +259,7 @@ impl RowDetailModal {
     }
 
     /// Render the row detail modal.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate modal size (80% of screen)
         let modal_width = (area.width as f32 * 0.85) as u16;
         let modal_height = (area.height as f32 * 0.85) as u16;
@@ -279,20 +278,12 @@ impl RowDetailModal {
 
         // Build title
         let title = format!(
-            " Row {} Details ({} columns) ",
+            "Row {} Details ({} columns)",
             self.row_index + 1,
             self.field_count
         );
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block(&title, theme);
 
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
@@ -311,18 +302,27 @@ impl RowDetailModal {
         self.visible_height = content_area.height as usize;
 
         // Render content with scrolling
-        self.render_content(frame, content_area);
+        self.render_content(frame, content_area, theme);
 
         // Render footer with navigation hints
-        self.render_footer(frame, footer_area);
+        self.render_footer(frame, footer_area, theme);
 
         // Render scrollbar if content overflows
         if self.field_count > self.visible_height / 3 {
-            self.render_scrollbar(frame, content_area);
+            self.render_scrollbar(frame, content_area, theme);
         }
     }
 
-    fn render_content(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_content(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        // Selected-value spans keep their syntax fg but sit on the selection bg.
+        let on_selection_bg = |style: Style| -> Style {
+            let mut style = style.bg(theme.selection.bg.unwrap_or_default());
+            if style.fg.is_none() {
+                style.fg = theme.selection.fg;
+            }
+            style
+        };
+
         let mut lines: Vec<Line> = Vec::new();
 
         // Calculate which fields to show based on scroll offset
@@ -346,11 +346,11 @@ impl RowDetailModal {
             // Field header line with type info
             let header_style = if is_selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD)
             };
 
@@ -363,15 +363,15 @@ impl RowDetailModal {
             let selector = if is_selected { "> " } else { "  " };
 
             lines.push(Line::from(vec![
-                Span::styled(selector, Style::default().fg(Color::Cyan)),
+                Span::styled(selector, Style::default().fg(theme.accent)),
                 Span::styled(header, header_style),
-                Span::styled(type_info, Style::default().fg(Color::DarkGray)),
+                Span::styled(type_info, Style::default().fg(theme.text_muted)),
             ]));
 
             // Value line(s) with syntax highlighting
             let content_type = detect_content_type(&value);
             let value_style = if is_selected {
-                selected_row_style()
+                theme.selection
             } else {
                 Style::default()
             };
@@ -389,9 +389,9 @@ impl RowDetailModal {
                     value.clone()
                 };
                 let display_style = if is_selected {
-                    selected_muted_style()
+                    theme.selection
                 } else {
-                    value_style.fg(Color::DarkGray)
+                    value_style.fg(theme.text_muted)
                 };
                 lines.push(Line::from(vec![
                     Span::styled("    ", value_style),
@@ -405,7 +405,7 @@ impl RowDetailModal {
                 let mut spans = vec![Span::styled("    ", value_style)];
                 for span in highlighted {
                     spans.push(if is_selected {
-                        Span::styled(span.content.to_string(), on_selected_bg(span.style))
+                        Span::styled(span.content.to_string(), on_selection_bg(span.style))
                     } else {
                         span
                     });
@@ -422,7 +422,7 @@ impl RowDetailModal {
                     let mut spans = vec![Span::styled("    ", value_style)];
                     for span in highlighted {
                         spans.push(if is_selected {
-                            Span::styled(span.content.to_string(), on_selected_bg(span.style))
+                            Span::styled(span.content.to_string(), on_selection_bg(span.style))
                         } else {
                             span
                         });
@@ -436,9 +436,9 @@ impl RowDetailModal {
                             Span::styled(
                                 format!("... ({} more lines)", value_lines_count - max_lines),
                                 if is_selected {
-                                    selected_muted_style()
+                                    theme.selection
                                 } else {
-                                    Style::default().fg(Color::DarkGray)
+                                    Style::default().fg(theme.text_muted)
                                 },
                             ),
                         ]));
@@ -477,33 +477,34 @@ impl RowDetailModal {
         vec![Span::raw(value.to_string())]
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let footer = Line::from(vec![
-            Span::styled(" j/k ", Style::default().fg(Color::Yellow)),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("e/Enter ", Style::default().fg(Color::Yellow)),
-            Span::styled("edit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("y… ", Style::default().fg(Color::Yellow)),
-            Span::styled("yank  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("g/G ", Style::default().fg(Color::Yellow)),
-            Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q/Esc ", Style::default().fg(Color::Yellow)),
-            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" j/k ", Style::default().fg(theme.warning)),
+            Span::styled("navigate  ", Style::default().fg(theme.text_muted)),
+            Span::styled("e/Enter ", Style::default().fg(theme.warning)),
+            Span::styled("edit  ", Style::default().fg(theme.text_muted)),
+            Span::styled("y… ", Style::default().fg(theme.warning)),
+            Span::styled("yank  ", Style::default().fg(theme.text_muted)),
+            Span::styled("g/G ", Style::default().fg(theme.warning)),
+            Span::styled("top/bottom  ", Style::default().fg(theme.text_muted)),
+            Span::styled("q/Esc ", Style::default().fg(theme.warning)),
+            Span::styled("close  ", Style::default().fg(theme.text_muted)),
             Span::raw(" ".repeat(area.width.saturating_sub(80) as usize)),
             Span::styled(
                 format!("{}/{}", self.selected_field + 1, self.field_count),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             ),
         ]);
         frame.render_widget(Paragraph::new(footer), area);
     }
 
-    fn render_scrollbar(&self, frame: &mut Frame, area: Rect) {
+    fn render_scrollbar(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"))
             .track_symbol(Some("│"))
-            .thumb_symbol("█");
+            .thumb_symbol("█")
+            .style(theme.scrollbar);
 
         let mut scrollbar_state =
             ScrollbarState::new(self.field_count).position(self.selected_field);
@@ -536,9 +537,10 @@ fn truncate_for_display(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use tui_syntax::themes;
 
     fn create_test_modal() -> RowDetailModal {
         RowDetailModal::new(
@@ -550,6 +552,7 @@ mod tests {
             ],
             vec!["int4".to_string(), "text".to_string(), "jsonb".to_string()],
             0,
+            themes::one_dark(),
         )
     }
 
@@ -562,30 +565,32 @@ mod tests {
     }
 
     #[test]
-    fn test_selected_plain_value_uses_visible_foreground_on_dark_background() {
+    fn test_selected_plain_value_uses_visible_foreground_on_overlay_surface() {
         let mut modal = create_test_modal();
+        let theme = UiTheme::fallback();
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| modal.render(frame, frame.area()))
+            .draw(|frame| modal.render(frame, frame.area(), &theme))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]
-    fn test_selected_highlighted_value_uses_visible_foreground_on_dark_background() {
+    fn test_selected_highlighted_value_uses_visible_foreground_on_overlay_surface() {
         let mut modal = create_test_modal();
         modal.selected_field = 2;
+        let theme = UiTheme::fallback();
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| modal.render(frame, frame.area()))
+            .draw(|frame| modal.render(frame, frame.area(), &theme))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]

@@ -13,14 +13,14 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
+        Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
     },
     Frame,
 };
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
-use super::style::{selected_line, selected_row_style};
+use super::{overlay_block, UiTheme};
 
 /// A function that returns an optional styled prefix `(text, style)` for a picker item.
 type PrefixFn<T> = fn(&T) -> Option<(&'static str, Style)>;
@@ -384,7 +384,7 @@ impl<T: Clone> FuzzyPicker<T> {
     }
 
     /// Render the picker as a centered popup.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate popup size based on content.
         let max_width = (area.width as usize * 80 / 100).clamp(40, 100) as u16;
         let max_height = (area.height as usize * 70 / 100).clamp(10, 30) as u16;
@@ -420,10 +420,7 @@ impl<T: Clone> FuzzyPicker<T> {
         frame.render_widget(Clear, popup);
 
         // Create the block.
-        let block = Block::default()
-            .title(format!(" {} ", self.title))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block(&self.title, theme);
 
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -438,22 +435,21 @@ impl<T: Clone> FuzzyPicker<T> {
         .split(inner);
 
         // Render input line.
-        self.render_input(frame, chunks[0]);
+        self.render_input(frame, chunks[0], theme);
 
         // Render separator.
-        let sep = Paragraph::new("─".repeat(chunks[1].width as usize))
-            .style(Style::default().fg(Color::DarkGray));
+        let sep = Paragraph::new("─".repeat(chunks[1].width as usize)).style(theme.overlay_border);
         frame.render_widget(sep, chunks[1]);
 
         // Render list.
-        self.render_list(frame, chunks[2]);
+        self.render_list(frame, chunks[2], theme);
 
         // Render status.
-        self.render_status(frame, chunks[3]);
+        self.render_status(frame, chunks[3], theme);
     }
 
-    fn render_input(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = vec![Span::styled("> ", Style::default().fg(Color::Yellow))];
+    fn render_input(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.accent))];
 
         // Query text with cursor.
         let query_before: String = self.query.chars().take(self.cursor).collect();
@@ -461,17 +457,14 @@ impl<T: Clone> FuzzyPicker<T> {
         let query_after: String = self.query.chars().skip(self.cursor + 1).collect();
 
         spans.push(Span::raw(query_before));
-        spans.push(Span::styled(
-            cursor_char.to_string(),
-            Style::default().bg(Color::White).fg(Color::Black),
-        ));
+        spans.push(Span::styled(cursor_char.to_string(), theme.editor_cursor));
         spans.push(Span::raw(query_after));
 
         let input = Paragraph::new(Line::from(spans));
         frame.render_widget(input, area);
     }
 
-    fn render_list(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let visible_height = area.height as usize;
         let total_items = self.filtered.len();
         let needs_scrollbar = total_items > visible_height;
@@ -508,7 +501,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 let mut body_line = if filtered_item.indices.is_empty() {
                     Line::from(text)
                 } else {
-                    highlight_matches(&text, &filtered_item.indices)
+                    highlight_matches(&text, &filtered_item.indices, theme.warning)
                 };
 
                 // Prepend the styled prefix if provided.
@@ -521,7 +514,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 }
 
                 if is_selected {
-                    ListItem::new(selected_line(body_line)).style(selected_row_style())
+                    ListItem::new(body_line).style(theme.selection)
                 } else {
                     ListItem::new(body_line)
                 }
@@ -542,6 +535,7 @@ impl<T: Clone> FuzzyPicker<T> {
                     .end_symbol(Some("▼"))
                     .thumb_symbol("█")
                     .track_symbol(Some("░"))
+                    .style(theme.scrollbar)
             } else {
                 // Minimal scrollbar
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -549,6 +543,7 @@ impl<T: Clone> FuzzyPicker<T> {
                     .end_symbol(None)
                     .thumb_symbol("█")
                     .track_symbol(Some("│"))
+                    .style(theme.scrollbar)
             };
 
             let mut scrollbar_state = ScrollbarState::new(total_items).position(self.scroll_offset);
@@ -557,7 +552,7 @@ impl<T: Clone> FuzzyPicker<T> {
         }
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect) {
+    fn render_status(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let status = format!(
             " {}/{} ",
             if self.filtered.is_empty() {
@@ -568,7 +563,7 @@ impl<T: Clone> FuzzyPicker<T> {
             self.filtered.len()
         );
 
-        let status_widget = Paragraph::new(status).style(Style::default().fg(Color::DarkGray));
+        let status_widget = Paragraph::new(status).style(Style::default().fg(theme.text_muted));
         frame.render_widget(status_widget, area);
     }
 
@@ -629,7 +624,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 .collect();
 
             // Sort by score descending.
-            matches.sort_by(|a, b| b.score.cmp(&a.score));
+            matches.sort_by_key(|b| std::cmp::Reverse(b.score));
             self.filtered = matches;
         }
 
@@ -640,7 +635,7 @@ impl<T: Clone> FuzzyPicker<T> {
 }
 
 /// Highlight matched characters in a string.
-fn highlight_matches(text: &str, indices: &[u32]) -> Line<'static> {
+fn highlight_matches(text: &str, indices: &[u32], match_fg: Color) -> Line<'static> {
     let indices_set: std::collections::HashSet<usize> =
         indices.iter().map(|&i| i as usize).collect();
 
@@ -654,9 +649,7 @@ fn highlight_matches(text: &str, indices: &[u32]) -> Line<'static> {
         if is_match != current_is_match && !current_span.is_empty() {
             // Flush current span.
             let style = if current_is_match {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(match_fg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -671,9 +664,7 @@ fn highlight_matches(text: &str, indices: &[u32]) -> Line<'static> {
     // Flush remaining.
     if !current_span.is_empty() {
         let style = if current_is_match {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(match_fg).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -699,7 +690,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -714,33 +705,35 @@ mod tests {
     }
 
     #[test]
-    fn test_selected_row_uses_visible_foreground_on_dark_background() {
+    fn test_selected_row_uses_visible_foreground_on_overlay_surface() {
         let items = vec!["alpha", "beta", "gamma"];
         let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
+        let theme = UiTheme::fallback();
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| picker.render(frame, frame.area()))
+            .draw(|frame| picker.render(frame, frame.area(), &theme))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]
-    fn test_selected_row_with_fuzzy_match_uses_visible_foreground_on_dark_background() {
+    fn test_selected_row_with_fuzzy_match_uses_visible_foreground_on_overlay_surface() {
         let items = vec!["alpha", "beta", "gamma"];
         let mut picker: FuzzyPicker<&str> = FuzzyPicker::new(items, "Test");
         picker.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
 
+        let theme = UiTheme::fallback();
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| picker.render(frame, frame.area()))
+            .draw(|frame| picker.render(frame, frame.area(), &theme))
             .unwrap();
 
-        assert_selected_bg_has_visible_fg(terminal.backend().buffer());
+        assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
     }
 
     #[test]
@@ -897,7 +890,7 @@ mod tests {
         let text = "SELECT * FROM users";
         let indices = vec![0, 1, 2, 14, 15, 16, 17, 18]; // "SEL" and "users"
 
-        let line = highlight_matches(text, &indices);
+        let line = highlight_matches(text, &indices, UiTheme::fallback().warning);
         assert!(!line.spans.is_empty());
     }
 

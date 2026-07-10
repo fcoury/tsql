@@ -305,9 +305,10 @@ fg = "accent"
 
 Supported UI scope families are `ui.background`, `ui.text`, `ui.label`,
 `ui.accent`, `ui.selection`, `ui.cursor`, `ui.search.match`, `ui.statusline`,
-`ui.success`, `ui.warning`, `ui.error`, `ui.scrollbar`, and
-`ui.grid.header`. A missing, unreadable, or malformed custom theme falls back
-to One Dark and reports a nonfatal startup warning.
+`ui.success`, `ui.warning`, `ui.error`, `ui.transaction`, `ui.overlay`
+(modal surfaces, with `ui.overlay.border` and `ui.overlay.title`),
+`ui.scrollbar`, and `ui.grid.header`. A missing, unreadable, or malformed
+custom theme falls back to One Dark and reports a nonfatal startup warning.
 
 ### 1Password integration
 
