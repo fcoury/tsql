@@ -5090,6 +5090,10 @@ impl App {
                 self.replace_editor_with_schema_template(query);
                 false
             }
+            ConfirmContext::ReplaceAndExecuteQuery { query } => {
+                self.replace_editor_and_execute_schema_query(query);
+                false
+            }
         }
     }
 
@@ -5128,6 +5132,9 @@ impl App {
             }
             ConfirmContext::ReplaceQuery { .. } => {
                 self.last_status = Some("Query replacement cancelled".to_string());
+            }
+            ConfirmContext::ReplaceAndExecuteQuery { .. } => {
+                self.last_status = Some("Query execution cancelled".to_string());
             }
         }
     }
@@ -8517,6 +8524,22 @@ impl App {
         self.last_status = Some("Query replaced with schema template".to_string());
     }
 
+    fn replace_editor_and_execute_schema_query(&mut self, query: String) {
+        self.replace_editor_with_schema_template(query);
+        self.execute_query();
+    }
+
+    fn confirm_or_execute_schema_query(&mut self, query: String) {
+        if self.query_editor_has_content() {
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                "Replace the current query and run the generated SELECT?",
+                ConfirmContext::ReplaceAndExecuteQuery { query },
+            ));
+        } else {
+            self.replace_editor_and_execute_schema_query(query);
+        }
+    }
+
     fn confirm_or_replace_with_schema_template(&mut self, query: String) {
         if self.query_editor_has_content() {
             self.confirm_prompt = Some(ConfirmPrompt::new(
@@ -8631,10 +8654,16 @@ impl App {
                     _ => return,
                 };
 
-                if completed.action == KeySequenceAction::SchemaTableName {
-                    self.insert_into_editor_and_focus(&sql);
-                } else {
-                    self.confirm_or_replace_with_schema_template(sql);
+                match completed.action {
+                    KeySequenceAction::SchemaTableName => {
+                        self.insert_into_editor_and_focus(&sql);
+                    }
+                    KeySequenceAction::SchemaTableSelect => {
+                        self.confirm_or_execute_schema_query(sql);
+                    }
+                    _ => {
+                        self.confirm_or_replace_with_schema_template(sql);
+                    }
                 }
             }
         }
@@ -12761,7 +12790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_crud_templates_request_confirmation_for_nonempty_editor() {
+    fn test_schema_edit_templates_request_confirmation_for_nonempty_editor() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -12776,7 +12805,6 @@ mod tests {
         };
 
         for action in [
-            KeySequenceAction::SchemaTableSelect,
             KeySequenceAction::SchemaTableInsert,
             KeySequenceAction::SchemaTableUpdate,
             KeySequenceAction::SchemaTableDelete,
@@ -12809,7 +12837,7 @@ mod tests {
     }
 
     #[test]
-    fn test_confirming_schema_template_replaces_query_and_focuses_editor() {
+    fn test_confirming_schema_select_replaces_and_executes_query() {
         let (tx, rx) = mpsc::unbounded_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -12818,6 +12846,7 @@ mod tests {
         let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
         app.connection_picker = None;
         app.connection_manager = None;
+        app.history = History::new_empty(10);
         app.editor.set_text("SELECT current;".to_string());
         app.focus = Focus::Sidebar(SidebarSection::Schema);
         let context = SchemaTableContext {
@@ -12836,9 +12865,45 @@ mod tests {
         assert_eq!(app.editor.text(), expected);
         assert_eq!(app.focus, Focus::Query);
         assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.history.entries().len(), 1);
+        assert_eq!(app.history.entries()[0].query, expected);
         assert_eq!(
-            app.last_status.as_deref(),
-            Some("Query replaced with schema template")
+            app.last_error.as_deref(),
+            Some("Not connected. Use :connect <url> or set DATABASE_URL.")
+        );
+    }
+
+    #[test]
+    fn test_schema_select_executes_immediately_for_empty_editor() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.history = History::new_empty(10);
+        let context = SchemaTableContext {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+        };
+        let expected = app.build_select_template(&context);
+
+        app.execute_key_sequence_completion(KeySequenceCompletion {
+            action: KeySequenceAction::SchemaTableSelect,
+            context: Some(context),
+        });
+
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(app.editor.text(), expected);
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.history.entries().len(), 1);
+        assert_eq!(app.history.entries()[0].query, expected);
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("Not connected. Use :connect <url> or set DATABASE_URL.")
         );
     }
 

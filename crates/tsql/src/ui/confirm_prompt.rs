@@ -54,6 +54,8 @@ pub enum ConfirmContext {
     OpenAiAssistant { prefill: Option<String> },
     /// Replacing the current query with a generated schema template.
     ReplaceQuery { query: String },
+    /// Replacing the current query with a generated schema query and executing it.
+    ReplaceAndExecuteQuery { query: String },
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -123,7 +125,9 @@ impl ConfirmPrompt {
             | ConfirmContext::CloseConnectionForm
             | ConfirmContext::SwitchConnection { .. }
             | ConfirmContext::OpenAiAssistant { .. } => " Unsaved Changes ",
-            ConfirmContext::ReplaceQuery { .. } => " Replace Query ",
+            ConfirmContext::ReplaceQuery { .. } | ConfirmContext::ReplaceAndExecuteQuery { .. } => {
+                " Replace Query "
+            }
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
             ConfirmContext::ApplyUpdate { .. } => " Apply Update ",
