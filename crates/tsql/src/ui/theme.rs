@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use tui_syntax::{themes, Theme};
 
 use crate::app::Mode;
@@ -275,6 +275,36 @@ pub fn zone_scrollbar_area(area: Rect) -> Rect {
         width: u16::from(area.width > 0),
         height: area.height.saturating_sub(1),
     }
+}
+
+/// Build a soft horizontal cap for a raised card, opencode-style.
+///
+/// A `▄` row above the card (or `▀` below it) painted in the card's tone
+/// against the canvas makes the card edge land mid-cell instead of on a hard
+/// cell boundary. When `accent` is set (focused card), the left edge column
+/// tapers the accent bar into the cap with a quarter-block glyph.
+pub fn card_cap(
+    width: u16,
+    tone: Color,
+    canvas: Color,
+    top: bool,
+    accent: Option<Color>,
+) -> Paragraph<'static> {
+    let glyph = if top { "▄" } else { "▀" };
+    let taper = if top { "▖" } else { "▘" };
+
+    let mut spans = Vec::with_capacity(2);
+    if width > 0 {
+        match accent {
+            Some(accent) => {
+                spans.push(Span::styled(taper, Style::default().fg(accent)));
+                spans.push(Span::raw(glyph.repeat(width.saturating_sub(1) as usize)));
+            }
+            None => spans.push(Span::raw(glyph.repeat(width as usize))),
+        }
+    }
+
+    Paragraph::new(Line::from(spans)).style(Style::default().fg(tone).bg(canvas))
 }
 
 /// Build the standard floating-overlay block: a rounded border and themed

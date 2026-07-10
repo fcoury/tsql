@@ -9,7 +9,7 @@ use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
-use super::{zone_block, zone_label, UiTheme};
+use super::{card_cap, zone_block, zone_label, UiTheme};
 use crate::app::SidebarSection;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
@@ -85,38 +85,54 @@ impl Sidebar {
             connection_count as u16 + 1
         };
         let connections_cap = (area.height * 2 / 5).max(3);
+        // Each panel card gets soft half-block caps above and below, so the
+        // two sections float on the canvas instead of forming one tone wall.
         let chunks = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(connections_height.min(connections_cap)),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(area);
 
         // Store areas for mouse hit testing
-        self.connections_area = Some(chunks[0]);
-        self.schema_area = Some(chunks[2]);
+        self.connections_area = Some(chunks[1]);
+        self.schema_area = Some(chunks[4]);
 
-        // Base-tone groove so the two panel sections read as separate cards.
-        frame.render_widget(
-            Paragraph::new("").style(Style::default().fg(theme.text).bg(theme.bg_base)),
-            chunks[1],
-        );
+        let connections_focused = has_focus && focused_section == SidebarSection::Connections;
+        let schema_focused = has_focus && focused_section == SidebarSection::Schema;
+        let connections_accent = connections_focused.then_some(theme.accent);
+        let schema_accent = schema_focused.then_some(theme.accent);
+
+        for (cap_area, top, accent) in [
+            (chunks[0], true, connections_accent),
+            (chunks[2], false, connections_accent),
+            (chunks[3], true, schema_accent),
+            (chunks[5], false, schema_accent),
+        ] {
+            frame.render_widget(
+                card_cap(cap_area.width, theme.bg_panel, theme.bg_base, top, accent),
+                cap_area,
+            );
+        }
 
         self.render_connections(
             frame,
-            chunks[0],
+            chunks[1],
             connections,
             current_connection,
-            has_focus && focused_section == SidebarSection::Connections,
+            connections_focused,
             theme,
         );
         self.render_schema(
             frame,
-            chunks[2],
+            chunks[4],
             schema_items,
             schema_loading,
             schema_error,
-            has_focus && focused_section == SidebarSection::Schema,
+            schema_focused,
             theme,
         );
     }
@@ -565,11 +581,18 @@ mod tests {
 
         let connections_area = sidebar.connections_area.unwrap();
         let schema_area = sidebar.schema_area.unwrap();
-        let spacer_y = connections_area.bottom();
+        let cap_y = connections_area.bottom();
         let buffer = terminal.backend().buffer();
 
-        let first_row = row_text(buffer, 0);
-        assert!(first_row.contains("CONNECTIONS"));
+        // Row 0 is the connections card's soft top cap; the label follows.
+        let top_cap = buffer.cell((5, 0)).unwrap();
+        assert_eq!(top_cap.symbol(), "▄");
+        assert_eq!(top_cap.bg, theme.bg_base);
+        assert_eq!(top_cap.fg, theme.bg_panel);
+        // The focused card's cap tapers the accent edge with a quarter block.
+        assert_eq!(buffer.cell((0, 0)).unwrap().fg, theme.accent);
+
+        assert!(row_text(buffer, connections_area.y).contains("CONNECTIONS"));
         assert!(row_text(buffer, schema_area.y).contains("SCHEMA"));
         assert_eq!(
             buffer.cell((0, connections_area.y + 1)).unwrap().fg,
@@ -579,10 +602,13 @@ mod tests {
             buffer.cell((0, schema_area.y + 1)).unwrap().fg,
             theme.bg_panel
         );
-        // The spacer is a base-tone groove separating the two panel cards.
-        assert_eq!(buffer.cell((5, spacer_y)).unwrap().bg, theme.bg_base);
-        assert!(!sidebar.is_over_connections(5, spacer_y));
-        assert!(!sidebar.is_over_schema(5, spacer_y));
+        // The bottom cap melts the card into the canvas and stays outside
+        // the mouse hit areas.
+        let bottom_cap = buffer.cell((5, cap_y)).unwrap();
+        assert_eq!(bottom_cap.symbol(), "▀");
+        assert_eq!(bottom_cap.bg, theme.bg_base);
+        assert!(!sidebar.is_over_connections(5, cap_y));
+        assert!(!sidebar.is_over_schema(5, cap_y));
     }
 
     fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {

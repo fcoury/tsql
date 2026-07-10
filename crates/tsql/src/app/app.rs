@@ -42,8 +42,8 @@ use crate::config::{
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
 use crate::ui::{
-    create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
-    load_theme, overlay_block, quote_identifier, zone_block, zone_inner, zone_label,
+    card_cap, create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor,
+    is_inside, load_theme, overlay_block, quote_identifier, zone_block, zone_inner, zone_label,
     zone_scrollbar_area, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt,
     CompletionKind, CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult,
     ConnectionFormAction, ConnectionFormModal, ConnectionInfo, ConnectionManagerAction,
@@ -798,7 +798,8 @@ const DEFAULT_QUERY_HEIGHT_RATIO_DENOM: u16 = 4; // 25%
 const STATUS_HEIGHT: u16 = 1;
 const MIN_GRID_HEIGHT: u16 = 3;
 const QUERY_CHROME_ROWS: u16 = 1;
-const QUERY_GAP_ROWS: u16 = 1;
+/// Soft half-block cap rows above and below the query card.
+const QUERY_CAP_ROWS: u16 = 2;
 const MIN_CONTENT_QUERY_HEIGHT: u16 = 3; // label row + two content rows
 const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
@@ -851,9 +852,9 @@ fn compute_query_panel_height(
         return 0;
     }
 
-    // Preserve space for the base-tone gap row and a minimal grid when possible.
+    // Preserve space for the soft cap rows and a minimal grid when possible.
     let layout_safe_max = {
-        let max_with_min_grid = main_height.saturating_sub(MIN_GRID_HEIGHT + QUERY_GAP_ROWS);
+        let max_with_min_grid = main_height.saturating_sub(MIN_GRID_HEIGHT + QUERY_CAP_ROWS);
         if max_with_min_grid > 0 {
             max_with_min_grid
         } else {
@@ -3090,21 +3091,47 @@ impl App {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
+                        Constraint::Length(1),
                         Constraint::Length(query_height),
-                        Constraint::Length(QUERY_GAP_ROWS),
+                        Constraint::Length(1),
                         Constraint::Min(MIN_GRID_HEIGHT),
                     ])
                     .split(main_area);
 
-                let query_area = chunks[0];
-                let query_gap = chunks[1];
-                let grid_area = chunks[2];
+                let query_cap_top = chunks[0];
+                let query_area = chunks[1];
+                let query_cap_bottom = chunks[2];
+                let grid_area = chunks[3];
 
-                // Base-tone breathing row: lets the elevated query card float
-                // instead of butting against the results zone.
+                let query_focused = self.focus == Focus::Query;
+                let query_accent = self.ui_theme.mode_accent(self.mode);
+
+                // Soft half-block caps float the elevated query card on the
+                // canvas, tapering the accent edge while the pane is focused.
+                let cap_accent = if query_focused {
+                    Some(query_accent)
+                } else {
+                    None
+                };
                 frame.render_widget(
-                    Paragraph::new("").style(Style::default().bg(self.ui_theme.bg_base)),
-                    query_gap,
+                    card_cap(
+                        query_cap_top.width,
+                        self.ui_theme.bg_elevated,
+                        self.ui_theme.bg_base,
+                        true,
+                        cap_accent,
+                    ),
+                    query_cap_top,
+                );
+                frame.render_widget(
+                    card_cap(
+                        query_cap_bottom.width,
+                        self.ui_theme.bg_elevated,
+                        self.ui_theme.bg_base,
+                        false,
+                        cap_accent,
+                    ),
+                    query_cap_bottom,
                 );
 
                 // Store rendered areas for mouse click handling
@@ -3112,8 +3139,6 @@ impl App {
                 self.render_grid_area = Some(grid_area);
 
                 // Query editor with syntax highlighting
-                let query_focused = self.focus == Focus::Query;
-                let query_accent = self.ui_theme.mode_accent(self.mode);
                 let mut query_details = Vec::with_capacity(2);
                 if query_focused {
                     query_details.push(Span::styled(
@@ -11856,9 +11881,9 @@ mod tests {
     #[test]
     fn test_compute_query_panel_height_respects_layout_safety_cap() {
         // main_height=6 is the content height (status is split off separately).
-        // With gap row (1) + min grid reservation (3), query max should be 2.
+        // With cap rows (2) + min grid reservation (3), query max should be 1.
         let height = compute_query_panel_height(6, Mode::Insert, QueryHeightMode::Minimized, 50);
-        assert_eq!(height, 2);
+        assert_eq!(height, 1);
     }
 
     #[test]
