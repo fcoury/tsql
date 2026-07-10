@@ -189,16 +189,17 @@ fg = "cyan"
 [escape]
 fg = "cyan"
 
-# UI chrome
+# UI chrome. The tone ladder is deliberately wide so raised surfaces
+# visibly float: canvas (darkest) -> panel cards -> elevated card.
 ["ui.background"]
 fg = "#ABB2BF"
-bg = "#282C34"
+bg = "#1E222A"
 
 ["ui.background.panel"]
-bg = "#21252B"
+bg = "#262B34"
 
 ["ui.background.elevated"]
-bg = "#2C313A"
+bg = "#2E3440"
 
 ["ui.text"]
 fg = "#DCDFE4"
@@ -279,7 +280,7 @@ fg = "#9DA5B4"
 
 ["ui.grid.header"]
 fg = "#DCDFE4"
-bg = "#2C313A"
+bg = "#262B34"
 modifiers = ["bold"]
 "##;
 
@@ -456,16 +457,17 @@ fg = "dark_gray"
 [escape]
 fg = "cyan"
 
-# UI chrome
+# UI chrome. Mirrors the dark ladder: gray canvas -> panel cards ->
+# white elevated card.
 ["ui.background"]
 fg = "#1F2328"
-bg = "#FFFFFF"
+bg = "#EAEEF2"
 
 ["ui.background.panel"]
 bg = "#F6F8FA"
 
 ["ui.background.elevated"]
-bg = "#EAEEF2"
+bg = "#FFFFFF"
 
 ["ui.text"]
 fg = "#1F2328"
@@ -546,6 +548,6 @@ fg = "#57606A"
 
 ["ui.grid.header"]
 fg = "#1F2328"
-bg = "#EAEEF2"
+bg = "#F6F8FA"
 modifiers = ["bold"]
 "##;

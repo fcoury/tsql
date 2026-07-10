@@ -60,9 +60,11 @@ impl UiTheme {
         let selection_bg = rgb(0x3E, 0x44, 0x51);
 
         Self {
-            bg_base: rgb(0x28, 0x2C, 0x34),
-            bg_panel: rgb(0x21, 0x25, 0x2B),
-            bg_elevated: rgb(0x2C, 0x31, 0x3A),
+            // Deliberately wide tone ladder: canvas (darkest) -> panel
+            // cards -> elevated card, so raised surfaces visibly float.
+            bg_base: rgb(0x1E, 0x22, 0x2A),
+            bg_panel: rgb(0x26, 0x2B, 0x34),
+            bg_elevated: rgb(0x2E, 0x34, 0x40),
             bg_status: ink,
             text,
             text_muted,
@@ -85,7 +87,7 @@ impl UiTheme {
             scrollbar: Style::default().fg(text_muted),
             grid_header: Style::default()
                 .fg(text)
-                .bg(rgb(0x2C, 0x31, 0x3A))
+                .bg(rgb(0x26, 0x2B, 0x34))
                 .add_modifier(Modifier::BOLD),
             overlay: Style::default().fg(text).bg(rgb(0x33, 0x3B, 0x49)),
             overlay_border: Style::default().fg(rgb(0x5C, 0x66, 0x73)),

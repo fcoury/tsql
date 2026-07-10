@@ -283,15 +283,16 @@ the values it needs; missing UI fields inherit the One Dark fallback:
 ```toml
 [palette]
 foreground = "#d8dee9"
-background = "#242933"
+background = "#20242c"
 accent = "#88c0d0"
 
+# Tone ladder: canvas (darkest) -> sidebar panel cards -> elevated query card.
 ["ui.background"]
 fg = "foreground"
 bg = "background"
 
 ["ui.background.panel"]
-bg = "#20242c"
+bg = "#272c38"
 
 ["ui.background.elevated"]
 bg = "#2e3440"
