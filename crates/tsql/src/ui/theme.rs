@@ -223,8 +223,12 @@ fn normalize_explicit(mut style: Style) -> Style {
 }
 
 /// Left-edge symbols used by every tonal zone.
+///
+/// The bar is a left *half* block so it matches the width of the `▖`/`▘`
+/// quarter-block tapers rendered by [`card_cap`] — together they form one
+/// continuous accent bar that tapers at both cap rows.
 pub const ZONE_EDGE_SET: border::Set = border::Set {
-    vertical_left: "▍",
+    vertical_left: "▌",
     ..border::PLAIN
 };
 
