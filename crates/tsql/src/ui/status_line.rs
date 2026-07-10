@@ -276,6 +276,11 @@ impl StatusLineBuilder {
         self
     }
 
+    pub fn separator_style(mut self, style: Style) -> Self {
+        self.separator_style = style;
+        self
+    }
+
     pub fn segment(mut self, segment: StatusSegment) -> Self {
         self.segments.push(segment);
         self
@@ -541,5 +546,22 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("ALWAYS"));
         assert!(!text.contains("WIDE_ONLY")); // min_width not met
+    }
+
+    #[test]
+    fn test_status_line_builder_applies_separator_style() {
+        let separator_style = Style::default().fg(Color::LightBlue);
+        let line = StatusLineBuilder::new()
+            .separator_style(separator_style)
+            .segment(StatusSegment::new("LEFT", Priority::Critical))
+            .segment(StatusSegment::new("RIGHT", Priority::Critical))
+            .build(30);
+
+        let separator = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('│'))
+            .unwrap();
+        assert_eq!(separator.style, separator_style);
     }
 }

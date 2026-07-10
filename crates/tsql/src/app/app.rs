@@ -45,15 +45,16 @@ use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
-    quote_identifier, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind,
-    CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction,
-    ConnectionFormModal, ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal,
-    CursorShape, DataGrid, FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup,
-    HighlightedTextArea, JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction,
-    KeySequenceCompletion, KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt,
-    PasswordPromptResult, PendingKey, PickerAction, Priority, QueryEditor, ResizeAction,
-    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
-    StatusLineBuilder, StatusSegment, TableInfo, YankFormat,
+    load_theme, quote_identifier, zone_block, zone_inner, zone_label, zone_scrollbar_area,
+    AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup,
+    ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction, ConnectionFormModal,
+    ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal, CursorShape, DataGrid,
+    FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup, HighlightedTextArea,
+    JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
+    KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
+    PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
+    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
+    UiTheme, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -798,7 +799,7 @@ const MAX_DEFAULT_QUERY_HEIGHT: u16 = 12;
 const DEFAULT_QUERY_HEIGHT_RATIO_DENOM: u16 = 4; // 25%
 const STATUS_HEIGHT: u16 = 1;
 const MIN_GRID_HEIGHT: u16 = 3;
-const QUERY_BORDER_ROWS: u16 = 2;
+const QUERY_CHROME_ROWS: u16 = 1;
 const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
 /// Check if a query is suitable for cursor-based paging.
@@ -869,7 +870,7 @@ fn compute_query_panel_height(
     let maximized_height = ratio_cap.max(regular_height);
 
     if mode == Mode::Insert {
-        let desired_content_height = (editor_line_count as u16).saturating_add(QUERY_BORDER_ROWS);
+        let desired_content_height = (editor_line_count as u16).saturating_add(QUERY_CHROME_ROWS);
         let desired_height = desired_content_height.max(regular_height);
         return desired_height.min(maximized_height);
     }
@@ -2433,6 +2434,12 @@ pub struct App {
     /// Application configuration
     pub config: Config,
 
+    /// Resolved theme for UI chrome.
+    pub ui_theme: UiTheme,
+
+    /// Diagnostics produced while constructing the application.
+    startup_warnings: Vec<String>,
+
     /// Keymap for grid navigation
     pub grid_keymap: Keymap,
     /// Keymap for editor in normal mode
@@ -2660,6 +2667,8 @@ impl App {
         config: Config,
     ) -> Self {
         let editor = QueryEditor::new();
+        let (syntax_theme, theme_warning) = load_theme(&config.display.theme);
+        let ui_theme = UiTheme::from_theme(&syntax_theme);
 
         // Load history
         let history = History::load(config.editor.max_history).unwrap_or_else(|e| {
@@ -2685,6 +2694,8 @@ impl App {
             mode: Mode::Normal,
 
             config,
+            ui_theme,
+            startup_warnings: theme_warning.into_iter().collect(),
 
             grid_keymap,
             editor_normal_keymap,
@@ -2694,7 +2705,7 @@ impl App {
             connection_form_keymap,
 
             editor,
-            highlighter: create_sql_highlighter(),
+            highlighter: create_sql_highlighter(syntax_theme),
             search: SearchPrompt::new(),
             search_target: SearchTarget::Editor,
             command: CommandPrompt::new(),
@@ -2801,6 +2812,11 @@ impl App {
         // This allows main.rs to first check session state for auto-reconnect.
 
         app
+    }
+
+    /// Take diagnostics collected while constructing the application.
+    pub fn take_startup_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.startup_warnings)
     }
 
     /// Capture current session state for persistence.
@@ -3038,6 +3054,7 @@ impl App {
                         None, // No error handling yet
                         self.sidebar_focus,
                         has_focus,
+                        &self.ui_theme,
                     );
                 } else {
                     self.render_sidebar_area = None;
@@ -3068,36 +3085,31 @@ impl App {
                 self.render_grid_area = Some(grid_area);
 
                 // Query editor with syntax highlighting
-                let query_border = match (self.focus, self.mode) {
-                    (Focus::Query, Mode::Normal) => Style::default().fg(Color::Cyan),
-                    (Focus::Query, Mode::Insert) => Style::default().fg(Color::Green),
-                    (Focus::Query, Mode::Visual) => Style::default().fg(Color::Yellow),
-                    (Focus::Grid, _) | (Focus::Sidebar(_), _) => {
-                        Style::default().fg(Color::DarkGray)
-                    }
-                };
-
-                // Build query title with [+] indicator if modified
-                let modified_indicator = if self.editor.is_modified() {
-                    " [+]"
-                } else {
-                    ""
-                };
-                let query_title = if self.focus == Focus::Query {
-                    format!(" ● Query [{}]{} ", self.mode.label(), modified_indicator)
-                } else {
-                    format!(" Query{} ", modified_indicator)
-                };
-
-                let query_block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(query_title.as_str())
-                    .title_style(if self.focus == Focus::Query {
-                        query_border.add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    })
-                    .border_style(query_border);
+                let query_focused = self.focus == Focus::Query;
+                let query_accent = self.ui_theme.mode_accent(self.mode);
+                let mut query_details = Vec::with_capacity(2);
+                if query_focused {
+                    query_details.push(Span::styled(
+                        format!(" [{}]", self.mode.label()),
+                        self.ui_theme.label_focused.fg(query_accent),
+                    ));
+                }
+                if self.editor.is_modified() {
+                    query_details.push(Span::styled(" [+]", self.ui_theme.warning));
+                }
+                let query_block = zone_block(
+                    zone_label(
+                        "QUERY",
+                        query_details,
+                        query_focused,
+                        query_accent,
+                        &self.ui_theme,
+                    ),
+                    self.ui_theme.bg_elevated,
+                    self.ui_theme.text,
+                    query_focused,
+                    query_accent,
+                );
 
                 // Choose cursor shape based on vim mode
                 let cursor_shape = match self.mode {
@@ -3109,6 +3121,8 @@ impl App {
                 let highlighted_editor =
                     HighlightedTextArea::new(&self.editor.textarea, highlighted_lines.clone())
                         .block(query_block.clone())
+                        .cursor_style(self.ui_theme.editor_cursor)
+                        .selection_style(self.ui_theme.editor_selection)
                         .scroll(self.editor_scroll)
                         .show_cursor(is_editor_focused)
                         .cursor_shape(cursor_shape);
@@ -3126,9 +3140,9 @@ impl App {
                 }
 
                 // Update editor scroll based on cursor position
-                // The inner area height is query_area.height - 2 (for borders)
-                let inner_height = query_area.height.saturating_sub(2) as usize;
-                let inner_width = query_area.width.saturating_sub(2) as usize;
+                let query_inner = query_block.inner(query_area);
+                let inner_height = query_inner.height as usize;
+                let inner_width = query_inner.width as usize;
                 let (cursor_row, cursor_col) = self.editor.textarea.cursor();
                 self.editor_scroll = calculate_editor_scroll(
                     cursor_row,
@@ -3141,13 +3155,7 @@ impl App {
                 // Render scrollbar for query editor if content exceeds visible area
                 let total_lines = self.editor.textarea.lines().len();
                 if total_lines > inner_height && inner_height > 0 {
-                    let inner_area = query_block.inner(query_area);
-                    let scrollbar_area = Rect {
-                        x: inner_area.x + inner_area.width.saturating_sub(1),
-                        y: inner_area.y,
-                        width: 1,
-                        height: inner_area.height,
-                    };
+                    let scrollbar_area = zone_scrollbar_area(query_area);
 
                     let scrollbar = if scrollbar_area.height >= 7 {
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -3155,12 +3163,14 @@ impl App {
                             .end_symbol(Some("▼"))
                             .thumb_symbol("█")
                             .track_symbol(Some("░"))
+                            .style(self.ui_theme.scrollbar)
                     } else {
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
                             .begin_symbol(None)
                             .end_symbol(None)
                             .thumb_symbol("█")
                             .track_symbol(Some("│"))
+                            .style(self.ui_theme.scrollbar)
                     };
 
                     let mut scrollbar_state =
@@ -3170,13 +3180,12 @@ impl App {
                 }
 
                 // Calculate grid viewport dimensions for scroll handling
-                // Inner area: grid_area minus borders (2 for borders)
+                // Inner area: shared tonal-zone content rectangle
                 // Body area: inner minus header row (1)
                 // Data width: inner width minus marker column (3)
-                let inner_height = grid_area.height.saturating_sub(2);
-                let body_height = inner_height.saturating_sub(1); // minus header
-                let inner_width = grid_area.width.saturating_sub(2);
-                let data_width = inner_width.saturating_sub(3); // minus marker column
+                let grid_inner = zone_inner(grid_area);
+                let body_height = grid_inner.height.saturating_sub(1); // minus header
+                let data_width = grid_inner.width.saturating_sub(3); // minus marker column
 
                 // Update grid state scroll position based on viewport
                 self.grid_state.ensure_cursor_visible(
@@ -3191,10 +3200,35 @@ impl App {
                 self.last_grid_viewport = Some((body_height as usize, data_width));
 
                 // Results grid.
+                let grid_focused = self.focus == Focus::Grid;
+                let mut grid_details = vec![Span::styled(
+                    format!(" · {} rows", self.grid.rows.len()),
+                    self.ui_theme.text_muted,
+                )];
+                if let Some(elapsed) = self.db.last_elapsed {
+                    grid_details.push(Span::styled(
+                        format!(" · {}ms", elapsed.as_millis()),
+                        self.ui_theme.text_muted,
+                    ));
+                }
+                if let Some(search_info) = self.grid_state.search.match_info() {
+                    grid_details.push(Span::styled(
+                        format!(" · {search_info}"),
+                        self.ui_theme.warning,
+                    ));
+                }
                 let grid_widget = DataGrid {
                     model: &self.grid,
                     state: &self.grid_state,
-                    focused: self.focus == Focus::Grid,
+                    label: zone_label(
+                        "RESULTS",
+                        grid_details,
+                        grid_focused,
+                        self.ui_theme.accent,
+                        &self.ui_theme,
+                    ),
+                    theme: &self.ui_theme,
+                    focused: grid_focused,
                     show_row_numbers: self.config.display.show_row_numbers,
                     show_scrollbar: true,
                 };
@@ -3341,10 +3375,9 @@ impl App {
                     if !visible.is_empty() {
                         // Position popup near the cursor
                         let (cursor_row, cursor_col) = self.editor.textarea.cursor();
-                        // Estimate position (query_area starts at y=0, each line is 1 row)
-                        let popup_y = query_area.y + 1 + cursor_row as u16;
-                        let popup_x = query_area.x
-                            + 1
+                        let query_inner = zone_inner(query_area);
+                        let popup_y = query_inner.y + cursor_row as u16;
+                        let popup_x = query_inner.x
                             + cursor_col.saturating_sub(self.completion.prefix.len()) as u16;
 
                         let popup_height = (visible.len() + 2) as u16; // +2 for borders
@@ -10732,12 +10765,11 @@ impl App {
             self.grid_state.cursor_row.saturating_add(1)
         };
 
-        // Mode indicator with color
-        let (mode_text, mode_style) = match self.mode {
-            Mode::Normal => ("NORMAL", Style::default().fg(Color::Cyan)),
-            Mode::Insert => ("INSERT", Style::default().fg(Color::Green)),
-            Mode::Visual => ("VISUAL", Style::default().fg(Color::Yellow)),
-        };
+        let mode_text = format!(" {} ", self.mode.label());
+        let mode_style = Style::default()
+            .fg(self.ui_theme.pill_fg)
+            .bg(self.ui_theme.mode_accent(self.mode))
+            .add_modifier(Modifier::BOLD);
 
         // Connection info
         let conn_segment = if self.db.status == DbStatus::Connected {
@@ -10762,10 +10794,10 @@ impl App {
         };
 
         let conn_style = match self.db.status {
-            DbStatus::Connected => Style::default().fg(Color::Green),
-            DbStatus::Connecting => Style::default().fg(Color::Yellow),
-            DbStatus::Error => Style::default().fg(Color::Red),
-            DbStatus::Disconnected => Style::default().fg(Color::DarkGray),
+            DbStatus::Connected => Style::default().fg(self.ui_theme.success),
+            DbStatus::Connecting => Style::default().fg(self.ui_theme.warning),
+            DbStatus::Error => Style::default().fg(self.ui_theme.error),
+            DbStatus::Disconnected => Style::default().fg(self.ui_theme.text_muted),
         };
 
         // Row info
@@ -10803,12 +10835,12 @@ impl App {
         // Status message (right-aligned)
         let status = self.last_status.as_deref().unwrap_or("Ready").to_string();
         let status_style = if self.last_error.is_some() {
-            Style::default().fg(Color::Red)
+            Style::default().fg(self.ui_theme.error)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.ui_theme.text_muted)
         };
         let focus_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(self.ui_theme.accent)
             .add_modifier(Modifier::BOLD);
         let navigation_hint = if self.focus == Focus::Query && self.mode != Mode::Normal {
             "Alt-hjkl move · Esc then Tab/S-Tab cycle"
@@ -10818,6 +10850,7 @@ impl App {
 
         // Build status line with priority-based segments
         let line = StatusLineBuilder::new()
+            .separator_style(Style::default().fg(self.ui_theme.text_muted))
             // Critical: Mode (always shown)
             .segment(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
             // Critical: active pane (always shown)
@@ -10837,7 +10870,7 @@ impl App {
                 StatusSegment::new(running_indicator.unwrap_or_default(), Priority::Critical)
                     .style(
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(self.ui_theme.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
             )
@@ -10845,7 +10878,7 @@ impl App {
             .segment_if(
                 self.db.in_transaction,
                 StatusSegment::new("TXN", Priority::High)
-                    .style(Style::default().fg(Color::Magenta)),
+                    .style(Style::default().fg(self.ui_theme.accent_visual)),
             )
             // Medium: Row info
             .segment(StatusSegment::new(row_info, Priority::Medium).min_width(50))
@@ -10853,20 +10886,20 @@ impl App {
             .segment_if(
                 selection_info.is_some(),
                 StatusSegment::new(selection_info.unwrap_or_default(), Priority::Medium)
-                    .style(Style::default().fg(Color::Cyan))
+                    .style(Style::default().fg(self.ui_theme.accent))
                     .min_width(60),
             )
             // Low: Query timing
             .segment_if(
                 timing_info.is_some(),
                 StatusSegment::new(timing_info.unwrap_or_default(), Priority::Low)
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(self.ui_theme.text_muted))
                     .min_width(80),
             )
             // Low: navigation reminder on wider terminals.
             .segment(
                 StatusSegment::new(navigation_hint, Priority::Low)
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(self.ui_theme.text_muted))
                     .min_width(105),
             )
             // Right-aligned: Status message
@@ -10877,7 +10910,11 @@ impl App {
             )
             .build(width);
 
-        Paragraph::new(line)
+        Paragraph::new(line).style(
+            Style::default()
+                .fg(self.ui_theme.text)
+                .bg(self.ui_theme.bg_status),
+        )
     }
 
     /// Open the history fuzzy picker.
@@ -11047,17 +11084,7 @@ fn grid_mouse_target(
     col_offset: usize,
     col_widths: &[u16],
 ) -> Option<GridMouseTarget> {
-    // Convert from block area (with borders) to inner grid content area.
-    if grid_area.width < 2 || grid_area.height < 2 {
-        return None;
-    }
-
-    let inner = Rect {
-        x: grid_area.x.saturating_add(1),
-        y: grid_area.y.saturating_add(1),
-        width: grid_area.width.saturating_sub(2),
-        height: grid_area.height.saturating_sub(2),
-    };
+    let inner = zone_inner(grid_area);
 
     if inner.width == 0 || inner.height == 0 {
         return None;
@@ -11238,6 +11265,76 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial]
+    fn theme_warning_does_not_overwrite_runtime_status() {
+        let _guard = ConfigDirGuard::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.display.theme = "../invalid".to_string();
+        let mut app = App::with_config(
+            GridModel::empty(),
+            runtime.handle().clone(),
+            tx,
+            rx,
+            None,
+            config,
+        );
+        app.last_status = Some("runtime status".to_string());
+        app.last_error = Some("runtime error".to_string());
+
+        let warnings = app.take_startup_warnings();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("../invalid"));
+        assert_eq!(app.last_status.as_deref(), Some("runtime status"));
+        assert_eq!(app.last_error.as_deref(), Some("runtime error"));
+    }
+
+    #[test]
+    #[serial]
+    fn status_line_paints_complete_built_in_theme_backgrounds() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+
+        let _guard = ConfigDirGuard::new();
+        for theme_name in ["one_dark", "github_light"] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut config = Config::default();
+            config.display.theme = theme_name.to_string();
+            let app = App::with_config(
+                GridModel::empty(),
+                runtime.handle().clone(),
+                tx,
+                rx,
+                None,
+                config,
+            );
+            let area = Rect::new(0, 0, 100, 1);
+            let mut buffer = Buffer::empty(area);
+
+            app.status_line(area.width).render(area, &mut buffer);
+
+            assert!(buffer.content.iter().all(|cell| {
+                cell.bg == app.ui_theme.bg_status || cell.bg == app.ui_theme.accent
+            }));
+            assert_eq!(buffer.cell((1, 0)).unwrap().bg, app.ui_theme.accent);
+            for cell in &buffer.content {
+                if !cell.symbol().trim().is_empty() {
+                    assert_ne!(cell.fg, Color::Reset);
+                }
+            }
+        }
+    }
+
     // ========== Grid Mouse Tests ==========
 
     #[test]
@@ -11252,7 +11349,7 @@ mod tests {
         let col_widths = vec![5, 5, 5];
 
         // Header row is at y=1 (inner.y = 1).
-        // With no row numbers, marker_w = 3 and data_x = 1 + 3 = 4.
+        // With no row numbers, marker_w = 3 and data_x = 2 + 3 = 5.
         let header = grid_mouse_target(11, 1, grid_area, false, 10, 0, 0, &col_widths);
         assert_eq!(header, Some(GridMouseTarget::Header { col: Some(1) }));
 
@@ -11281,7 +11378,7 @@ mod tests {
         };
 
         let col_widths = vec![5, 5, 5];
-        // row_count=120 => digits=3, row_number_width=4, marker_w=7, data_x=1+7=8.
+        // row_count=120 => digits=3, row_number_width=4, marker_w=7, data_x=2+7=9.
         let cell = grid_mouse_target(9, 2, grid_area, true, 120, 0, 0, &col_widths);
         assert_eq!(
             cell,
@@ -11719,6 +11816,11 @@ mod tests {
         let low_content =
             compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 2);
         assert_eq!(low_content, 10);
+
+        // Tonal chrome reserves one label row above the editor content.
+        let content_driven =
+            compute_query_panel_height(40, Mode::Insert, QueryHeightMode::Minimized, 10);
+        assert_eq!(content_driven, 11);
 
         // High content expands, capped at 50% of main area.
         let high_content =

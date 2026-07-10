@@ -62,3 +62,19 @@ pub(crate) fn assert_selected_bg_has_visible_fg(buf: &Buffer) {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn assert_nonblank_cells_have_explicit_fg(buf: &Buffer) {
+    for y in buf.area.y..buf.area.y.saturating_add(buf.area.height) {
+        for x in buf.area.x..buf.area.x.saturating_add(buf.area.width) {
+            let cell = buf.cell((x, y)).expect("cell in buffer");
+            if !cell.symbol().trim().is_empty() {
+                assert_ne!(
+                    cell.fg,
+                    Color::Reset,
+                    "nonblank cell at ({x}, {y}) has reset foreground"
+                );
+            }
+        }
+    }
+}

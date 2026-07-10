@@ -43,9 +43,7 @@ pub struct DisplayConfig {
     pub show_null_indicator: bool,
     /// NULL indicator text
     pub null_indicator: String,
-    /// Show borders around cells
-    pub show_borders: bool,
-    /// Theme name (for future theme support)
+    /// Built-in or custom theme name
     pub theme: String,
 }
 
@@ -59,7 +57,6 @@ impl Default for DisplayConfig {
             truncate_cells: true,
             show_null_indicator: true,
             null_indicator: "NULL".to_string(),
-            show_borders: true,
             theme: "default".to_string(),
         }
     }
@@ -541,5 +538,19 @@ description = "Focus the next pane"
         assert!(toml_str.contains("[connection]"));
         assert!(toml_str.contains("[updates]"));
         assert!(toml_str.contains("[ai]"));
+    }
+
+    #[test]
+    fn test_removed_show_borders_field_is_ignored() {
+        let config: Config = toml::from_str(
+            r#"
+            [display]
+            show_borders = true
+            theme = "github_light"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.display.theme, "github_light");
     }
 }

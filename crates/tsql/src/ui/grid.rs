@@ -5,17 +5,17 @@ use std::collections::HashSet;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
-    Widget,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
 use crate::util::{is_uuid, looks_like_json};
 
-use super::style::selected_row_style;
+use super::{zone_block, zone_scrollbar_area, UiTheme};
 
 /// Minimum column width for display.
 const MIN_COLUMN_WIDTH: u16 = 3;
@@ -1391,6 +1391,8 @@ fn escape_json(s: &str) -> String {
 pub struct DataGrid<'a> {
     pub model: &'a GridModel,
     pub state: &'a GridState,
+    pub label: Line<'a>,
+    pub theme: &'a UiTheme,
     pub focused: bool,
     pub show_row_numbers: bool,
     pub show_scrollbar: bool,
@@ -1398,35 +1400,13 @@ pub struct DataGrid<'a> {
 
 impl<'a> Widget for DataGrid<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Build a concise title with search info if active.
-        let base_title = if self.focused {
-            " ● Results "
-        } else {
-            " Results "
-        };
-        let title = if let Some(search_info) = self.state.search.match_info() {
-            format!("{} {}", base_title, search_info)
-        } else {
-            base_title.to_string()
-        };
-
-        let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        let block = Block::default()
-            .title(title)
-            .title_style(if self.focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            })
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let block = zone_block(
+            self.label,
+            self.theme.bg_base,
+            self.theme.text,
+            self.focused,
+            self.theme.accent,
+        );
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -1437,7 +1417,7 @@ impl<'a> Widget for DataGrid<'a> {
 
         if self.model.headers.is_empty() {
             Paragraph::new("No columns")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(self.theme.text_muted))
                 .render(inner, buf);
             return;
         }
@@ -1445,7 +1425,7 @@ impl<'a> Widget for DataGrid<'a> {
         // Reserve one line for header.
         if inner.height < 2 {
             Paragraph::new("Window too small")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(self.theme.text_muted))
                 .render(inner, buf);
             return;
         }
@@ -1492,6 +1472,7 @@ impl<'a> Widget for DataGrid<'a> {
             marker_w,
             self.show_row_numbers,
             row_number_width,
+            self.theme,
         );
         render_row_cells(
             data_x,
@@ -1500,9 +1481,7 @@ impl<'a> Widget for DataGrid<'a> {
             &self.model.headers,
             &self.model.col_widths,
             self.state.col_offset,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            self.theme.grid_header,
             None,  // No search highlighting for headers
             false, // Headers never have UUID expansion
             buf,
@@ -1511,7 +1490,7 @@ impl<'a> Widget for DataGrid<'a> {
         // Body rows.
         if self.model.rows.is_empty() {
             Paragraph::new("(no rows)")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(self.theme.text_muted))
                 .render(body_area, buf);
             return;
         }
@@ -1527,7 +1506,7 @@ impl<'a> Widget for DataGrid<'a> {
             let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
-                selected_row_style()
+                self.theme.selection
             } else {
                 Style::default()
             };
@@ -1543,6 +1522,7 @@ impl<'a> Widget for DataGrid<'a> {
                 self.show_row_numbers,
                 row_number_width,
                 row_idx + 1, // 1-based row number
+                self.theme,
             );
 
             // Determine cursor column for this row (only if this is the cursor row)
@@ -1564,6 +1544,7 @@ impl<'a> Widget for DataGrid<'a> {
                 cursor_col,
                 &self.state.search,
                 self.state.uuid_expanded,
+                self.theme,
                 buf,
             );
         }
@@ -1574,19 +1555,14 @@ impl<'a> Widget for DataGrid<'a> {
                 .begin_symbol(Some("▲"))
                 .end_symbol(Some("▼"))
                 .thumb_symbol("█")
-                .track_symbol(Some("░"));
+                .track_symbol(Some("░"))
+                .style(self.theme.scrollbar);
 
             let mut scrollbar_state = ScrollbarState::new(self.model.rows.len())
                 .position(self.state.cursor_row)
                 .viewport_content_length(body_area.height as usize);
 
-            // Render scrollbar on the right edge of the body area
-            let scrollbar_area = Rect {
-                x: body_area.x + body_area.width.saturating_sub(1),
-                y: body_area.y,
-                width: 1,
-                height: body_area.height,
-            };
+            let scrollbar_area = zone_scrollbar_area(area);
 
             scrollbar.render(scrollbar_area, buf, &mut scrollbar_state);
         }
@@ -1599,27 +1575,21 @@ fn render_marker_header(
     marker_w: u16,
     show_row_numbers: bool,
     row_number_width: u16,
+    theme: &UiTheme,
 ) {
     let mut x = area.x;
 
     // Render row number header (e.g., "#" or empty)
     if show_row_numbers && row_number_width > 0 {
         let header = format!("{:>width$}", "#", width = (row_number_width - 1) as usize);
-        buf.set_string(
-            x,
-            area.y,
-            &header,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+        buf.set_string(x, area.y, &header, theme.grid_header);
         x += row_number_width;
     }
 
     // Fill remaining marker area with spaces
     let remaining = marker_w.saturating_sub(row_number_width);
     for _ in 0..remaining {
-        buf.set_string(x, area.y, " ", Style::default());
+        buf.set_string(x, area.y, " ", theme.grid_header);
         x += 1;
     }
 }
@@ -1636,6 +1606,7 @@ fn render_marker_cell(
     show_row_numbers: bool,
     row_number_width: u16,
     row_number: usize,
+    theme: &UiTheme,
 ) {
     let mut current_x = x;
 
@@ -1646,11 +1617,11 @@ fn render_marker_cell(
             row_number,
             width = (row_number_width - 1) as usize
         );
-        // Use lighter color for cursor row (DarkGray bg) to ensure visibility
+        // Use primary text on the selected row and muted text otherwise.
         let row_num_style = if is_cursor {
-            style.fg(Color::Gray)
+            style.fg(theme.text)
         } else {
-            style.fg(Color::DarkGray)
+            style.fg(theme.text_muted)
         };
         buf.set_string(current_x, y, &row_num_str, row_num_style);
         current_x += row_number_width;
@@ -1731,6 +1702,7 @@ fn render_row_cells_with_search(
     cursor_col: Option<usize>,
     search: &GridSearch,
     uuid_expanded: bool,
+    theme: &UiTheme,
     buf: &mut Buffer,
 ) {
     if available_w == 0 {
@@ -1739,13 +1711,6 @@ fn render_row_cells_with_search(
 
     let padding: u16 = 1;
     let max_x = x.saturating_add(available_w);
-
-    // Styles for search matches and cursor
-    let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
-    let current_match_style = Style::default()
-        .bg(Color::Rgb(255, 165, 0))
-        .fg(Color::Black); // Orange
-    let cursor_cell_style = Style::default().bg(Color::Cyan).fg(Color::Black);
 
     let mut col = col_offset;
     while col < cells.len() && col < col_widths.len() && x < max_x {
@@ -1763,11 +1728,11 @@ fn render_row_cells_with_search(
         // Determine cell style based on cursor position and search state
         let is_cursor_cell = cursor_col == Some(col);
         let cell_style = if is_cursor_cell {
-            cursor_cell_style
+            theme.cursor_cell
         } else if search.is_current_match(row_idx, col) {
-            current_match_style
+            theme.search_match_current
         } else if search.is_match(row_idx, col) {
-            match_style
+            theme.search_match
         } else {
             base_style
         };
@@ -1927,7 +1892,7 @@ fn truncate_by_display_width(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
 
     fn create_test_model() -> GridModel {
         GridModel::new(
@@ -2045,6 +2010,7 @@ mod tests {
     #[test]
     fn test_cursor_row_uses_visible_foreground_on_dark_background() {
         let model = create_test_model();
+        let theme = UiTheme::fallback();
         let state = GridState {
             cursor_row: 1,
             cursor_col: 1,
@@ -2053,6 +2019,8 @@ mod tests {
         let grid = DataGrid {
             model: &model,
             state: &state,
+            label: Line::from(" RESULTS"),
+            theme: &theme,
             focused: true,
             show_row_numbers: true,
             show_scrollbar: false,
@@ -2062,7 +2030,45 @@ mod tests {
 
         grid.render(area, &mut buf);
 
-        assert_selected_bg_has_visible_fg(&buf);
+        assert_nonblank_cells_have_explicit_fg(&buf);
+    }
+
+    #[test]
+    fn test_built_in_themes_style_labels_and_ordinary_cells() {
+        let model = create_test_model();
+        let state = GridState {
+            cursor_row: 1,
+            ..Default::default()
+        };
+
+        for syntax_theme in [
+            tui_syntax::themes::one_dark(),
+            tui_syntax::themes::github_light(),
+        ] {
+            let theme = UiTheme::from_theme(&syntax_theme);
+            let grid = DataGrid {
+                model: &model,
+                state: &state,
+                label: Line::from(" RESULTS · 2 rows"),
+                theme: &theme,
+                focused: false,
+                show_row_numbers: false,
+                show_scrollbar: false,
+            };
+            let area = Rect::new(0, 0, 40, 6);
+            let mut buffer = Buffer::empty(area);
+
+            grid.render(area, &mut buffer);
+
+            assert_nonblank_cells_have_explicit_fg(&buffer);
+            let alice = buffer
+                .content
+                .iter()
+                .find(|cell| cell.symbol() == "A")
+                .expect("Alice should be rendered");
+            assert_eq!(alice.fg, theme.text);
+            assert_eq!(alice.bg, theme.bg_base);
+        }
     }
 
     #[test]
@@ -2145,6 +2151,7 @@ mod tests {
 
         // Create a model with several columns
         let model = create_wide_test_model();
+        let theme = UiTheme::fallback();
 
         // Create state with cursor at rightmost column but col_offset at 0
         // This simulates the bug: cursor moved right but header hasn't scrolled
@@ -2157,21 +2164,23 @@ mod tests {
         let grid = DataGrid {
             model: &model,
             state: &state,
+            label: Line::from(" RESULTS"),
+            theme: &theme,
             focused: true,
             show_row_numbers: false,
             show_scrollbar: false,
         };
 
         // Render to a small buffer (narrow viewport)
-        // Width of 20 should only fit ~2-3 columns with border + marker
+        // Width of 20 should only fit ~2-3 columns with zone chrome + marker
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = Buffer::empty(area);
         grid.render(area, &mut buf);
 
-        // The header row is at y=1 (after border)
-        // After marker column (3 chars), data starts at x=4
+        // The header row is at y=1 (after the label)
+        // After the left edge, padding, and marker column, data starts at x=5
         // Check that the header shows same columns as body
-        let header_row: String = (4..area.width - 1)
+        let header_row: String = (5..area.width - 1)
             .map(|x| {
                 buf.cell((x, 1))
                     .map(|c| c.symbol().chars().next().unwrap_or(' '))
@@ -2180,7 +2189,7 @@ mod tests {
             .collect();
 
         // Body row is at y=2
-        let body_row: String = (4..area.width - 1)
+        let body_row: String = (5..area.width - 1)
             .map(|x| {
                 buf.cell((x, 2))
                     .map(|c| c.symbol().chars().next().unwrap_or(' '))
@@ -2819,48 +2828,21 @@ mod tests {
     }
 
     #[test]
-    fn test_row_number_cursor_row_uses_visible_color() {
-        // When is_cursor is true, the row number should use Color::Gray (lighter)
-        // to be visible against the DarkGray background of the cursor row.
-        // This is a unit test for the logic, not the actual rendering.
-        let is_cursor = true;
-        let base_style = Style::default().bg(Color::DarkGray);
+    fn test_row_number_cursor_row_uses_theme_text_on_selection() {
+        let theme = UiTheme::fallback();
+        let row_num_style = theme.selection.fg(theme.text);
 
-        // Simulate the logic from render_marker_cell
-        let row_num_style = if is_cursor {
-            base_style.fg(Color::Gray)
-        } else {
-            base_style.fg(Color::DarkGray)
-        };
-
-        // Verify foreground is Gray (not DarkGray which would be invisible)
-        assert_eq!(
-            row_num_style.fg,
-            Some(Color::Gray),
-            "Cursor row should use Gray foreground for visibility"
-        );
+        assert_eq!(row_num_style.fg, Some(theme.text));
+        assert_eq!(row_num_style.bg, theme.selection.bg);
     }
 
     #[test]
-    fn test_row_number_non_cursor_row_uses_dark_gray() {
-        // When is_cursor is false, the row number should use DarkGray
-        // (subdued color since background is default/transparent).
-        let is_cursor = false;
-        let base_style = Style::default();
+    fn test_row_number_non_cursor_row_uses_theme_muted_text() {
+        let theme = UiTheme::fallback();
+        let row_num_style = Style::default().fg(theme.text_muted);
 
-        // Simulate the logic from render_marker_cell
-        let row_num_style = if is_cursor {
-            base_style.fg(Color::Gray)
-        } else {
-            base_style.fg(Color::DarkGray)
-        };
-
-        // Verify foreground is DarkGray for non-cursor rows
-        assert_eq!(
-            row_num_style.fg,
-            Some(Color::DarkGray),
-            "Non-cursor row should use DarkGray foreground"
-        );
+        assert_eq!(row_num_style.fg, Some(theme.text_muted));
+        assert_eq!(row_num_style.bg, None);
     }
 
     // =========================================================================

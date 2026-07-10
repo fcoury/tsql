@@ -24,10 +24,8 @@ show_null_indicator = true
 # Text to display for NULL values
 null_indicator = "NULL"
 
-# Show borders around grid cells
-show_borders = true
-
-# Theme name (reserved for future use)
+# Theme name: "one_dark", "github_light", or a custom file name from
+# ~/.tsql/themes/<name>.toml (or $TSQL_CONFIG_DIR/themes/<name>.toml)
 theme = "default"
 
 # SQL generation settings (used by Schema panel templates, etc.)

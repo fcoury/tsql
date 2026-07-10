@@ -5,7 +5,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
-use tui_syntax::{sql, themes, Highlighter};
+use tui_syntax::{sql, Highlighter, Theme};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
@@ -426,8 +426,8 @@ fn apply_style_to_range(
 }
 
 /// Creates a pre-configured highlighter for SQL.
-pub fn create_sql_highlighter() -> Highlighter {
-    let mut highlighter = Highlighter::new(themes::one_dark());
+pub fn create_sql_highlighter(theme: Theme) -> Highlighter {
+    let mut highlighter = Highlighter::new(theme);
     // Ignore errors - SQL should always register successfully
     let _ = highlighter.register_language(sql());
     highlighter
@@ -439,8 +439,57 @@ mod tests {
 
     #[test]
     fn test_create_sql_highlighter() {
-        let _highlighter = create_sql_highlighter();
+        let _highlighter = create_sql_highlighter(tui_syntax::themes::one_dark());
         // Just verify it creates without panicking
+    }
+
+    #[test]
+    fn test_tonal_zone_cursor_geometry_and_built_in_base_styles() {
+        use crate::ui::{zone_block, UiTheme};
+
+        let area = Rect::new(0, 0, 30, 5);
+        let textarea = TextArea::new(vec!["select plain_identifier".to_string()]);
+
+        for syntax_theme in [
+            tui_syntax::themes::one_dark(),
+            tui_syntax::themes::github_light(),
+        ] {
+            let ui_theme = UiTheme::from_theme(&syntax_theme);
+            let mut highlighter = create_sql_highlighter(syntax_theme);
+            let lines = highlighter
+                .highlight("sql", textarea.lines().join("\n").as_str())
+                .unwrap();
+            let block = zone_block(
+                Line::from(" QUERY"),
+                ui_theme.bg_elevated,
+                ui_theme.text,
+                true,
+                ui_theme.accent,
+            );
+            let widget = HighlightedTextArea::new(&textarea, lines.clone())
+                .block(block.clone())
+                .cursor_style(ui_theme.editor_cursor)
+                .selection_style(ui_theme.editor_selection);
+
+            assert_eq!(
+                widget.cursor_screen_position(area),
+                Some(Position::new(2, 1))
+            );
+
+            let mut buffer = Buffer::empty(area);
+            HighlightedTextArea::new(&textarea, lines)
+                .block(block)
+                .cursor_style(ui_theme.editor_cursor)
+                .selection_style(ui_theme.editor_selection)
+                .show_cursor(false)
+                .render(area, &mut buffer);
+
+            for cell in &buffer.content {
+                if !cell.symbol().trim().is_empty() {
+                    assert_ne!(cell.fg, Color::Reset);
+                }
+            }
+        }
     }
 
     #[test]

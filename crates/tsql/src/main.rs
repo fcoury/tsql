@@ -349,6 +349,7 @@ fn main() -> Result<()> {
         cfg,
     );
     app.set_safe_mode(safe_mode);
+    startup_warnings.extend(app.take_startup_warnings());
 
     // Display startup warnings.
     if let Some(warning) = libpq_warning {

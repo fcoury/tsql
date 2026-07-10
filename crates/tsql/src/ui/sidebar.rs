@@ -2,13 +2,14 @@
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
+use super::{zone_block, zone_label, UiTheme};
 use crate::app::SidebarSection;
 use crate::config::{ConnectionEntry, ConnectionsFile};
 
@@ -73,14 +74,23 @@ impl Sidebar {
         schema_error: Option<&str>,
         focused_section: SidebarSection,
         has_focus: bool,
+        theme: &UiTheme,
     ) {
-        // Split sidebar into connections (30%) and schema (70%)
-        let chunks =
-            Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
+        let chunks = Layout::vertical([
+            Constraint::Percentage(30),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
 
         // Store areas for mouse hit testing
         self.connections_area = Some(chunks[0]);
-        self.schema_area = Some(chunks[1]);
+        self.schema_area = Some(chunks[2]);
+
+        frame.render_widget(
+            Paragraph::new("").style(Style::default().fg(theme.text).bg(theme.bg_panel)),
+            chunks[1],
+        );
 
         self.render_connections(
             frame,
@@ -88,14 +98,16 @@ impl Sidebar {
             connections,
             current_connection,
             has_focus && focused_section == SidebarSection::Connections,
+            theme,
         );
         self.render_schema(
             frame,
-            chunks[1],
+            chunks[2],
             schema_items,
             schema_loading,
             schema_error,
             has_focus && focused_section == SidebarSection::Schema,
+            theme,
         );
     }
 
@@ -106,29 +118,15 @@ impl Sidebar {
         connections: &ConnectionsFile,
         current: Option<&str>,
         focused: bool,
+        theme: &UiTheme,
     ) {
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        let title = if focused {
-            " ● Connections "
-        } else {
-            " Connections "
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(if focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            })
-            .border_style(border_style);
+        let block = zone_block(
+            zone_label("CONNECTIONS", Vec::new(), focused, theme.accent, theme),
+            theme.bg_panel,
+            theme.text,
+            focused,
+            theme.accent,
+        );
 
         let sorted = connections.sorted();
         if sorted.is_empty() {
@@ -141,11 +139,11 @@ impl Sidebar {
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled("a", Style::default().fg(Color::Yellow)),
+                    Span::styled("a", Style::default().fg(theme.warning)),
                     Span::raw(" to add one, or"),
                 ]),
                 Line::from(vec![
-                    Span::styled("Ctrl+Shift+C", Style::default().fg(Color::Yellow)),
+                    Span::styled("Ctrl+Shift+C", Style::default().fg(theme.warning)),
                     Span::raw(" for the full manager."),
                 ]),
             ])
@@ -163,7 +161,7 @@ impl Sidebar {
 
                 let style = if is_current {
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(theme.success)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -177,9 +175,9 @@ impl Sidebar {
             .collect();
 
         let highlight_style = if focused {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
+            theme.selection
         } else {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.accent)
         };
 
         let list = List::new(items)
@@ -190,6 +188,7 @@ impl Sidebar {
         frame.render_stateful_widget(list, area, &mut self.connections_state);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_schema(
         &mut self,
         frame: &mut Frame,
@@ -198,31 +197,21 @@ impl Sidebar {
         loading: bool,
         error: Option<&str>,
         focused: bool,
+        theme: &UiTheme,
     ) {
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        let title = if focused { " ● Schema " } else { " Schema " };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(if focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            })
-            .border_style(border_style);
+        let block = zone_block(
+            zone_label("SCHEMA", Vec::new(), focused, theme.accent, theme),
+            theme.bg_panel,
+            theme.text,
+            focused,
+            theme.accent,
+        );
 
         // Handle loading state
         if loading {
             let loading_text = Paragraph::new("Loading schema...")
                 .block(block)
-                .style(Style::default().fg(Color::Yellow));
+                .style(Style::default().fg(theme.warning));
             frame.render_widget(loading_text, area);
             return;
         }
@@ -231,7 +220,7 @@ impl Sidebar {
         if let Some(err) = error {
             let error_text = Paragraph::new(format!("Error: {}\nPress 'r' to retry", err))
                 .block(block)
-                .style(Style::default().fg(Color::Red));
+                .style(Style::default().fg(theme.error));
             frame.render_widget(error_text, area);
             return;
         }
@@ -240,15 +229,15 @@ impl Sidebar {
         if schema_items.is_empty() {
             let empty = Paragraph::new("Connect to view schema")
                 .block(block)
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(theme.text_muted));
             frame.render_widget(empty, area);
             return;
         }
 
         let highlight_style = if focused {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
+            theme.selection
         } else {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.accent)
         };
 
         match Tree::new(schema_items) {
@@ -263,7 +252,7 @@ impl Sidebar {
                 let err =
                     Paragraph::new(format!("Schema tree build failed: {}\n(retry with `r`)", e))
                         .block(block)
-                        .style(Style::default().fg(Color::Red));
+                        .style(Style::default().fg(theme.error));
                 frame.render_widget(err, area);
             }
         }
@@ -509,5 +498,65 @@ impl Sidebar {
         for path in paths {
             self.schema_state.open(path.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::*;
+
+    #[test]
+    fn render_uses_stable_zones_and_excludes_spacer_from_hit_areas() {
+        let backend = TestBackend::new(32, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut sidebar = Sidebar::new();
+        let connections = ConnectionsFile::new();
+        let theme = UiTheme::fallback();
+
+        terminal
+            .draw(|frame| {
+                sidebar.render(
+                    frame,
+                    frame.area(),
+                    &connections,
+                    None,
+                    &[],
+                    false,
+                    None,
+                    SidebarSection::Connections,
+                    true,
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let connections_area = sidebar.connections_area.unwrap();
+        let schema_area = sidebar.schema_area.unwrap();
+        let spacer_y = connections_area.bottom();
+        let buffer = terminal.backend().buffer();
+
+        let first_row = row_text(buffer, 0);
+        assert!(first_row.contains("CONNECTIONS"));
+        assert!(row_text(buffer, schema_area.y).contains("SCHEMA"));
+        assert_eq!(
+            buffer.cell((0, connections_area.y + 1)).unwrap().fg,
+            theme.accent
+        );
+        assert_eq!(
+            buffer.cell((0, schema_area.y + 1)).unwrap().fg,
+            theme.bg_panel
+        );
+        assert_eq!(buffer.cell((5, spacer_y)).unwrap().bg, theme.bg_panel);
+        assert!(!sidebar.is_over_connections(5, spacer_y));
+        assert!(!sidebar.is_over_schema(5, spacer_y));
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (buffer.area.x..buffer.area.right())
+            .map(|x| buffer.cell((x, y)).unwrap().symbol())
+            .collect()
     }
 }

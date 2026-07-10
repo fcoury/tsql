@@ -227,6 +227,10 @@ tsql looks for configuration at `~/.tsql/config.toml` by default.
 On Linux/macOS startup, legacy config folders are auto-migrated to `~/.tsql`.
 
 ```toml
+[display]
+# Built-ins: "one_dark" and "github_light". "default" maps to One Dark.
+theme = "one_dark"
+
 [connection]
 # Default connection URL (can be overridden by CLI arg or DATABASE_URL)
 default_url = "postgres://localhost/mydb"
@@ -265,6 +269,45 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 See [config.example.toml](config.example.toml) for all available options.
+
+### Custom themes
+
+Custom themes use the same Helix-style TOML format as syntax highlighting and
+can also define tsql's UI chrome. Place `<name>.toml` in
+`~/.tsql/themes/`, then set `display.theme = "<name>"`. When
+`TSQL_CONFIG_DIR` is set, tsql uses `$TSQL_CONFIG_DIR/themes/` instead.
+
+Scope names containing dots must be quoted. A minimal theme can override only
+the values it needs; missing UI fields inherit the One Dark fallback:
+
+```toml
+[palette]
+foreground = "#d8dee9"
+background = "#242933"
+accent = "#88c0d0"
+
+["ui.background"]
+fg = "foreground"
+bg = "background"
+
+["ui.background.panel"]
+bg = "#20242c"
+
+["ui.background.elevated"]
+bg = "#2e3440"
+
+["ui.accent"]
+fg = "accent"
+
+[keyword]
+fg = "accent"
+```
+
+Supported UI scope families are `ui.background`, `ui.text`, `ui.label`,
+`ui.accent`, `ui.selection`, `ui.cursor`, `ui.search.match`, `ui.statusline`,
+`ui.success`, `ui.warning`, `ui.error`, `ui.scrollbar`, and
+`ui.grid.header`. A missing, unreadable, or malformed custom theme falls back
+to One Dark and reports a nonfatal startup warning.
 
 ### 1Password integration
 

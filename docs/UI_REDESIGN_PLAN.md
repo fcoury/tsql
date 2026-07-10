@@ -1,151 +1,396 @@
-# Tonal Zones UI Redesign — Implementation Plan
+# Tonal Zones UI Redesign — Implementation Plan (Revision 2)
 
 ## Context
 
-The current TUI wraps all four panes (connections, schema, query, results) in `Block::default().borders(Borders::ALL)` with focus shown by a border-color change — visually noisy, space-wasting, and a weak focus signal. Following the case study, the maintainer chose **Direction A (tonal zones)**, opencode-style: background tones per pane, uppercase section labels instead of border titles, a left accent edge on the focused pane, and a status strip with a solid vim-mode pill.
+The current TUI wraps the four primary panes (connections, schema, query, and results) in `Block::default().borders(Borders::ALL)`. Focus is indicated only by changing the border color. This is visually noisy, consumes space, and provides a weak focus signal.
+
+The replacement follows **Direction A (tonal zones)**: each primary pane has a background tone, uppercase section labels replace border titles, the focused pane has a left accent edge, and the status strip has a solid vim-mode pill.
 
 **Maintainer decisions (locked):**
-- **Full replacement** — the bordered UI is deleted; no legacy path, no `show_borders` flag (field removed), no truecolor fallback/detection. `Color::Rgb` is emitted unconditionally (matches existing stance: syntax highlighting and `grid.rs:1746` already do).
-- **Custom theme files in scope** — `display.theme` resolves built-ins first, then `~/.tsql/themes/<name>.toml` (honoring `TSQL_CONFIG_DIR`), falling back to `one_dark` with a nonfatal startup warning.
-- One Helix-style TOML drives both syntax and UI chrome via new `ui.*` keys; modals/popups keep their current bordered look (only must-not-regress).
 
-**Verified load-bearing facts:**
-- ratatui 0.29 `Block::inner()` reserves the top row when a top title exists even without `Borders::TOP` (`block.rs:644`), and `Block::render` paints `self.style` over the whole area — so `zone_block` needs no manual label rendering. Use `title_top(Line)` (the `Title` struct is deprecated; repo pushes with `-D warnings`).
-- `symbols::border::Set` fields are `&'static str` — a custom set with `vertical_left: "▍"` is const-legal.
-- `HighlightedTextArea` already has `.cursor_style()` / `.selection_style()` setters (`highlighted_editor.rs:66-74`) and derives cursor position from `block.inner()`.
-- Syntax themes set **fg only** (no bg anywhere in one_dark/github_light) — pane tones show through tokens.
-- The grid renders manually via `buf.set_string` with `Style::default()` (bg None) for all non-highlight cells — a block-level bg composes cleanly.
-- `Config`/`DisplayConfig` use `#[serde(default)]`, no `deny_unknown_fields` — removing `show_borders` keeps old configs parseable (pin with a test).
-- `tui-syntax` `Theme` parser accepts arbitrary keys via `#[serde(flatten)]`, supports fg/bg/modifiers, and `style_for()` has hierarchical dotted-scope fallback.
-- `main.rs:367-369` overwrites `app.last_status` with startup warnings — the theme warning must be merged into `startup_warnings`, not just set in `with_config`.
+- **Full replacement:** remove the bordered primary-pane UI. Do not retain a legacy rendering path or `show_borders` flag.
+- **Truecolor:** emit `Color::Rgb` unconditionally. This matches existing syntax highlighting and grid search styling.
+- **Custom themes:** resolve `display.theme` against built-ins first, then `<config_dir>/themes/<name>.toml`, where `config_dir()` honors `TSQL_CONFIG_DIR`. Missing or invalid themes fall back to `one_dark` and produce a nonfatal startup warning.
+- **One theme source:** Helix-style TOML drives both syntax highlighting and UI chrome through `ui.*` scopes.
+- **Modals and popups:** retain their current bordered appearance. They are regression-tested but are not redesigned in this change.
 
-## Core new module: `crates/tsql/src/ui/theme.rs`
+## Verified load-bearing facts
 
-### `UiTheme` — pre-resolved chrome styles, built once in `App::with_config`
+- In ratatui 0.29, `Block::inner()` reserves the top row for a top title even without `Borders::TOP`, and `Block::render` applies the block style over its complete area. Zone labels therefore do not require separate rendering.
+- Use `title_top(Line)` rather than the deprecated `Title` type because the repository runs clippy with `-D warnings`.
+- `symbols::border::Set` fields are `&'static str`, so a const set with `vertical_left: "▍"` is valid.
+- `HighlightedTextArea` exposes `.cursor_style()` and `.selection_style()`, and both rendering and native-cursor positioning derive their viewport from `block.inner()`.
+- `HighlightedTextArea` replaces the syntax style on selected and block-cursor characters rather than patching it. Editor selection and cursor styles must therefore resolve to explicit foreground and background colors.
+- The grid writes cells using styles whose unset fields inherit the buffer's existing style. A zone-level foreground and background provides a reliable base style for ordinary grid cells.
+- `Config` and `DisplayConfig` use `#[serde(default)]` without `deny_unknown_fields`; removing `show_borders` keeps old configuration files parseable.
+- The `tui-syntax` parser accepts arbitrary capture keys and supports foreground, background, and modifiers. Its current hierarchical fallback selects the nearest complete ancestor style; it does not merge missing fields from parent and child styles.
+- `main.rs` currently writes joined startup warnings into `app.last_status`. Theme-loading diagnostics must join that warning collection without using `last_status` as temporary transport.
+
+## Theme architecture
+
+### `UiTheme`
+
+Add `crates/tsql/src/ui/theme.rs` with a pre-resolved theme built once during `App::with_config`:
 
 ```rust
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiTheme {
-    // tones
-    pub bg_base: Color,      // ui.background           — results grid
-    pub bg_panel: Color,     // ui.background.panel     — sidebar
-    pub bg_elevated: Color,  // ui.background.elevated  — query editor
-    pub bg_status: Color,    // ui.statusline bg
-    // text
-    pub text: Color, pub text_muted: Color,
-    // labels
-    pub label: Style, pub label_focused: Style,
-    // focus accents (vim-mode)
-    pub accent: Color, pub accent_insert: Color, pub accent_visual: Color,
-    // selection & cursors (explicit fg+bg, never REVERSED)
-    pub selection: Style, pub cursor_cell: Style,
-    pub editor_cursor: Style, pub editor_selection: Style,
-    // search
-    pub search_match: Style, pub search_match_current: Style,
-    // semantic
-    pub success: Color, pub warning: Color, pub error: Color,
-    // misc
-    pub pill_fg: Color, pub scrollbar: Style, pub grid_header: Style,
+    // Pane tones and base text
+    pub bg_base: Color,
+    pub bg_panel: Color,
+    pub bg_elevated: Color,
+    pub bg_status: Color,
+    pub text: Color,
+    pub text_muted: Color,
+
+    // Labels and focus
+    pub label: Style,
+    pub label_focused: Style,
+    pub accent: Color,
+    pub accent_insert: Color,
+    pub accent_visual: Color,
+
+    // Explicit foreground + background styles
+    pub selection: Style,
+    pub cursor_cell: Style,
+    pub editor_cursor: Style,
+    pub editor_selection: Style,
+    pub search_match: Style,
+    pub search_match_current: Style,
+
+    // Semantic and miscellaneous styles
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub pill_fg: Color,
+    pub scrollbar: Style,
+    pub grid_header: Style,
 }
 ```
 
-- `UiTheme::from_theme(&tui_syntax::Theme)` — `style_for("ui.*")` lookups; every field has a hardcoded One Dark constant as final fallback (any theme, even empty, yields a coherent UI). `UiTheme::fallback()` for tests/Default.
-- `mode_accent(mode) -> Color`: Normal→accent, Insert→accent_insert, Visual→accent_visual.
+`UiTheme::fallback()` is the canonical hardcoded One Dark UI theme. `UiTheme::from_theme(&Theme)` starts from that fallback and applies theme values component by component.
 
-### Zone helpers (geometry single source of truth)
+### Component-wise style resolution
+
+Do not use `Theme::style_for()` alone to resolve UI styles. An exact child style containing only `bg` must still inherit its parent's `fg`, and both must retain hardcoded defaults for any remaining fields.
+
+Add an exact lookup API to `tui-syntax`:
 
 ```rust
-pub const ZONE_EDGE_SET: border::Set = border::Set { vertical_left: "▍", ..border::PLAIN };
+pub fn style_for_exact(&self, capture: &str) -> Option<RatatuiStyle>
+```
 
-pub fn zone_block(label: Line, tone: Color, focused: bool, accent: Color) -> Block {
-    let edge = if focused { Style::default().fg(accent).bg(tone) }
-               else { Style::default().fg(tone).bg(tone) };  // invisible, column still reserved
-    Block::default().style(Style::default().bg(tone))
-        .borders(Borders::LEFT).border_set(ZONE_EDGE_SET).border_style(edge)
-        .title_top(label).padding(Padding::new(1, 1, 0, 0))
+Resolve a UI style in this order:
+
+1. Start with the complete hardcoded fallback style.
+2. Patch each defined ancestor from least to most specific, for example `ui`, `ui.selection`, then `ui.selection.editor`.
+3. Preserve fallback fields when a theme style omits them.
+4. Remove `REVERSED` from normalized selection and cursor styles; these styles use explicit colors.
+
+For example, a custom theme with only:
+
+```toml
+["ui.selection.editor"]
+bg = "#44475a"
+```
+
+retains the fallback editor-selection foreground while replacing its background.
+
+Tests must cover exact lookup, parent/child component merging, modifier merging, and a child that supplies only a background.
+
+### Theme scopes
+
+Add matching `ui.*` scopes to both built-in themes during Phase 1:
+
+- `ui.background`, `ui.background.panel`, `ui.background.elevated`
+- `ui.text`, `ui.text.muted`
+- `ui.label`, `ui.label.focused`
+- `ui.accent`, `ui.accent.insert`, `ui.accent.visual`
+- `ui.selection`, `ui.selection.editor`
+- `ui.cursor`, `ui.cursor.cell`
+- `ui.search.match`, `ui.search.match.current`
+- `ui.statusline`, `ui.statusline.mode`
+- `ui.success`, `ui.warning`, `ui.error`
+- `ui.scrollbar`, `ui.grid.header`
+
+One Dark tones:
+
+- base `#282C34`
+- panel `#21252B`
+- elevated `#2C313A`
+- status `#1D2025`
+
+GitHub Light tones:
+
+- base `#FFFFFF`
+- panel `#F6F8FA`
+- elevated `#EAEEF2`
+- status `#D8DEE4`
+
+Selection, cursor, and search scopes in both built-ins must specify explicit foreground and background colors. Syntax scopes remain foreground-only so the zone base style shows through.
+
+### Theme loading and diagnostics
+
+```rust
+pub fn load_theme_from(
+    name: &str,
+    themes_dir: Option<&Path>,
+) -> (Theme, Option<String>);
+
+pub fn load_theme(name: &str) -> (Theme, Option<String>);
+```
+
+Resolution order:
+
+1. `""`, `"default"`, or `"one_dark"` → built-in One Dark.
+2. `"github_light"` → built-in GitHub Light.
+3. A valid custom name → `<themes_dir>/<name>.toml`.
+4. Missing, unreadable, or invalid TOML → One Dark plus a warning containing the requested name and failure reason.
+
+Custom names must be a single file stem: reject absolute paths, path separators, `.` and `..`. This keeps theme resolution inside the themes directory.
+
+Add a private `startup_warnings: Vec<String>` field to `App` and a `take_startup_warnings()` method. `App::with_config` pushes only theme-loading diagnostics into that collection. In `main.rs`, extend the existing local `startup_warnings` with `app.take_startup_warnings()` before joining them into `last_status`. Do not read or clear `last_status` during this merge.
+
+## Zone geometry
+
+```rust
+pub const ZONE_EDGE_SET: border::Set = border::Set {
+    vertical_left: "▍",
+    ..border::PLAIN
+};
+
+pub fn zone_block(
+    label: Line,
+    tone: Color,
+    text: Color,
+    focused: bool,
+    accent: Color,
+) -> Block {
+    let edge = if focused {
+        Style::default().fg(accent).bg(tone)
+    } else {
+        Style::default().fg(tone).bg(tone)
+    };
+
+    Block::default()
+        .style(Style::default().fg(text).bg(tone))
+        .borders(Borders::LEFT)
+        .border_set(ZONE_EDGE_SET)
+        .border_style(edge)
+        .title_top(label)
+        .padding(Padding::new(1, 1, 0, 0))
 }
-pub fn zone_inner(area: Rect) -> Rect      // (x+2, y+1, w-3, h-1) — mirror of zone_block().inner()
-pub fn zone_scrollbar_area(area: Rect) -> Rect  // right padding column below label row
-pub fn zone_label(name, detail_spans, focused, accent, theme) -> Line<'static>  // " QUERY" style
+
+pub fn zone_inner(area: Rect) -> Rect;
+pub fn zone_scrollbar_area(area: Rect) -> Rect;
+pub fn zone_label(
+    name: &str,
+    detail_spans: Vec<Span<'static>>,
+    focused: bool,
+    accent: Color,
+    theme: &UiTheme,
+) -> Line<'static>;
 ```
 
-**Inner geometry** (vs. old `Borders::ALL` inset of +1,+1,−2,−2): `x+2, y+1, width−3, height−1`. Identical focused/unfocused — no layout shift on focus change, by construction. Unit test pins `zone_block(...).inner(area) == zone_inner(area)` incl. degenerate rects.
+For normal-sized rectangles, `zone_block(...).inner(area)` is `(x + 2, y + 1, width - 3, height - 1)`:
 
-### Theme loading
+- one column for the left edge
+- one column for left padding
+- one column for right padding and the scrollbar gutter
+- one row for the label
 
-```rust
-pub fn load_theme_from(name: &str, themes_dir: Option<&Path>) -> (Theme, Option<String>)
-// "" | "default" | "one_dark" → built-in one_dark; "github_light" → built-in;
-// else themes_dir/<name>.toml; missing/parse-error → one_dark + warning message
-pub fn load_theme(name: &str) -> (Theme, Option<String>)  // dir = config_dir().join("themes")
-```
+`zone_inner` must mirror ratatui's saturating behavior exactly for degenerate rectangles. A unit test pins `zone_block(...).inner(area) == zone_inner(area)` over normal and degenerate sizes.
 
-Warning surfaces via `startup_warnings` in `main.rs` (merge `app.last_status.take()` before the join at `main.rs:367-369`).
+The focused and unfocused forms always reserve the same geometry. Only styles change.
 
-### `ui.*` keys appended to `ONE_DARK_TOML` (`crates/tui-syntax/src/themes/mod.rs`)
+## Implementation phases
 
-Scopes: `ui.background` (#282C34) / `.panel` (#21252B) / `.elevated` (#2C313A); `ui.text` / `.muted`; `ui.label` / `.focused` (cyan bold); `ui.accent` (cyan) / `.insert` (green) / `.visual` (yellow); `ui.selection` (#3E4451 bg) / `.editor`; `ui.cursor` (explicit fg/bg) / `.cell`; `ui.search.match` / `.current`; `ui.statusline` (bg #1D2025) / `.mode` (pill ink); `ui.success/warning/error`; `ui.scrollbar`; `ui.grid.header`. Syntax scopes stay fg-only.
+Each phase must compile, pass formatting and linting, pass tests, and leave every enabled built-in theme coherent. Transitional mixtures of bordered and zone panes are acceptable, but foreground/background combinations must remain legible.
 
-## Phases
+### Phase 1 — Theme foundation and loading (M)
 
-Each phase: compiles, `cargo fmt --all`, `cargo clippy --all --all-targets -- -D warnings`, `cargo test --all` pass; app renders coherently (transitional mixed look between phases is acceptable).
+- Add all `ui.*` scopes to both `ONE_DARK_TOML` and `GITHUB_LIGHT_TOML`.
+- Add `Theme::style_for_exact()` and tests in `crates/tui-syntax/src/theme.rs`.
+- Add `crates/tsql/src/ui/theme.rs` with:
+  - `UiTheme`
+  - component-wise style resolution
+  - `fallback()`
+  - `mode_accent(mode)`
+  - `load_theme()` and `load_theme_from()`
+  - zone geometry helpers
+  - test-only luminance and contrast helpers
+- Register and re-export the required theme types/helpers from `crates/tsql/src/ui/mod.rs`.
+- Remove `DisplayConfig::show_borders` and its default; update `config.example.toml`.
+- Reword the `display.theme` configuration documentation.
 
-### Phase 1 — Theme foundation, no visual change (M)
-- `crates/tui-syntax/src/themes/mod.rs`: append `ui.*` block to `ONE_DARK_TOML`.
-- `crates/tui-syntax/src/theme.rs`: tests only (`ui.*` parses with bg; hierarchical fallback panel→background).
-- **New** `crates/tsql/src/ui/theme.rs`: `UiTheme`, `from_theme`, `fallback`, `mode_accent`, `load_theme(_from)`, zone helpers; `#[cfg(test)]` `luminance`/`contrast_ratio` helpers.
-- `crates/tsql/src/ui/mod.rs`: register module.
-- `crates/tsql/src/ui/highlighted_editor.rs:429`: `create_sql_highlighter(theme: Theme)` (was zero-arg hardcoded one_dark).
-- `crates/tsql/src/app/app.rs`: `pub ui_theme: UiTheme` field (~:2434); build in `with_config` (:2654) from `config.display.theme`; pass syntax theme to highlighter (:2697).
-- `crates/tsql/src/main.rs:367-369`: merge `last_status` into `startup_warnings`.
-- `crates/tsql/src/config/schema.rs`: **delete** `show_borders` (:47, :62); reword `theme` doc (:48). Update `config.example.toml` (:27-31).
-- Tests: tone resolution from one_dark; `from_theme(empty) == fallback()`; contrast ratios ≥ 4.5 for text-on-tone pairs across all built-ins + fallback, tones mutually distinguishable; `load_theme_from` tempdir matrix (valid/malformed/missing/built-in); old config with `show_borders = true` still parses.
+Do not connect the new loader to `App` yet. Phase 1 is intentionally a no-visual-change foundation: the configured syntax and UI themes become active together in Phase 2, when the query pane has an explicit base foreground and background.
 
-### Phase 2 — Zone helpers live: query pane + geometry plumbing (L)
-All in `app.rs` draw closure (:2995-3280) unless noted:
-- :3071-3100 — replace border/title with `zone_block(zone_label("QUERY", …), ui_theme.bg_elevated, focused, ui_theme.mode_accent(mode))`; label detail: `[INSERT]` (focused, accent) + modified `[+]`.
-- :3109-3114 — add `.cursor_style(ui_theme.editor_cursor)` + `.selection_style(ui_theme.editor_selection)` (kills REVERSED-on-tint and hardcoded Blue).
-- :3128-3139 — **load-bearing**: replace `query_area.height/width.saturating_sub(2)` with `query_block.inner(query_area)` dims for `calculate_editor_scroll`.
-- :3141-3170 — scrollbar → `zone_scrollbar_area(query_area)` + `ui_theme.scrollbar`.
-- :3345-3348 — completion popup anchor derives from `zone_inner(query_area)`.
-- :801 — `QUERY_BORDER_ROWS = 2` → `QUERY_CHROME_ROWS = 1`; usage :872; update `compute_query_panel_height` tests (:11693-11726).
-- Tests (TestBackend/Buffer): label on row 0; `▍` accent column when focused; **focused-vs-unfocused buffer symbols identical** (geometry-stability regression test); all cell bg == tone; cursor position (x+2, y+1) for cursor (0,0).
+Tests:
+
+- both built-ins parse all required `ui.*` scopes
+- `UiTheme::from_theme(empty) == UiTheme::fallback()`
+- partial child styles inherit parent and fallback components
+- base text meets a 4.5:1 contrast ratio against each pane tone for both built-ins
+- every explicit selection, cursor, and search foreground/background pair meets its documented contrast threshold
+- the three pane tones are distinct
+- valid, malformed, missing, and built-in theme loading
+- custom theme names cannot escape the themes directory
+- an old config containing `show_borders = true` still parses
+
+### Phase 2 — Query zone and syntax-theme activation (L)
+
+Application integration:
+
+- Add `ui_theme` and structured `startup_warnings` fields to `App`.
+- In `App::with_config`, load the configured theme once, build `UiTheme`, and pass that same loaded theme into the SQL highlighter.
+- In `main.rs`, merge `app.take_startup_warnings()` into the existing startup-warning vector without reading or clearing `last_status`.
+
+In the main draw closure:
+
+- Replace the query border/title with `zone_block` using `bg_elevated`, `text`, and `mode_accent(mode)`.
+- Build a `QUERY` label with focused mode detail and a modified `[+]` indicator.
+- Change `create_sql_highlighter` to accept the loaded `Theme`. This activates the configured syntax and UI themes atomically now that the editor has an explicit matching base foreground/background.
+- Apply `ui_theme.editor_cursor` and `ui_theme.editor_selection` to `HighlightedTextArea`.
+- Derive editor scroll dimensions from `query_block.inner(query_area)` rather than subtracting hardcoded border widths.
+- Render the scrollbar in `zone_scrollbar_area(query_area)` using `ui_theme.scrollbar`.
+- Derive the completion-popup origin from `zone_inner(query_area)`.
+- Rename `QUERY_BORDER_ROWS` to `QUERY_CHROME_ROWS` and change it from 2 to 1. Update query-height tests.
+
+Tests:
+
+- label appears on row 0
+- focused edge uses `▍` and the current mode accent
+- focused and unfocused buffers have identical symbols and geometry but different edge styles
+- ordinary editor cells inherit `theme.text` and `bg_elevated`
+- selection and cursor cells use their explicit allowed foreground/background pairs
+- native cursor position for editor coordinate `(0, 0)` is `(inner.x, inner.y)`
+- One Dark and GitHub Light query renders contain no reset foreground on nonblank content cells
+- a bad theme and an unrelated `last_status`/`last_error` remain separate
+
+Do not assert that every cell has the pane background: cursor and selection cells intentionally use different backgrounds.
 
 ### Phase 3 — Results grid zone (L)
-- `grid.rs` `DataGrid` (:1391): add `label: Line<'a>`, `theme: &'a UiTheme` fields; render (:1400-1432) uses `zone_block(label, theme.bg_base, focused, theme.accent)`. Style swaps: header (:1503) → `theme.grid_header`; cursor row (:1529) → `theme.selection`; search/cursor-cell (:1744-1748) → theme; gutter DarkGray/Gray (:1607-1654) → `theme.text_muted/text`; empty-state messages → `theme.text_muted`; scrollbar (:1572-1592) → `zone_scrollbar_area` (content regains its last column).
-- `app.rs`: build grid label in draw closure (`RESULTS · {n} rows · {ms}ms` + search match info — data lives on App); viewport math (:3172-3191) via `zone_inner(grid_area)` (preserve existing marker_w parity quirk — do not fix in this pass); `grid_mouse_target` (:11040-11096) hardcoded inset → `zone_inner`, update its tests (~:12322).
-- `style.rs`: add `#[cfg(test)] assert_bg_cells_have_visible_fg(buf, bg)` (generalizes :46-64; keep old helper for modals).
-- Tests: update grid render tests (:2046-2066, :2145-2175) for new offsets (data starts x=5); label row content; cell bg ∈ allowed set; contrast assertion on selection; focus-toggle symbol equality; mouse mapping.
+
+In `grid.rs`:
+
+- Add `label: Line<'a>` and `theme: &'a UiTheme` to `DataGrid`.
+- Render with `zone_block(label, bg_base, text, focused, accent)`.
+- Replace hardcoded styles with:
+  - `grid_header`
+  - `selection`
+  - `cursor_cell`
+  - `search_match`
+  - `search_match_current`
+  - `text` and `text_muted`
+- Preserve the zone base foreground for ordinary body cells.
+- Move the vertical scrollbar into `zone_scrollbar_area(area)` so it no longer overwrites the content column.
+
+In `app.rs`:
+
+- Build `RESULTS · {n} rows · {ms}ms`, with search match detail when active.
+- Derive viewport dimensions from `zone_inner(grid_area)`.
+- Preserve the existing marker-width parity behavior; changing it is outside this redesign.
+- Change `grid_mouse_target` to use `zone_inner(grid_area)` and update its tests.
+
+In `style.rs`, add a test helper that validates cells against an explicit set of allowed foreground/background pairs. Keep the existing modal selection helper.
+
+Tests:
+
+- label content and offsets
+- ordinary data cells use `text` on `bg_base`
+- selection, search, and cursor cells use allowed explicit pairs
+- no nonblank grid cell has a reset foreground under either built-in theme
+- focus changes styles without changing symbols or geometry
+- scrollbar occupies only the right gutter
+- mouse mapping matches rendered rows and columns
 
 ### Phase 4 — Sidebar zones (M)
-- `sidebar.rs` render (:64-100): add `theme: &UiTheme` param; split `[Percentage(30), Length(1), Min(0)]` with the 1-row spacer painted `bg_panel`; areas = chunks[0]/chunks[2].
-- `render_connections` (:102-191) / `render_schema` (:193-270): `zone_block(…, bg_panel, focused, theme.accent)` each (accent edge only on the focused sub-section); selection highlight → `theme.selection` (focused) / `fg(theme.accent)` (unfocused, replaces Yellow); current-conn marker → `theme.success`; loading/error/empty → `theme.warning/error/text_muted`.
-- Click math unchanged (label row occupies the old border row — `sidebar.rs:441-468`); schema tree uses stored absolute coords (:477-482).
-- `app.rs:3031-3041`: pass `&self.ui_theme`.
-- Tests: labels render; spacer bg; `▍` on focused section only; focus-toggle symbol equality; selection contrast.
 
-### Phase 5 — Status strip + pill, light theme, docs (S/M)
-- `status_line.rs`: add `separator_style()` to builder (separator hardcodes DarkGray at :270).
-- `app.rs status_line()` (:10726-10881): mode segment = pill (`" {mode} "` with `bg(mode_accent) fg(pill_fg) BOLD`); segment styles → theme semantic colors; return `Paragraph::new(line).style(bg(bg_status).fg(text))` (paints full strip).
-- `themes/mod.rs`: matching `ui.*` block for `GITHUB_LIGHT_TOML` (base #ffffff, panel #f6f8fa, elevated #eaeef2…) — Phase 1 contrast tests cover it automatically.
-- Docs: `config.example.toml`, README note on custom themes dir.
-- Noted follow-up (out of scope): `json_editor.rs:108` / `row_detail.rs:89` hardcode one_dark for modal syntax; ~170 modal `Color::` literals stay.
+- Change the sidebar split to `[Percentage(30), Length(1), Min(0)]`.
+- Paint the spacer row with `bg_panel` and `text`.
+- Render connections and schema with `zone_block(..., bg_panel, text, ...)`.
+- Show the accent edge only on the focused sidebar subsection.
+- Replace selection, current-connection, loading, error, empty-state, and muted styles with `UiTheme` values.
+- Ensure non-current connection and ordinary schema text inherit `text` on `bg_panel`.
+- Pass `&self.ui_theme` from `app.rs`.
 
-## Risks & mitigations
-1. **Geometry regressions** (cursor drift, scroll jumps, mouse mis-hits) → single geometry source (`zone_block`/`zone_inner` + equality test); editor scroll uses the same `block.inner()` as the widget; per-pane focus-toggle symbol-equality tests.
-2. **REVERSED cursor on tinted bg** → explicit `ui.cursor` style from Phase 2; fallback constants guarantee it's always set.
-3. **Contrast on tones** → all highlight styles carry explicit fg+bg; contrast-ratio unit tests over every built-in + fallback; buffer assertions in render tests.
-4. **Config back-compat** → `show_borders` removal safe (`#[serde(default)]`, no deny_unknown_fields; pinned by test); `theme = "default"` → one_dark; Config never written back to disk (verified).
-5. **Sparse custom themes** → hierarchical `style_for` fallback + hardcoded final fallbacks; test with a minimal TOML.
-6. **Clippy -D warnings vs deprecated `Title`** → use `title_top(Line)` exclusively.
-7. **Insert-mode auto-height** grows one row (chrome 2→1) — intended; tests updated in Phase 2.
+Connection click-row math remains unchanged because the label occupies the former top-border row. Schema-tree clicks continue to use the absolute coordinates recorded by the tree widget. The spacer is outside both stored hit-test areas.
+
+Tests:
+
+- both labels render
+- spacer has the panel base style
+- only the focused subsection has a visible `▍`
+- focus changes styles without changing symbols or geometry
+- ordinary and selected text have explicit visible foregrounds
+- clicks on labels, rows, blank content, and the spacer produce the expected result
+
+### Phase 5 — Status strip and documentation (S/M)
+
+- Add `separator_style()` to `StatusLineBuilder`.
+- Render the mode segment as `" {mode} "` with `bg(mode_accent)`, `fg(pill_fg)`, and `BOLD`.
+- Replace status segment colors with theme semantic colors.
+- Return `Paragraph::new(line).style(Style::default().bg(bg_status).fg(text))` so padding and unstyled spans inherit the status base style.
+- Add a status-line render test for narrow and wide widths under both built-ins.
+- Document the custom theme directory, supported `ui.*` keys, exact quoted TOML syntax, fallback behavior, and a minimal example in the README.
+- Update `config.example.toml` with `one_dark`, `github_light`, and custom-name examples.
+
+Out of scope:
+
+- `json_editor.rs` and `row_detail.rs` continue using One Dark syntax highlighting.
+- Existing modal and popup color literals remain unchanged.
+- Modal and popup borders remain visible.
+
+## Risks and mitigations
+
+1. **Reset foreground on painted backgrounds** — every zone applies both `text` and its tone as the base style; render tests reject reset foregrounds on nonblank content.
+2. **Partial custom styles lose required fields** — UI styles merge fallback, parent, and exact child components before use.
+3. **Geometry regressions** — `zone_block`, `zone_inner`, and `zone_scrollbar_area` are the shared geometry source; editor scroll, cursor placement, viewport sizing, and mouse hit-testing use those helpers.
+4. **Cursor or selection disappears on tinted backgrounds** — normalized cursor, selection, and search styles always have explicit foreground and background colors and never rely on `REVERSED`.
+5. **Built-in light/dark mismatch** — both built-ins receive complete UI palettes before the configured syntax theme is activated.
+6. **Theme warnings overwrite runtime status** — theme diagnostics use a dedicated startup-warning collection and never use `last_status` as transport.
+7. **Config compatibility** — unknown `show_borders` remains accepted, `theme = "default"` maps to One Dark, and configuration is not written back automatically.
+8. **Theme path escape** — custom theme names are validated as a single file stem before joining them to the theme directory.
+9. **Custom theme contrast** — hardcoded UI fallbacks keep omitted chrome scopes usable; custom syntax colors remain the theme author's responsibility and are documented as such.
+10. **Deprecated ratatui APIs** — zone helpers use `title_top(Line)` exclusively.
+11. **Insert-mode height change** — reducing query chrome from two rows to one intentionally adds one visible editor row; query-height tests pin the behavior.
 
 ## Critical files
-- `crates/tsql/src/app/app.rs` (draw closure :2995-3280, scroll math :3128, viewport :3172, `grid_mouse_target` :11040, `status_line()` :10726, `with_config` :2654)
+
+- `crates/tsql/src/app/app.rs`
+- `crates/tsql/src/main.rs`
 - `crates/tsql/src/ui/theme.rs` (new)
-- `crates/tsql/src/ui/grid.rs` (:1391-1593, :1744-1748)
-- `crates/tsql/src/ui/sidebar.rs` (:64-270, :441-468)
-- `crates/tui-syntax/src/themes/mod.rs`, `crates/tsql/src/config/schema.rs`, `crates/tsql/src/ui/status_line.rs`, `crates/tsql/src/main.rs`
+- `crates/tsql/src/ui/highlighted_editor.rs`
+- `crates/tsql/src/ui/grid.rs`
+- `crates/tsql/src/ui/sidebar.rs`
+- `crates/tsql/src/ui/status_line.rs`
+- `crates/tsql/src/ui/style.rs`
+- `crates/tsql/src/config/schema.rs`
+- `crates/tui-syntax/src/theme.rs`
+- `crates/tui-syntax/src/themes/mod.rs`
+- `config.example.toml`
+- `README.md`
 
 ## Verification
-- Per phase: `cargo fmt --all` && `cargo clippy --all --all-targets -- -D warnings` && `cargo test --all`.
-- End-to-end after Phases 2-5: run the app against a live connection (`cargo run`), and verify visually: no borders anywhere; tones distinct (sidebar/query/results/status); focus cycling (Tab / Ctrl-hjkl) moves the `▍` edge with **zero content shift**; vim mode flips edge+pill colors (i / v / Esc); scroll long query + grid with scrollbars in the gutter; mouse clicks on tree items and grid cells hit the right rows; search highlights legible; `display.theme = "github_light"` renders the light variant; a custom `~/.tsql/themes/test.toml` loads (and a bogus name shows the startup warning in the status strip).
+
+Per phase:
+
+```sh
+cargo fmt --all
+cargo clippy --all --all-targets -- -D warnings
+cargo test --all
+```
+
+After Phases 2–5, run the app against a live connection and verify:
+
+- primary panes have no surrounding borders; modal and popup borders remain
+- sidebar, query, results, and status tones are distinct
+- ordinary text is legible in One Dark and GitHub Light regardless of the terminal's default foreground
+- Tab, Shift-Tab, and Ctrl/Alt-hjkl move the `▍` edge without shifting content
+- `i`, `v`, and Esc update the query edge and status pill colors
+- long query and grid content scroll without the scrollbar overwriting content
+- sidebar and grid mouse clicks target the rendered row and column
+- selection, search, cursor, muted, error, and loading text remain legible
+- `display.theme = "github_light"` renders a complete light UI
+- a valid custom theme loads from `<config_dir>/themes`
+- an invalid or missing theme falls back to One Dark and appears in the startup-warning status without replacing unrelated application errors
