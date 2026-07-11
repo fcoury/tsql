@@ -82,7 +82,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         ),
         KeyBinding::new("Ctrl-h/j/k/l", "Move between panes in Normal mode"),
         KeyBinding::new("Alt-h/j/k/l", "Move between panes in any mode"),
-        KeyBinding::new("Alt+M", "Toggle query pane height (min/max)"),
+        KeyBinding::new("Alt+M", "Toggle maximized results view"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
