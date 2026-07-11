@@ -1,18 +1,54 @@
 use std::error::Error as StdError;
 
 use serde_json::Value as JsonValue;
+use tokio_postgres::error::ErrorPosition;
 
 /// Format a postgres error with its full chain of causes
 pub fn format_pg_error(e: &tokio_postgres::Error) -> String {
-    let mut msg = e.to_string();
+    format_pg_error_with_position(e, |_| None)
+}
 
-    // Try to get the database error details
+/// Formats a PostgreSQL error, allowing generated SQL positions to be mapped to user source.
+pub(crate) fn format_pg_error_with_position(
+    e: &tokio_postgres::Error,
+    map_position: impl FnOnce(u32) -> Option<(u32, usize, usize)>,
+) -> String {
     if let Some(db_err) = e.as_db_error() {
-        msg = db_err.to_string();
-    } else if let Some(source) = e.source() {
-        // Fall back to source error
-        msg = format!("{}: {}", msg, source);
+        let mut lines = vec![format!("{} [{}]", db_err.message(), db_err.code().code())];
+        if let Some(detail) = db_err.detail() {
+            lines.push(format!("DETAIL: {detail}"));
+        }
+        if let Some(hint) = db_err.hint() {
+            lines.push(format!("HINT: {hint}"));
+        }
+        if let Some(position) = db_err.position() {
+            match position {
+                ErrorPosition::Original(position) => {
+                    if let Some((position, line, column)) = map_position(*position) {
+                        lines.push(format!(
+                            "POSITION: {position} (line {line}, column {column})"
+                        ));
+                    } else {
+                        lines.push(format!("POSITION: {position}"));
+                    }
+                }
+                ErrorPosition::Internal { position, query } => {
+                    lines.push(format!("INTERNAL POSITION: {position}"));
+                    lines.push(format!("INTERNAL QUERY: {query}"));
+                }
+            }
+        }
+        if let Some(context) = db_err.where_() {
+            lines.push(format!("CONTEXT: {context}"));
+        }
+        return lines.join("\n");
     }
+
+    let msg = if let Some(source) = e.source() {
+        format!("{}: {}", e, source)
+    } else {
+        e.to_string()
+    };
 
     let hint = pg_error_hint(&msg);
     if !hint.is_empty() {
@@ -20,6 +56,42 @@ pub fn format_pg_error(e: &tokio_postgres::Error) -> String {
     } else {
         msg
     }
+}
+
+/// Converts a formatted PostgreSQL `POSITION:` into a zero-based textarea cursor.
+///
+/// PostgreSQL counts Unicode scalar values rather than UTF-8 bytes. Rejecting positions beyond
+/// the current source prevents stale or unmapped generated-SQL diagnostics from jumping to an
+/// unrelated location in an edited cell.
+pub(crate) fn pg_error_cursor_position(error: &str, source: &str) -> Option<(usize, usize)> {
+    let position = error.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("POSITION:")?.trim_start();
+        let digits = rest
+            .find(|character: char| !character.is_ascii_digit())
+            .map_or(rest, |end| &rest[..end]);
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse::<usize>().ok()
+        }
+    })?;
+    let offset = position.checked_sub(1)?;
+    if offset > source.chars().count() {
+        return None;
+    }
+
+    Some(
+        source
+            .chars()
+            .take(offset)
+            .fold((0usize, 0usize), |(row, column), character| {
+                if character == '\n' {
+                    (row + 1, 0)
+                } else {
+                    (row, column + 1)
+                }
+            }),
+    )
 }
 
 /// Strip the password component from a connection URL, preserving the
@@ -476,6 +548,82 @@ mod tests {
         assert!(pg_error_hint("timeout expired").contains("unreachable"));
         assert!(pg_error_hint("SSL connection is required").contains("SSL"));
         assert!(pg_error_hint("totally unrelated").is_empty());
+    }
+
+    #[test]
+    fn test_pg_error_cursor_position_handles_unicode_and_mapped_locations() {
+        let source = "SELECT 'é🙂' AS note\nWHERE broken";
+        let position = source[..source.find("broken").unwrap()].chars().count() + 1;
+
+        assert_eq!(
+            pg_error_cursor_position(&format!("syntax error\nPOSITION: {position}"), source),
+            Some((1, 6))
+        );
+        assert_eq!(
+            pg_error_cursor_position(
+                &format!("syntax error [42601]\n  POSITION: {position} (line 2, column 7)"),
+                source
+            ),
+            Some((1, 6))
+        );
+        assert_eq!(
+            pg_error_cursor_position(
+                &format!("syntax error\nPOSITION: {}", source.chars().count() + 1),
+                source
+            ),
+            Some((1, "WHERE broken".chars().count()))
+        );
+    }
+
+    #[test]
+    fn test_pg_error_cursor_position_rejects_internal_stale_and_invalid_locations() {
+        let source = "SELECT 1";
+
+        for error in [
+            "syntax error\nINTERNAL POSITION: 2",
+            "syntax error\nPOSITION: 0",
+            "syntax error\nPOSITION:",
+            "syntax error\nPOSITION: nope",
+            "syntax error\nPOSITION: 99999999999999999999999999",
+            "syntax error\nPOSITION: 99 (line 1, column 99)",
+        ] {
+            assert_eq!(pg_error_cursor_position(error, source), None, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_format_pg_error_preserves_sqlstate_position_detail_and_hint() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let syntax_error = client.simple_query("SELEC 1").await.unwrap_err();
+        let syntax = format_pg_error(&syntax_error);
+        assert!(syntax.contains("[42601]"), "{syntax}");
+        assert!(syntax.contains("POSITION:"), "{syntax}");
+        let mapped = format_pg_error_with_position(&syntax_error, |_| Some((3, 2, 4)));
+        assert!(
+            mapped.contains("POSITION: 3 (line 2, column 4)"),
+            "{mapped}"
+        );
+
+        let raised_error = client
+            .simple_query(
+                "DO $$ BEGIN RAISE EXCEPTION 'notebook failure' USING DETAIL = 'missing row', HINT = 'rerun the source'; END $$",
+            )
+            .await
+            .unwrap_err();
+        let raised = format_pg_error(&raised_error);
+        assert!(raised.contains("notebook failure [P0001]"), "{raised}");
+        assert!(raised.contains("DETAIL: missing row"), "{raised}");
+        assert!(raised.contains("HINT: rerun the source"), "{raised}");
+        assert!(raised.contains("CONTEXT:"), "{raised}");
     }
 
     #[test]

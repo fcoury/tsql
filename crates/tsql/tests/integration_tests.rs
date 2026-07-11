@@ -62,6 +62,31 @@ async fn test_query_error_message() {
         "Error message should mention the table name or indicate it doesn't exist. Got: {}",
         error_message
     );
+    assert!(
+        error_message.contains("[42P01]"),
+        "Error message should include the undefined-table SQLSTATE. Got: {error_message}"
+    );
+    assert!(
+        error_message.contains("POSITION:"),
+        "Error message should include the query position. Got: {error_message}"
+    );
+
+    let err = client
+        .simple_query(
+            "DO $$ BEGIN RAISE EXCEPTION 'notebook diagnostic' USING ERRCODE = '22023', DETAIL = 'extra context', HINT = 'check the input'; END $$",
+        )
+        .await
+        .unwrap_err();
+    let error_message = tsql::util::format_pg_error(&err);
+    assert!(error_message.contains("[22023]"), "{error_message}");
+    assert!(
+        error_message.contains("DETAIL: extra context"),
+        "{error_message}"
+    );
+    assert!(
+        error_message.contains("HINT: check the input"),
+        "{error_message}"
+    );
 }
 
 /// Test that we can execute DDL statements.

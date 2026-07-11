@@ -70,6 +70,7 @@ impl Sidebar {
         connections: &ConnectionsFile,
         current_connection: Option<&str>,
         schema_items: &[TreeItem<'static, String>],
+        schema_connected: bool,
         schema_loading: bool,
         schema_error: Option<&str>,
         focused_section: SidebarSection,
@@ -113,6 +114,7 @@ impl Sidebar {
             frame,
             chunks[2],
             schema_items,
+            schema_connected,
             schema_loading,
             schema_error,
             has_focus && focused_section == SidebarSection::Schema,
@@ -210,6 +212,7 @@ impl Sidebar {
         frame: &mut Frame,
         area: Rect,
         schema_items: &[TreeItem<'static, String>],
+        connected: bool,
         loading: bool,
         error: Option<&str>,
         focused: bool,
@@ -250,9 +253,14 @@ impl Sidebar {
             return;
         }
 
-        // Handle an empty cache (either disconnected or a database with no visible relations).
+        // Distinguish a disconnected workspace from a connected database with no relations.
         if schema_items.is_empty() {
-            let empty = Paragraph::new("No schema items · r refresh")
+            let message = if connected {
+                "No schema items · r refresh"
+            } else {
+                "Connect to view schema"
+            };
+            let empty = Paragraph::new(message)
                 .block(block)
                 .style(Style::default().fg(theme.text_muted));
             frame.render_widget(empty, area);
@@ -549,6 +557,7 @@ mod tests {
                     &connections,
                     None,
                     &[],
+                    true,
                     false,
                     None,
                     SidebarSection::Connections,
@@ -578,6 +587,37 @@ mod tests {
         assert_eq!(buffer.cell((5, spacer_y)).unwrap().bg, theme.bg_panel);
         assert!(!sidebar.is_over_connections(5, spacer_y));
         assert!(!sidebar.is_over_schema(5, spacer_y));
+    }
+
+    #[test]
+    fn disconnected_schema_prompts_for_connection() {
+        let backend = TestBackend::new(32, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut sidebar = Sidebar::new();
+        let connections = ConnectionsFile::new();
+        let theme = UiTheme::fallback();
+
+        terminal
+            .draw(|frame| {
+                sidebar.render(
+                    frame,
+                    frame.area(),
+                    &connections,
+                    None,
+                    &[],
+                    false,
+                    false,
+                    None,
+                    SidebarSection::Schema,
+                    true,
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let schema_area = sidebar.schema_area.unwrap();
+        assert!(row_text(terminal.backend().buffer(), schema_area.y + 1)
+            .contains("Connect to view schema"));
     }
 
     fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {

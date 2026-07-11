@@ -1,3 +1,4 @@
+mod action_palette;
 mod ai_query_modal;
 mod completion;
 mod confirm_prompt;
@@ -20,6 +21,7 @@ mod status_line;
 mod style;
 mod theme;
 
+pub use action_palette::{action_entries, ActionContext, ActionEntry, PaletteAction};
 pub use ai_query_modal::{AiQueryModal, AiQueryModalAction};
 pub use completion::{
     determine_context, get_word_before_cursor, ColumnInfo, CompletionContext, CompletionItem,

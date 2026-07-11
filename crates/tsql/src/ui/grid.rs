@@ -813,6 +813,8 @@ impl GridState {
 pub struct GridModel {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Per-cell SQL NULL identity, separate from the rendered cell text.
+    pub null_cells: Vec<Vec<bool>>,
     pub col_widths: Vec<u16>,
     /// The source table name, if known (extracted from simple SELECT queries).
     pub source_table: Option<String>,
@@ -826,9 +828,11 @@ impl GridModel {
     pub fn new(headers: Vec<String>, rows: Vec<Vec<String>>) -> Self {
         let col_widths = compute_column_widths(&headers, &rows);
         let col_count = headers.len();
+        let null_cells = rows.iter().map(|row| vec![false; row.len()]).collect();
         Self {
             headers,
             rows,
+            null_cells,
             col_widths,
             source_table: None,
             primary_keys: Vec::new(),
@@ -851,10 +855,32 @@ impl GridModel {
         self
     }
 
+    /// Attach SQL NULL identity captured while decoding database rows.
+    pub fn with_null_cells(mut self, mut null_cells: Vec<Vec<bool>>) -> Self {
+        null_cells.resize_with(self.rows.len(), Vec::new);
+        null_cells.truncate(self.rows.len());
+        for (row, mask) in self.rows.iter().zip(&mut null_cells) {
+            mask.resize(row.len(), false);
+            mask.truncate(row.len());
+        }
+        self.null_cells = null_cells;
+        self
+    }
+
+    /// Return whether the cell was decoded from an actual SQL NULL.
+    pub fn cell_is_null(&self, row: usize, col: usize) -> bool {
+        self.null_cells
+            .get(row)
+            .and_then(|mask| mask.get(col))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn empty() -> Self {
         Self {
             headers: Vec::new(),
             rows: Vec::new(),
+            null_cells: Vec::new(),
             col_widths: Vec::new(),
             source_table: None,
             primary_keys: Vec::new(),
@@ -870,6 +896,15 @@ impl GridModel {
     /// Note: If new rows have more columns than the existing model, extra columns
     /// are ignored. If new rows have fewer columns, missing columns are not processed.
     pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
+        self.append_rows_with_nulls(new_rows, Vec::new());
+    }
+
+    /// Append rows together with the SQL NULL identity captured for each cell.
+    pub fn append_rows_with_nulls(
+        &mut self,
+        new_rows: Vec<Vec<String>>,
+        mut null_cells: Vec<Vec<bool>>,
+    ) {
         // Update column widths for any cells that are wider than current widths
         for row in &new_rows {
             for (i, cell) in row.iter().enumerate() {
@@ -889,7 +924,14 @@ impl GridModel {
             }
         }
 
+        null_cells.resize_with(new_rows.len(), Vec::new);
+        null_cells.truncate(new_rows.len());
+        for (row, mask) in new_rows.iter().zip(&mut null_cells) {
+            mask.resize(row.len(), false);
+            mask.truncate(row.len());
+        }
         self.rows.extend(new_rows);
+        self.null_cells.extend(null_cells);
     }
 
     /// Get the column type for a given column index.
@@ -1013,6 +1055,38 @@ impl GridModel {
             .collect();
 
         format!("[\n{}\n]", objects.join(",\n"))
+    }
+
+    /// Format rows as one SQL INSERT statement per row.
+    pub fn rows_as_sql_inserts(&self, row_indices: &[usize], table: &str) -> String {
+        if self.headers.is_empty() {
+            return String::new();
+        }
+
+        let table = table
+            .split('.')
+            .map(quote_identifier)
+            .collect::<Vec<_>>()
+            .join(".");
+        let columns = self
+            .headers
+            .iter()
+            .map(|header| quote_identifier(header))
+            .collect::<Vec<_>>()
+            .join(", ");
+        row_indices
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .map(|row| {
+                let values = row
+                    .iter()
+                    .map(|value| escape_sql_value(value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("INSERT INTO {table} ({columns}) VALUES ({values});")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Format rows as a GitHub-flavored markdown table (always includes headers).
@@ -1379,11 +1453,21 @@ fn escape_csv(s: &str) -> String {
 
 /// Escape a string for JSON output.
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            control if control < ' ' => escaped.push_str(&format!("\\u{:04x}", control as u32)),
+            printable => escaped.push(printable),
+        }
+    }
+    escaped
 }
 
 pub struct DataGrid<'a> {
@@ -1993,6 +2077,70 @@ mod tests {
         // Test without headers
         let result = model.rows_as_tsv(&[0], false);
         assert_eq!(result, "1\tAlice", "Should not include header row");
+    }
+
+    #[test]
+    fn rows_as_json_escapes_all_control_characters() {
+        let model = GridModel::new(
+            vec!["odd\u{0001}header".to_string()],
+            vec![vec!["back\u{0008} form\u{000c} line\nend".to_string()]],
+        );
+
+        let encoded = model.rows_as_json(&[0]);
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            decoded[0]["odd\u{0001}header"],
+            "back\u{0008} form\u{000c} line\nend"
+        );
+    }
+
+    #[test]
+    fn rows_as_sql_inserts_quotes_identifiers_escapes_values_and_skips_missing_rows() {
+        let model = GridModel::new(
+            vec![
+                "id".to_string(),
+                "display \"name\"".to_string(),
+                "enabled".to_string(),
+                "missing".to_string(),
+            ],
+            vec![
+                vec![
+                    "1".to_string(),
+                    "O'Reilly".to_string(),
+                    "true".to_string(),
+                    "NULL".to_string(),
+                ],
+                vec![
+                    "2".to_string(),
+                    "line one\nline two".to_string(),
+                    "false".to_string(),
+                    String::new(),
+                ],
+            ],
+        );
+
+        assert_eq!(
+            model.rows_as_sql_inserts(&[1, 99, 0], "reporting.user \"copy\""),
+            concat!(
+                "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
+                "(id, \"display \"\"name\"\"\", enabled, missing) ",
+                "VALUES (2, 'line one\nline two', FALSE, NULL);\n",
+                "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
+                "(id, \"display \"\"name\"\"\", enabled, missing) ",
+                "VALUES (1, 'O''Reilly', TRUE, NULL);"
+            )
+        );
+    }
+
+    #[test]
+    fn rows_as_sql_inserts_returns_empty_when_there_is_nothing_to_export() {
+        let model = create_test_model();
+        assert!(model.rows_as_sql_inserts(&[], "result").is_empty());
+        assert!(model.rows_as_sql_inserts(&[99], "result").is_empty());
+
+        let no_headers = GridModel::new(Vec::new(), vec![vec!["value".to_string()]]);
+        assert!(no_headers.rows_as_sql_inserts(&[0], "result").is_empty());
     }
 
     #[test]
@@ -3026,6 +3174,46 @@ mod tests {
         // Width should increase for the name column
         assert_eq!(model.col_widths[0], 3); // unchanged
         assert_eq!(model.col_widths[1], 11); // "Christopher"
+    }
+
+    #[test]
+    fn null_metadata_distinguishes_sql_null_from_literal_null_text() {
+        let model = GridModel::new(
+            vec!["actual_null".to_string(), "literal_null".to_string()],
+            vec![vec!["NULL".to_string(), "NULL".to_string()]],
+        )
+        .with_null_cells(vec![vec![true, false]]);
+
+        assert!(model.cell_is_null(0, 0));
+        assert!(!model.cell_is_null(0, 1));
+        assert!(!model.cell_is_null(1, 0));
+        assert!(!model.cell_is_null(0, 2));
+    }
+
+    #[test]
+    fn append_rows_with_nulls_preserves_and_normalizes_null_metadata() {
+        let mut model = GridModel::new(
+            vec!["left".to_string(), "right".to_string()],
+            vec![vec!["NULL".to_string(), "value".to_string()]],
+        )
+        .with_null_cells(vec![vec![true]]);
+
+        model.append_rows_with_nulls(
+            vec![
+                vec!["NULL".to_string(), "NULL".to_string()],
+                vec!["value".to_string(), "NULL".to_string()],
+            ],
+            vec![vec![false, true, true]],
+        );
+
+        assert_eq!(
+            model.null_cells,
+            vec![vec![true, false], vec![false, true], vec![false, false]]
+        );
+        assert!(model.cell_is_null(0, 0));
+        assert!(!model.cell_is_null(1, 0));
+        assert!(model.cell_is_null(1, 1));
+        assert!(!model.cell_is_null(2, 1));
     }
 
     #[test]

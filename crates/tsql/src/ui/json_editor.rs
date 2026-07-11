@@ -133,6 +133,12 @@ impl<'a> JsonEditorModal<'a> {
         self.textarea.lines().join("\n")
     }
 
+    /// Insert bracketed-paste text literally, independent of the current Vim mode.
+    pub fn paste_text(&mut self, text: &str) {
+        self.textarea.insert_str(text);
+        self.update_validity();
+    }
+
     /// Check if the content has been modified from the original.
     pub fn is_modified(&self) -> bool {
         self.content() != self.original_value
@@ -825,6 +831,22 @@ mod tests {
         // Plain text should be detected as Plain type
         let content_type = detect_content_type(&editor.content());
         assert_eq!(content_type, ContentType::Plain);
+    }
+
+    #[test]
+    fn test_bracketed_paste_inserts_literally_in_normal_mode() {
+        let mut editor = JsonEditorModal::new(
+            String::new(),
+            "data".to_string(),
+            "text".to_string(),
+            0,
+            0,
+            themes::one_dark(),
+        );
+
+        editor.paste_text("SELECT * FROM source\nWHERE value > 1");
+
+        assert_eq!(editor.content(), "SELECT * FROM source\nWHERE value > 1");
     }
 
     #[test]

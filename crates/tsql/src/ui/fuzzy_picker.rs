@@ -80,6 +80,8 @@ pub struct FuzzyPicker<T> {
     filter_fn: Option<fn(&T) -> bool>,
     /// Optional function returning a styled prefix string for an item (not fuzzy-matched).
     prefix_fn: Option<PrefixFn<T>>,
+    /// Whether an empty query presents source items newest-first.
+    reverse_empty: bool,
     /// Popup area (set during render, used for mouse hit testing).
     popup_area: Option<Rect>,
     /// List area (set during render, used for mouse item selection).
@@ -126,6 +128,7 @@ impl<T: Clone> FuzzyPicker<T> {
             display_fn,
             filter_fn: None,
             prefix_fn: None,
+            reverse_empty: true,
             popup_area: None,
             list_area: None,
         };
@@ -147,6 +150,13 @@ impl<T: Clone> FuzzyPicker<T> {
     /// Set an optional per-item prefix rendered in a distinct style (not fuzzy-matched).
     pub fn with_prefix(mut self, f: PrefixFn<T>) -> Self {
         self.prefix_fn = Some(f);
+        self
+    }
+
+    /// Keep the source order for an empty query (useful for priority-ordered actions).
+    pub fn with_original_order(mut self) -> Self {
+        self.reverse_empty = false;
+        self.update_filtered();
         self
     }
 
@@ -583,14 +593,13 @@ impl<T: Clone> FuzzyPicker<T> {
         self.filtered.clear();
 
         if self.query.is_empty() {
-            // Show items in reverse order (most recent first for history),
-            // applying any pre-filter.
+            // History defaults to newest-first; callers with a meaningful source order
+            // can opt out. Apply any pre-filter before changing the presentation order.
             self.filtered = self
                 .items
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| self.filter_fn.is_none_or(|f| f(item)))
-                .rev()
                 .map(|(i, item)| FilteredItem {
                     item: item.clone(),
                     original_index: i,
@@ -598,6 +607,9 @@ impl<T: Clone> FuzzyPicker<T> {
                     indices: Vec::new(),
                 })
                 .collect();
+            if self.reverse_empty {
+                self.filtered.reverse();
+            }
         } else {
             let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
 
@@ -801,6 +813,19 @@ mod tests {
             }
             _ => panic!("Expected Selected action"),
         }
+    }
+
+    #[test]
+    fn test_picker_can_preserve_priority_order_for_empty_query() {
+        let items = vec!["run", "history", "switch"];
+        let mut picker: FuzzyPicker<&str> =
+            FuzzyPicker::new(items, "Actions").with_original_order();
+
+        assert_eq!(picker.selected_original_index(), Some(0));
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            PickerAction::Selected("run")
+        );
     }
 
     #[test]

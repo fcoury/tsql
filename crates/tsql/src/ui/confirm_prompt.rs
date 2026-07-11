@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{BorderType, Borders};
 use ratatui::Frame;
+use std::path::PathBuf;
 use tui_confirm_dialog_with_mouse::{ConfirmDialog, ConfirmDialogState};
 
 use super::UiTheme;
@@ -49,6 +50,8 @@ pub enum ConfirmContext {
     DeleteNotebookCell { cell_id: u64 },
     /// Clearing a notebook cell execution and any dependent executions.
     ClearNotebookCellExecution { cell_id: u64 },
+    /// Replacing the current notebook with another portable notebook document.
+    OpenNotebook { path: PathBuf },
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
     /// Switching to a new connection with unsaved query changes.
@@ -129,7 +132,8 @@ impl ConfirmPrompt {
             | ConfirmContext::QuitApp
             | ConfirmContext::CloseConnectionForm
             | ConfirmContext::SwitchConnection { .. }
-            | ConfirmContext::OpenAiAssistant { .. } => " Unsaved Changes ",
+            | ConfirmContext::OpenAiAssistant { .. }
+            | ConfirmContext::OpenNotebook { .. } => " Unsaved Changes ",
             ConfirmContext::ReplaceQuery { .. } | ConfirmContext::ReplaceAndExecuteQuery { .. } => {
                 " Replace Query "
             }

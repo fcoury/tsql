@@ -83,6 +83,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("Ctrl-h/j/k/l", "Move between panes in Normal mode"),
         KeyBinding::new("Alt-h/j/k/l", "Move between panes in any mode"),
         KeyBinding::new("Alt+M", "Toggle maximized results view"),
+        KeyBinding::new("Ctrl+Shift+P / Cmd+K", "Open contextual Actions palette"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
@@ -294,6 +295,10 @@ const GRID_ACTIONS: HelpSection = HelpSection::new(
         KeyBinding::new("o", "Open row detail view"),
         KeyBinding::new("/", "Search in results"),
         KeyBinding::new("n/N", "Next/previous match"),
+        KeyBinding::new(
+            "Ctrl+Shift+P / Cmd+K",
+            "Sort, filter, project, or group the focused Classic/PostgreSQL result",
+        ),
         KeyBinding::new("Ctrl-r", "Rerun last query"),
     ],
 );
@@ -326,9 +331,100 @@ const COMMANDS: HelpSection = HelpSection::new(
     &[
         KeyBinding::new(":connect <url>", "Connect to database"),
         KeyBinding::new(":disconnect", "Disconnect from database"),
-        KeyBinding::new(":export <fmt> <path>", "Export results (csv/json/tsv)"),
+        KeyBinding::new(
+            ":export <fmt> <path>",
+            "Export result or selected rows (csv/json/tsv/sql); retained results stream",
+        ),
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
+        KeyBinding::new(":actions / :palette", "Open contextual Actions palette"),
+        KeyBinding::new(
+            ":sort asc|desc|add-asc|add-desc|toggle",
+            "Sort the focused Classic/PostgreSQL result",
+        ),
+        KeyBinding::new(
+            ":filter [#column|name] eq|ne|<|<=|>|>=|contains|not-contains|null|not-null [value]",
+            "Filter the focused Classic/PostgreSQL result",
+        ),
+        KeyBinding::new(
+            ":columns / :group-count",
+            "Choose result columns or group and count the current column",
+        ),
+        KeyBinding::new(
+            ":clear-filters / :clear-sort / :reset-result",
+            "Clear or reset Classic result transformations",
+        ),
+        KeyBinding::new(
+            ":result-sql copy|open",
+            "Copy transformed SQL or open it in the editor",
+        ),
+        KeyBinding::new(
+            ":snippets / :snippet-save <name>",
+            "Load or save reusable named query snippets",
+        ),
+        KeyBinding::new(
+            ":snippet <name> / :snippet-delete <name>",
+            "Load or delete a named query snippet",
+        ),
+        KeyBinding::new(":notebook / :mode notebook", "Switch to Notebook mode"),
+        KeyBinding::new(":mode classic", "Switch to Classic mode"),
+        KeyBinding::new(
+            ":rebase / :rebind",
+            "Rebind a cell to the latest source result",
+        ),
+        KeyBinding::new(":detach", "Remove a cell's result dependency"),
+        KeyBinding::new(
+            ":run-without-snapshot",
+            "Run the selected cell without retaining a snapshot",
+        ),
+        KeyBinding::new(
+            ":run-all / :run-above / :run-below",
+            "Run notebook cells in dependency order",
+        ),
+        KeyBinding::new(
+            ":run-dependents",
+            "Rerun the selected cell and its dependents",
+        ),
+        KeyBinding::new(
+            ":open-notebook / :save-notebook <path>",
+            "Open or save a portable notebook document",
+        ),
+        KeyBinding::new(
+            ":insert-above / :insert-below / :duplicate-cell",
+            "Insert or duplicate a notebook cell",
+        ),
+        KeyBinding::new(
+            ":move-cell-up / :move-cell-down",
+            "Reorder the selected notebook cell",
+        ),
+        KeyBinding::new(
+            ":name <identifier> / :name clear",
+            "Set or clear a stable notebook result name",
+        ),
+        KeyBinding::new(
+            ":outline / :cell <id-or-name>",
+            "List notebook cells or jump to one",
+        ),
+        KeyBinding::new(
+            ":error / :copy-error",
+            "Inspect or copy the selected notebook cell error",
+        ),
+        KeyBinding::new(
+            ":error-jump / :activity",
+            "Go to a mapped error or the latest off-screen cell update",
+        ),
+        KeyBinding::new(
+            ":cell-history / :cell-run <id>",
+            "Browse completed cell runs or restore a previous source",
+        ),
+        KeyBinding::new(
+            ":explain-cell",
+            "Run EXPLAIN for the selected PostgreSQL notebook cell",
+        ),
+        KeyBinding::new(
+            ":collapse-source / :expand-source / :toggle-source",
+            "Compact or reveal the selected notebook source",
+        ),
         KeyBinding::new(":ai [prompt]", "Open AI query assistant"),
         KeyBinding::new(":export-connections <path>", "Export saved connections"),
         KeyBinding::new(
@@ -1039,5 +1135,47 @@ mod tests {
                 "Esc",
             ]
         );
+    }
+
+    #[test]
+    fn commands_section_lists_notebook_commands() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Commands")
+            .expect("commands help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        for command in [
+            ":sort asc|desc|add-asc|add-desc|toggle",
+            ":filter [#column|name] eq|ne|<|<=|>|>=|contains|not-contains|null|not-null [value]",
+            ":columns / :group-count",
+            ":clear-filters / :clear-sort / :reset-result",
+            ":result-sql copy|open",
+            ":notebook / :mode notebook",
+            ":mode classic",
+            ":rebase / :rebind",
+            ":detach",
+            ":run-without-snapshot",
+            ":run-all / :run-above / :run-below",
+            ":run-dependents",
+            ":open-notebook / :save-notebook <path>",
+            ":insert-above / :insert-below / :duplicate-cell",
+            ":move-cell-up / :move-cell-down",
+            ":name <identifier> / :name clear",
+            ":outline / :cell <id-or-name>",
+            ":error / :copy-error",
+            ":error-jump / :activity",
+            ":cell-history / :cell-run <id>",
+            ":explain-cell",
+            ":collapse-source / :expand-source / :toggle-source",
+        ] {
+            assert!(keys.contains(&command), "missing {command}");
+        }
     }
 }

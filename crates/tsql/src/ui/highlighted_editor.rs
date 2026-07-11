@@ -5,7 +5,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
-use tui_syntax::{sql, Highlighter, Theme};
+use tui_syntax::{javascript, sql, Highlighter, Theme};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
@@ -425,11 +425,12 @@ fn apply_style_to_range(
     result
 }
 
-/// Creates a pre-configured highlighter for SQL.
+/// Creates a pre-configured highlighter for SQL and Mongo shell JavaScript.
 pub fn create_sql_highlighter(theme: Theme) -> Highlighter {
     let mut highlighter = Highlighter::new(theme);
-    // Ignore errors - SQL should always register successfully
+    // Ignore errors - bundled language definitions should always register successfully.
     let _ = highlighter.register_language(sql());
+    let _ = highlighter.register_language(javascript());
     highlighter
 }
 
@@ -439,8 +440,11 @@ mod tests {
 
     #[test]
     fn test_create_sql_highlighter() {
-        let _highlighter = create_sql_highlighter(tui_syntax::themes::one_dark());
-        // Just verify it creates without panicking
+        let mut highlighter = create_sql_highlighter(tui_syntax::themes::one_dark());
+        assert!(highlighter.highlight("sql", "SELECT 1").is_ok());
+        assert!(highlighter
+            .highlight("javascript", "db.users.find({ active: true }).limit(5)")
+            .is_ok());
     }
 
     #[test]

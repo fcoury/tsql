@@ -2,8 +2,12 @@
 mod app;
 mod execution;
 mod notebook;
+mod notebook_export;
+mod notebook_run;
 mod pg_snapshot;
 mod refinement;
+mod result_transform;
+mod sql_lexer;
 mod state;
 
 pub use app::{encode_schema_id_component, App, DbEvent, DbSession, QueryResult, SharedClient};

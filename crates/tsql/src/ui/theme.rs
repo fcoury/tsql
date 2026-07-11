@@ -138,17 +138,23 @@ impl UiTheme {
             "ui.text.muted",
             Style::default().fg(fallback.text_muted),
         );
+        let bg_base = background.bg.unwrap_or(fallback.bg_base);
+        let bg_elevated = elevated.bg.unwrap_or(fallback.bg_elevated);
+        let text = text_style.fg.unwrap_or(fallback.text);
+        let text_muted = muted_style.fg.unwrap_or(fallback.text_muted);
+        let accent = resolve_color(theme, "ui.accent", fallback.accent);
+        let warning = resolve_color(theme, "ui.warning", fallback.warning);
 
         Self {
-            bg_base: background.bg.unwrap_or(fallback.bg_base),
+            bg_base,
             bg_panel: panel.bg.unwrap_or(fallback.bg_panel),
-            bg_elevated: elevated.bg.unwrap_or(fallback.bg_elevated),
+            bg_elevated,
             bg_status: statusline.bg.unwrap_or(fallback.bg_status),
-            text: text_style.fg.unwrap_or(fallback.text),
-            text_muted: muted_style.fg.unwrap_or(fallback.text_muted),
+            text,
+            text_muted,
             label: resolve_style(theme, "ui.label", fallback.label),
             label_focused: resolve_style(theme, "ui.label.focused", fallback.label_focused),
-            accent: resolve_color(theme, "ui.accent", fallback.accent),
+            accent,
             accent_insert: resolve_color(theme, "ui.accent.insert", fallback.accent_insert),
             accent_visual: resolve_color(theme, "ui.accent.visual", fallback.accent_visual),
             selection: normalize_explicit(resolve_style(theme, "ui.selection", fallback.selection)),
@@ -178,7 +184,7 @@ impl UiTheme {
                 fallback.search_match_current,
             )),
             success: resolve_color(theme, "ui.success", fallback.success),
-            warning: resolve_color(theme, "ui.warning", fallback.warning),
+            warning,
             error: resolve_color(theme, "ui.error", fallback.error),
             transaction: resolve_color(theme, "ui.transaction", fallback.transaction),
             pill_fg: resolve_color(theme, "ui.statusline.mode", fallback.pill_fg),
@@ -190,26 +196,30 @@ impl UiTheme {
             notebook_canvas: normalize_explicit(resolve_style(
                 theme,
                 "ui.notebook.canvas",
-                fallback.notebook_canvas,
+                Style::default().fg(text).bg(bg_base),
             )),
             notebook_composer: normalize_explicit(resolve_style(
                 theme,
                 "ui.notebook.composer",
-                fallback.notebook_composer,
+                Style::default().fg(text).bg(bg_elevated),
             )),
             notebook_composer_focused: normalize_explicit(resolve_style(
                 theme,
                 "ui.notebook.composer.focused",
-                fallback.notebook_composer_focused,
+                Style::default().fg(text).bg(bg_elevated),
             )),
-            notebook_rail: resolve_style(theme, "ui.notebook.rail", fallback.notebook_rail),
+            notebook_rail: resolve_style(theme, "ui.notebook.rail", Style::default().fg(accent)),
             notebook_output: normalize_explicit(resolve_style(
                 theme,
                 "ui.notebook.output",
-                fallback.notebook_output,
+                Style::default().fg(text).bg(bg_base),
             )),
-            notebook_meta: resolve_style(theme, "ui.notebook.meta", fallback.notebook_meta),
-            notebook_stale: resolve_style(theme, "ui.notebook.stale", fallback.notebook_stale),
+            notebook_meta: resolve_style(
+                theme,
+                "ui.notebook.meta",
+                Style::default().fg(text_muted),
+            ),
+            notebook_stale: resolve_style(theme, "ui.notebook.stale", Style::default().fg(warning)),
         }
     }
 
@@ -453,6 +463,43 @@ mod tests {
         assert!(cursor.add_modifier.contains(Modifier::BOLD));
         assert!(cursor.fg.is_some());
         assert!(cursor.bg.is_some());
+    }
+
+    #[test]
+    fn notebook_scopes_inherit_partial_light_theme() {
+        let theme = Theme::from_toml(
+            r##"
+            ["ui.background"]
+            bg = "#F7F7F7"
+
+            ["ui.background.elevated"]
+            bg = "#FFFFFF"
+
+            ["ui.text"]
+            fg = "#202428"
+
+            ["ui.text.muted"]
+            fg = "#606870"
+
+            ["ui.accent"]
+            fg = "#185ABC"
+
+            ["ui.warning"]
+            fg = "#9A5B00"
+            "##,
+        )
+        .unwrap();
+
+        let ui = UiTheme::from_theme(&theme);
+
+        assert_eq!(ui.notebook_canvas.bg, Some(rgb(0xF7, 0xF7, 0xF7)));
+        assert_eq!(ui.notebook_output.bg, Some(rgb(0xF7, 0xF7, 0xF7)));
+        assert_eq!(ui.notebook_composer.bg, Some(rgb(0xFF, 0xFF, 0xFF)));
+        assert_eq!(ui.notebook_composer_focused.bg, Some(rgb(0xFF, 0xFF, 0xFF)));
+        assert_eq!(ui.notebook_canvas.fg, Some(rgb(0x20, 0x24, 0x28)));
+        assert_eq!(ui.notebook_meta.fg, Some(rgb(0x60, 0x68, 0x70)));
+        assert_eq!(ui.notebook_rail.fg, Some(rgb(0x18, 0x5A, 0xBC)));
+        assert_eq!(ui.notebook_stale.fg, Some(rgb(0x9A, 0x5B, 0x00)));
     }
 
     #[test]

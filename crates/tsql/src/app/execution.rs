@@ -96,15 +96,12 @@ impl TransactionState {
 }
 
 pub(crate) fn classify_transaction_control(sql: &str) -> TransactionControl {
-    let Some(statement) = single_statement(sql) else {
+    let Ok(statement) = super::sql_lexer::single_statement(sql) else {
         return TransactionControl::Ambiguous;
     };
-    let words: Vec<String> = statement
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .filter(|word| !word.is_empty())
-        .take(5)
-        .map(str::to_ascii_uppercase)
-        .collect();
+    let Ok(words) = super::sql_lexer::code_words(statement, 6) else {
+        return TransactionControl::Ambiguous;
+    };
 
     match words.as_slice() {
         [first, ..] if first == "BEGIN" => TransactionControl::Begin,
@@ -121,7 +118,7 @@ pub(crate) fn classify_transaction_control(sql: &str) -> TransactionControl {
         [first, rest @ ..] if first == "ROLLBACK" || first == "ABORT" => {
             if contains_and_chain(rest) {
                 TransactionControl::RollbackAndChain
-            } else if rest.first().is_some_and(|word| word == "TO") {
+            } else if is_savepoint_rollback(rest) {
                 TransactionControl::Other
             } else {
                 TransactionControl::Rollback
@@ -133,114 +130,22 @@ pub(crate) fn classify_transaction_control(sql: &str) -> TransactionControl {
     }
 }
 
+fn is_savepoint_rollback(words: &[String]) -> bool {
+    let rest = if words
+        .first()
+        .is_some_and(|word| word == "WORK" || word == "TRANSACTION")
+    {
+        &words[1..]
+    } else {
+        words
+    };
+    rest.first().is_some_and(|word| word == "TO")
+}
+
 fn contains_and_chain(words: &[String]) -> bool {
     words
         .windows(2)
         .any(|pair| pair[0] == "AND" && pair[1] == "CHAIN")
-}
-
-/// Returns one comment-aware statement, or `None` for multiple/unterminated SQL.
-fn single_statement(sql: &str) -> Option<String> {
-    let mut result = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let mut index = 0;
-    let mut statement_ended = false;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' | b'"' => {
-                if statement_ended {
-                    return None;
-                }
-                let start = index;
-                let delimiter = bytes[index];
-                index += 1;
-                loop {
-                    let offset = sql[index..].find(delimiter as char)?;
-                    index += offset + 1;
-                    if bytes.get(index) == Some(&delimiter) {
-                        index += 1;
-                    } else {
-                        break;
-                    }
-                }
-                result.push_str(&sql[start..index]);
-            }
-            b'$' => {
-                let Some(tag_end_offset) = sql[index + 1..].find('$') else {
-                    if statement_ended {
-                        return None;
-                    }
-                    result.push('$');
-                    index += 1;
-                    continue;
-                };
-                let tag_end = index + 1 + tag_end_offset;
-                let tag = &sql[index + 1..tag_end];
-                let mut characters = tag.chars();
-                let valid_tag = characters.next().is_none_or(|character| {
-                    (character.is_ascii_alphabetic() || character == '_')
-                        && characters
-                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                });
-                if !valid_tag {
-                    if statement_ended {
-                        return None;
-                    }
-                    result.push('$');
-                    index += 1;
-                    continue;
-                }
-                if statement_ended {
-                    return None;
-                }
-                let delimiter = &sql[index..=tag_end];
-                let content_start = tag_end + 1;
-                let close_offset = sql[content_start..].find(delimiter)?;
-                let end = content_start + close_offset + delimiter.len();
-                result.push_str(&sql[index..end]);
-                index = end;
-            }
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                index = sql[index..]
-                    .find('\n')
-                    .map_or(bytes.len(), |offset| index + offset + 1);
-                result.push(' ');
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                let mut depth = 1;
-                while index < bytes.len() && depth > 0 {
-                    if bytes.get(index..index + 2) == Some(b"/*") {
-                        depth += 1;
-                        index += 2;
-                    } else if bytes.get(index..index + 2) == Some(b"*/") {
-                        depth -= 1;
-                        index += 2;
-                    } else {
-                        index += sql[index..].chars().next()?.len_utf8();
-                    }
-                }
-                if depth > 0 {
-                    return None;
-                }
-                result.push(' ');
-            }
-            b';' => {
-                statement_ended = true;
-                index += 1;
-            }
-            _ => {
-                let character = sql[index..].chars().next()?;
-                if statement_ended && !character.is_whitespace() {
-                    return None;
-                }
-                result.push(character);
-                index += character.len_utf8();
-            }
-        }
-    }
-    Some(result)
 }
 
 #[cfg(test)]
@@ -265,6 +170,14 @@ mod tests {
             classify_transaction_control("ROLLBACK TO SAVEPOINT checkpoint"),
             TransactionControl::Other
         );
+        assert_eq!(
+            classify_transaction_control("ROLLBACK TRANSACTION TO SAVEPOINT checkpoint"),
+            TransactionControl::Other
+        );
+        assert_eq!(
+            classify_transaction_control("ABORT WORK TO checkpoint"),
+            TransactionControl::Other
+        );
     }
 
     #[test]
@@ -287,6 +200,10 @@ mod tests {
         );
         assert_eq!(
             classify_transaction_control("SELECT 1 /* outer ; /* nested ; */ still comment */;"),
+            TransactionControl::Other
+        );
+        assert_eq!(
+            classify_transaction_control("SELECT E'it\\'s; -- not a comment' AS value;"),
             TransactionControl::Other
         );
     }
