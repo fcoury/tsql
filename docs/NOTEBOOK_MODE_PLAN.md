@@ -1,7 +1,7 @@
 # Notebook Mode Implementation Plan
 
-Status: proposed  
-Worktree: `/Users/fcoury/code/tsql.feat-notebook-mode`  
+Status: implemented (MVP)
+Worktree: `/Users/felipe.coury/code/tsql.ui-improvements`
 Branch: `feat/notebook-mode`  
 Base: `ui-improvements` at `d54379c`  
 Date: 2026-07-10
@@ -131,7 +131,7 @@ Visual rules:
 - Cell metadata is compact and secondary metadata disappears first at narrow
   widths.
 - Composer language is explicit: `SQL` for PostgreSQL and `MONGOSH` for Mongo.
-- Logical `@result_N` references render as a distinct lineage token even if the
+- Logical `@result` and `@result_N` references render as distinct lineage tokens even if the
   underlying SQL grammar marks `@` as nonstandard; completion can offer only
   result versions retained by the current notebook.
 - Output begins under the composer with the same indentation as OpenCode
@@ -195,7 +195,10 @@ never the only binding, because legacy terminals often cannot distinguish it.
 | Cell | execute and advance | `E`; modified Enter may be an alias |
 | Cell | select/create unrelated trailing draft | `n` |
 | Cell | refine selected result | `r` |
-| Cell | collapse/expand output | `z` |
+| Cell | collapse selected output | `h` |
+| Cell | expand selected output | `l` |
+| Cell | toggle output | `z` |
+| Cell | clear execution and dependent executions | `x`, confirm and preserve SQL/lineage |
 | Cell | delete cell | `dd`, confirm non-empty/executed cells |
 | Cell | page document | PageUp / PageDown, `Ctrl+U` / `Ctrl+D` |
 | Cell | return to trailing draft | `G` when draft is last |
@@ -320,8 +323,9 @@ The UI must distinguish:
   show `TXN`, snapshot refinement remains disabled, and the status tells the
   user to switch to Classic for COMMIT/ROLLBACK in the MVP.
 - On restart, restored cells contain source and lineage only. They render
-  `NEEDS RUN`; dependencies render `SOURCE UNAVAILABLE · run/rebase cell N`
-  because no output or PostgreSQL backend snapshot is persisted.
+  `NEEDS RUN`; dependencies render `SOURCE UNAVAILABLE · run cell N first`
+  because no output or PostgreSQL backend snapshot is persisted. Once the source
+  is rerun, a restored `@result_N` can bind its latest available snapshot.
 
 Deletion policy is locked: `dd` opens `ConfirmContext::DeleteNotebookCell` for
 any non-empty, executed, or dependency-bearing cell. The empty tail composer is
@@ -362,7 +366,7 @@ identity, and unfetched rows. It is therefore explicitly rejected for the MVP.
 
 ### 6.1 Database-neutral contract
 
-Notebook cells and logical `@result_N` references are database-neutral. The
+Notebook cells and logical `@result`/`@result_N` references are database-neutral. The
 active adapter supplies the retention and compilation behavior:
 
 ```rust
@@ -522,10 +526,12 @@ Before executing a snapshot candidate:
 
 1. Require PostgreSQL, a connected direct/session-affine client, safe
    transaction state, and snapshot feature enabled.
-2. Resolve structured `@result_<cell>` tokens outside literals/comments to
-   their immutable, safely quoted physical snapshot identifiers. A reference
-   without matching dependency metadata is an error, not free-form text
-   substitution.
+2. Resolve structured `@result`/`@result_<cell>` tokens outside literals/comments
+   to immutable, safely quoted physical snapshot identifiers. Bare `@result`
+   selects the latest completed refinable result for each execution. An unbound
+   or restored `@result_<cell>` selects the latest available snapshot from that
+   stable cell identity; a live numbered dependency remains pinned. Missing
+   sources fail before PostgreSQL with an actionable run-source message.
 3. Use the existing `tree-sitter-sequel` grammar on the compiled SQL as a
    conservative semantic
    classifier for statement shape, transaction control, data-changing CTEs,
@@ -608,8 +614,9 @@ zero), and call transaction commit or rollback. The SQL above illustrates the
 server sequence.
 
 Every successful backing table is immutable and revision-specific. The source
-cell exposes only a logical `@result_3` reference; dependency metadata binds it
-to cell 3/run 2 and compilation substitutes the collision-safe physical table.
+cell exposes a logical `@result_3` reference (or the latest-result alias
+`@result`); dependency metadata binds the chosen version to cell 3/run 2 and
+compilation substitutes the collision-safe physical table.
 No stable per-cell temp view is replaced, so a failed rerun cannot silently
 redirect an older dependency. Physical names stay out of normal UI, source
 history, and exported SQL unless a diagnostic view is requested.
@@ -1236,7 +1243,8 @@ Exit: acceptance criteria below pass and Classic regressions remain green.
 - snapshot eviction and disabled-reason transitions;
 - v1-to-v2 session migration and corrupt/future schema behavior;
 - restored source cells become `NEEDS RUN`; restored dependents become
-  `SOURCE UNAVAILABLE` until their exact source result is rerun/rebased;
+  `SOURCE UNAVAILABLE` until their source is rerun, then numbered references
+  bind its latest retained result;
 - capability dispatch selects only the active backend's provider and preserves
   its semantic label/dialect;
 - logical result references reject backend, connection-generation, and result-
@@ -1244,7 +1252,7 @@ Exit: acceptance criteria below pass and Classic regressions remain green.
 - native/client snapshot handle invalidation keeps display output while making
   dependent execution unavailable with a typed reason;
 - SQL-aware statement/semicolon classification;
-- `@result_N` rewriting ignores quoted identifiers, single/dollar-quoted
+- `@result`/`@result_N` rewriting ignores quoted identifiers, single/dollar-quoted
   strings, and line/block comments;
 - identifier quoting and duplicate/empty output-name normalization;
 - row/byte boundary decisions at `N-1`, `N`, and `N+1`.

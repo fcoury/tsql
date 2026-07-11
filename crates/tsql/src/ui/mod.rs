@@ -32,7 +32,7 @@ pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
 pub use fuzzy_picker::{FilteredItem, FuzzyPicker, PickerAction};
 pub use grid::{
     escape_sql_value, quote_identifier, DataGrid, GridKeyResult, GridModel, GridSearch, GridState,
-    ResizeAction,
+    GridViewport, ResizeAction,
 };
 pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, CursorShape, HighlightedTextArea};

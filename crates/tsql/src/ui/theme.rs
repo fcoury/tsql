@@ -42,6 +42,13 @@ pub struct UiTheme {
     pub overlay: Style,
     pub overlay_border: Style,
     pub overlay_title: Style,
+    pub notebook_canvas: Style,
+    pub notebook_composer: Style,
+    pub notebook_composer_focused: Style,
+    pub notebook_rail: Style,
+    pub notebook_output: Style,
+    pub notebook_meta: Style,
+    pub notebook_stale: Style,
 }
 
 impl Default for UiTheme {
@@ -90,6 +97,13 @@ impl UiTheme {
             overlay: Style::default().fg(text).bg(rgb(0x33, 0x3B, 0x49)),
             overlay_border: Style::default().fg(rgb(0x5C, 0x66, 0x73)),
             overlay_title: Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            notebook_canvas: Style::default().fg(text).bg(rgb(0x28, 0x2C, 0x34)),
+            notebook_composer: Style::default().fg(text).bg(rgb(0x2C, 0x31, 0x3A)),
+            notebook_composer_focused: Style::default().fg(text).bg(rgb(0x2C, 0x31, 0x3A)),
+            notebook_rail: Style::default().fg(accent),
+            notebook_output: Style::default().fg(text).bg(rgb(0x28, 0x2C, 0x34)),
+            notebook_meta: Style::default().fg(text_muted),
+            notebook_stale: Style::default().fg(rgb(0xE5, 0xC0, 0x7B)),
         }
     }
 
@@ -173,6 +187,29 @@ impl UiTheme {
             overlay: normalize_explicit(resolve_style(theme, "ui.overlay", fallback.overlay)),
             overlay_border: resolve_style(theme, "ui.overlay.border", fallback.overlay_border),
             overlay_title: resolve_style(theme, "ui.overlay.title", fallback.overlay_title),
+            notebook_canvas: normalize_explicit(resolve_style(
+                theme,
+                "ui.notebook.canvas",
+                fallback.notebook_canvas,
+            )),
+            notebook_composer: normalize_explicit(resolve_style(
+                theme,
+                "ui.notebook.composer",
+                fallback.notebook_composer,
+            )),
+            notebook_composer_focused: normalize_explicit(resolve_style(
+                theme,
+                "ui.notebook.composer.focused",
+                fallback.notebook_composer_focused,
+            )),
+            notebook_rail: resolve_style(theme, "ui.notebook.rail", fallback.notebook_rail),
+            notebook_output: normalize_explicit(resolve_style(
+                theme,
+                "ui.notebook.output",
+                fallback.notebook_output,
+            )),
+            notebook_meta: resolve_style(theme, "ui.notebook.meta", fallback.notebook_meta),
+            notebook_stale: resolve_style(theme, "ui.notebook.stale", fallback.notebook_stale),
         }
     }
 
@@ -449,6 +486,13 @@ mod tests {
                 "ui.overlay.title",
                 "ui.scrollbar",
                 "ui.grid.header",
+                "ui.notebook.canvas",
+                "ui.notebook.composer",
+                "ui.notebook.composer.focused",
+                "ui.notebook.rail",
+                "ui.notebook.output",
+                "ui.notebook.meta",
+                "ui.notebook.stale",
             ] {
                 assert!(
                     theme.style_for_exact(scope).is_some(),

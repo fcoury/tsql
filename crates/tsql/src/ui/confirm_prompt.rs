@@ -45,6 +45,10 @@ pub enum ConfirmContext {
     QuitAppClean,
     /// Deleting a saved connection.
     DeleteConnection { name: String },
+    /// Deleting a notebook cell with source, output, or lineage.
+    DeleteNotebookCell { cell_id: u64 },
+    /// Clearing a notebook cell execution and any dependent executions.
+    ClearNotebookCellExecution { cell_id: u64 },
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
     /// Switching to a new connection with unsaved query changes.
@@ -127,6 +131,8 @@ impl ConfirmPrompt {
             ConfirmContext::ReplaceQuery { .. } => " Replace Query ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
+            ConfirmContext::DeleteNotebookCell { .. } => " Delete Notebook Cell ",
+            ConfirmContext::ClearNotebookCellExecution { .. } => " Clear Cell Execution ",
             ConfirmContext::ApplyUpdate { .. } => " Apply Update ",
         }
     }
@@ -265,6 +271,21 @@ mod tests {
             }
             _ => panic!("Expected CloseCellEditor context"),
         }
+    }
+
+    #[test]
+    fn test_clear_notebook_cell_execution_context_and_title() {
+        let context = ConfirmContext::ClearNotebookCellExecution { cell_id: 7 };
+        let prompt = ConfirmPrompt::new("Clear cell 7 and its dependent executions?", context);
+
+        assert!(matches!(
+            prompt.context(),
+            ConfirmContext::ClearNotebookCellExecution { cell_id: 7 }
+        ));
+        assert_eq!(
+            ConfirmPrompt::title_for_context(prompt.context()),
+            " Clear Cell Execution "
+        );
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub struct RowDetailModal {
     highlighter: Highlighter,
     /// True when `y` has been pressed and we are waiting for the format key.
     pending_yank: bool,
+    /// Whether the source result can be edited.
+    read_only: bool,
 }
 
 impl RowDetailModal {
@@ -100,7 +102,14 @@ impl RowDetailModal {
             visible_height: 10,
             highlighter,
             pending_yank: false,
+            read_only: false,
         }
+    }
+
+    /// Mark this row detail view as read-only.
+    pub fn with_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// Get the currently selected column index.
@@ -481,8 +490,18 @@ impl RowDetailModal {
         let footer = Line::from(vec![
             Span::styled(" j/k ", Style::default().fg(theme.warning)),
             Span::styled("navigate  ", Style::default().fg(theme.text_muted)),
-            Span::styled("e/Enter ", Style::default().fg(theme.warning)),
-            Span::styled("edit  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                if self.read_only {
+                    "read-only  "
+                } else {
+                    "e/Enter "
+                },
+                Style::default().fg(theme.warning),
+            ),
+            Span::styled(
+                if self.read_only { "" } else { "edit  " },
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled("y… ", Style::default().fg(theme.warning)),
             Span::styled("yank  ", Style::default().fg(theme.text_muted)),
             Span::styled("g/G ", Style::default().fg(theme.warning)),
@@ -591,6 +610,28 @@ mod tests {
             .unwrap();
 
         assert_nonblank_cells_have_explicit_fg(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn test_read_only_footer_hides_edit_hint() {
+        let mut modal = create_test_modal().with_read_only();
+        let theme = UiTheme::fallback();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| modal.render(frame, frame.area(), &theme))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("read-only"));
+        assert!(!text.contains("e/Enter edit"));
     }
 
     #[test]

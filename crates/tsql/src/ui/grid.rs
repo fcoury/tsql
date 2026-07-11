@@ -1409,6 +1409,50 @@ impl<'a> Widget for DataGrid<'a> {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        GridViewport {
+            model: self.model,
+            state: self.state,
+            theme: self.theme,
+            focused: true,
+            show_row_numbers: self.show_row_numbers,
+            show_scrollbar: self.show_scrollbar,
+        }
+        .render_with_scrollbar_area(inner, buf, zone_scrollbar_area(area));
+    }
+}
+
+/// A navigable grid viewport without the surrounding results-zone chrome.
+pub struct GridViewport<'a> {
+    pub model: &'a GridModel,
+    pub state: &'a GridState,
+    pub theme: &'a UiTheme,
+    pub focused: bool,
+    pub show_row_numbers: bool,
+    pub show_scrollbar: bool,
+}
+
+impl Widget for GridViewport<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let has_scrollbar =
+            self.show_scrollbar && self.model.rows.len() > area.height.saturating_sub(1) as usize;
+        let viewport = Rect {
+            width: area.width.saturating_sub(u16::from(has_scrollbar)),
+            ..area
+        };
+        let scrollbar_area = Rect {
+            x: area.right().saturating_sub(1),
+            y: area.y,
+            width: u16::from(area.width > 0),
+            height: area.height,
+        };
+        self.render_with_scrollbar_area(viewport, buf, scrollbar_area);
+    }
+}
+
+impl GridViewport<'_> {
+    fn render_with_scrollbar_area(self, area: Rect, buf: &mut Buffer, scrollbar_area: Rect) {
+        let inner = area;
+
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -1508,7 +1552,7 @@ impl<'a> Widget for DataGrid<'a> {
             }
             let y = body_area.y + i as u16;
 
-            let is_cursor = row_idx == self.state.cursor_row;
+            let is_cursor = self.focused && row_idx == self.state.cursor_row;
             let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
@@ -1567,8 +1611,6 @@ impl<'a> Widget for DataGrid<'a> {
             let mut scrollbar_state = ScrollbarState::new(self.model.rows.len())
                 .position(self.state.cursor_row)
                 .viewport_content_length(body_area.height as usize);
-
-            let scrollbar_area = zone_scrollbar_area(area);
 
             scrollbar.render(scrollbar_area, buf, &mut scrollbar_state);
         }
@@ -2037,6 +2079,100 @@ mod tests {
         grid.render(area, &mut buf);
 
         assert_nonblank_cells_have_explicit_fg(&buf);
+    }
+
+    #[test]
+    fn test_grid_viewport_renders_header_cursor_selection_search_and_scrollbar() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+                vec!["3".to_string(), "Carol".to_string()],
+                vec!["4".to_string(), "Diana".to_string()],
+            ],
+        );
+        let theme = UiTheme::fallback();
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        state.selected_rows.insert(0);
+        state.search.search("Alice", &model);
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buffer = Buffer::empty(area);
+
+        GridViewport {
+            model: &model,
+            state: &state,
+            theme: &theme,
+            focused: true,
+            show_row_numbers: true,
+            show_scrollbar: true,
+        }
+        .render(area, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "#");
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "i");
+        assert_eq!(buffer.cell((9, 0)).unwrap().symbol(), "n");
+        assert_eq!(
+            buffer.cell((9, 0)).unwrap().fg,
+            theme.grid_header.fg.unwrap()
+        );
+        assert_eq!(
+            buffer.cell((9, 0)).unwrap().bg,
+            theme.grid_header.bg.unwrap()
+        );
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "*");
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), ">");
+        assert_eq!(
+            buffer.cell((9, 1)).unwrap().bg,
+            theme.search_match_current.bg.unwrap()
+        );
+        assert_eq!(
+            buffer.cell((9, 2)).unwrap().bg,
+            theme.cursor_cell.bg.unwrap()
+        );
+        assert_eq!(buffer.cell((19, 0)).unwrap().symbol(), "▲");
+        assert_eq!(buffer.cell((19, 2)).unwrap().symbol(), "▼");
+    }
+
+    #[test]
+    fn test_unfocused_grid_viewport_hides_cursor_and_keeps_selection_and_search() {
+        let model = create_test_model();
+        let theme = UiTheme::fallback();
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        state.selected_rows.insert(0);
+        state.search.search("Alice", &model);
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+
+        GridViewport {
+            model: &model,
+            state: &state,
+            theme: &theme,
+            focused: false,
+            show_row_numbers: true,
+            show_scrollbar: false,
+        }
+        .render(area, &mut buffer);
+
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "*");
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), " ");
+        assert_eq!(
+            buffer.cell((9, 1)).unwrap().bg,
+            theme.search_match_current.bg.unwrap()
+        );
+        assert_ne!(
+            buffer.cell((9, 2)).unwrap().bg,
+            theme.cursor_cell.bg.unwrap()
+        );
+        assert_ne!(buffer.cell((9, 2)).unwrap().bg, theme.selection.bg.unwrap());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +19,9 @@ use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Terminal;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -33,14 +35,30 @@ use tokio_postgres_rustls_improved::MakeRustlsConnect;
 use tui_textarea::{CursorMove, Input};
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use super::state::{DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection};
+use super::execution::{
+    classify_transaction_control, ActiveExecution, CellId, ExecutionContext, ExecutionId,
+    ExecutionTarget, QueryExecutionKind, TransactionControl, TransactionState,
+};
+use super::notebook::{
+    CellExecutionState, NotebookCell, NotebookFocus, NotebookOutput, NotebookState,
+};
+use super::pg_snapshot::{self, PgSnapshotRequest, PgTempSnapshot};
+use super::refinement::{
+    compile_logical_reference, logical_result_reference, LogicalResultReference,
+    RefinementAvailability, RefinementUnavailableReason, ResultVersion, RetainedResultHandle,
+};
+use super::state::{
+    DbStatus, Focus, Mode, PanelDirection, SearchTarget, SidebarSection, WorkspaceMode,
+};
 use crate::ai::{generate_query, AiProposal, AiRequestContext};
 use crate::config::{
     load_connections, save_connections, Action, ClipboardBackend, Config, ConnectionEntry,
-    ConnectionsFile, DbKind, KeyBinding, Keymap, SslMode, UpdateMode,
+    ConnectionsFile, DbKind, KeyBinding, Keymap, SnapshotMode, SslMode, UpdateMode,
 };
 use crate::history::{History, HistoryEntry};
-use crate::session::SessionState;
+use crate::session::{
+    NotebookCellSession, NotebookDependencySession, NotebookSession, SessionState,
+};
 use crate::ui::{
     create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
     load_theme, overlay_block, quote_identifier, zone_block, zone_inner, zone_label,
@@ -48,11 +66,12 @@ use crate::ui::{
     CompletionKind, CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult,
     ConnectionFormAction, ConnectionFormModal, ConnectionInfo, ConnectionManagerAction,
     ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker, GridKeyResult, GridModel,
-    GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction, JsonEditorModal,
-    KeyHintPopup, KeySequenceAction, KeySequenceCompletion, KeySequenceHandlerWithContext,
-    KeySequenceResult, PasswordPrompt, PasswordPromptResult, PendingKey, PickerAction, Priority,
-    QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
-    SidebarAction, StatusLineBuilder, StatusSegment, TableInfo, UiTheme, YankFormat,
+    GridState, GridViewport, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction,
+    JsonEditorModal, KeyHintPopup, KeySequenceAction, KeySequenceCompletion,
+    KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt, PasswordPromptResult,
+    PendingKey, PickerAction, Priority, QueryEditor, ResizeAction, RowDetailAction, RowDetailModal,
+    SchemaCache, SearchPrompt, Sidebar, SidebarAction, StatusLineBuilder, StatusSegment, TableInfo,
+    UiTheme, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -542,6 +561,8 @@ SELECT
     tableowner AS owner
 FROM pg_catalog.pg_tables
 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+  AND schemaname NOT LIKE 'pg_temp_%'
+  AND schemaname NOT LIKE 'pg_toast_temp_%'
 ORDER BY schemaname, tablename
 "#;
 
@@ -587,6 +608,8 @@ SELECT
     indexdef AS definition
 FROM pg_catalog.pg_indexes
 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+  AND schemaname NOT LIKE 'pg_temp_%'
+  AND schemaname NOT LIKE 'pg_toast_temp_%'
 ORDER BY schemaname, tablename, indexname
 "#;
 
@@ -622,6 +645,8 @@ SELECT
     viewowner AS owner
 FROM pg_catalog.pg_views
 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+  AND schemaname NOT LIKE 'pg_temp_%'
+  AND schemaname NOT LIKE 'pg_toast_temp_%'
 ORDER BY schemaname, viewname
 "#;
 
@@ -635,6 +660,8 @@ SELECT
 FROM pg_catalog.pg_proc p
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_temp_%'
+  AND n.nspname NOT LIKE 'pg_toast_temp_%'
 ORDER BY n.nspname, p.proname
 "#;
 
@@ -2130,7 +2157,17 @@ pub enum DbEvent {
     QueryFinished {
         result: QueryResult,
     },
+    NotebookQueryFinished {
+        context: ExecutionContext,
+        result: QueryResult,
+        retained: Option<super::refinement::RetainedResult>,
+        snapshot: Option<PgTempSnapshot>,
+    },
     QueryError {
+        error: String,
+    },
+    NotebookQueryError {
+        context: ExecutionContext,
         error: String,
     },
     QueryCancelled,
@@ -2218,8 +2255,8 @@ pub struct DbSession {
     pub last_command_tag: Option<String>,
     pub last_elapsed: Option<Duration>,
     pub running: bool,
-    /// Whether we're currently in a transaction (after BEGIN, before COMMIT/ROLLBACK)
-    pub in_transaction: bool,
+    /// Conservatively inferred state of the current PostgreSQL user transaction.
+    pub transaction_state: TransactionState,
     /// Whether the current connection was established using TLS.
     pub connected_with_tls: bool,
 }
@@ -2237,7 +2274,7 @@ impl DbSession {
             last_command_tag: None,
             last_elapsed: None,
             running: false,
-            in_transaction: false,
+            transaction_state: TransactionState::Unknown,
             connected_with_tls: false,
         }
     }
@@ -2431,6 +2468,8 @@ impl CellEditor {
 pub struct App {
     pub focus: Focus,
     pub mode: Mode,
+    pub workspace_mode: WorkspaceMode,
+    pub notebook: NotebookState,
 
     /// Application configuration
     pub config: Config,
@@ -2446,6 +2485,8 @@ pub struct App {
 
     /// Keymap for grid navigation
     pub grid_keymap: Keymap,
+    /// Keymap for Notebook Cell focus.
+    pub notebook_keymap: Keymap,
     /// Keymap for editor in normal mode
     pub editor_normal_keymap: Keymap,
     /// Keymap for editor in insert mode
@@ -2483,6 +2524,12 @@ pub struct App {
     last_executed_query: Option<String>,
     /// How the active editor query was started, used when applying its result.
     active_query_kind: Option<QueryExecutionKind>,
+    active_execution: Option<ActiveExecution>,
+    next_execution_id: u64,
+    next_retained_handle: u64,
+    pg_snapshots: HashMap<RetainedResultHandle, PgTempSnapshot>,
+    retained_versions: HashMap<super::refinement::ResultVersion, RetainedResultHandle>,
+    pg_snapshot_order: VecDeque<RetainedResultHandle>,
 
     pub grid: GridModel,
     pub grid_state: GridState,
@@ -2522,6 +2569,8 @@ pub struct App {
     render_query_area: Option<Rect>,
     /// Last rendered area for results grid (for mouse click handling).
     render_grid_area: Option<Rect>,
+    /// Last rendered Notebook composer/output areas (for mouse hit testing).
+    render_notebook_cells: Vec<NotebookCellRenderArea>,
     /// Last rendered area for sidebar (for mouse click handling).
     render_sidebar_area: Option<Rect>,
 
@@ -2598,6 +2647,16 @@ struct GridCellClick {
     col: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NotebookCellRenderArea {
+    cell_id: CellId,
+    composer: Rect,
+    output_toggle: Option<Rect>,
+    output: Option<Rect>,
+    grid: Option<Rect>,
+    compact: bool,
+}
+
 /// Local enum to track cursor style changes (SetCursorStyle doesn't implement PartialEq).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CachedCursorStyle {
@@ -2609,12 +2668,6 @@ enum CachedCursorStyle {
 enum QueryHeightMode {
     Minimized,
     Maximized,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueryExecutionKind {
-    New,
-    Refresh,
 }
 
 /// Groups spinner and timing state for query execution UI.
@@ -2686,6 +2739,7 @@ impl App {
 
         // Build keymaps from defaults + config overrides
         let grid_keymap = Self::build_grid_keymap(&config);
+        let notebook_keymap = Self::build_notebook_keymap(&config);
         let editor_normal_keymap = Self::build_editor_normal_keymap(&config);
         let editor_insert_keymap = Self::build_editor_insert_keymap(&config);
         let editor_visual_keymap = Self::build_editor_visual_keymap(&config);
@@ -2696,12 +2750,15 @@ impl App {
         let mut app = Self {
             focus: Focus::Query,
             mode: Mode::Normal,
+            workspace_mode: WorkspaceMode::Classic,
+            notebook: NotebookState::new(),
 
             config,
             ui_theme,
             startup_warnings: theme_warning.into_iter().collect(),
 
             grid_keymap,
+            notebook_keymap,
             editor_normal_keymap,
             editor_insert_keymap,
             editor_visual_keymap,
@@ -2728,6 +2785,12 @@ impl App {
             paged_query: None,
             last_executed_query: None,
             active_query_kind: None,
+            active_execution: None,
+            next_execution_id: 1,
+            next_retained_handle: 1,
+            pg_snapshots: HashMap::new(),
+            retained_versions: HashMap::new(),
+            pg_snapshot_order: VecDeque::new(),
 
             grid,
             grid_state: GridState::default(),
@@ -2751,6 +2814,7 @@ impl App {
 
             render_query_area: None,
             render_grid_area: None,
+            render_notebook_cells: Vec::new(),
             render_sidebar_area: None,
 
             connections: ConnectionsFile::new(),
@@ -2816,6 +2880,11 @@ impl App {
         // Note: connection picker is NOT opened here when no URL specified.
         // This allows main.rs to first check session state for auto-reconnect.
 
+        if app.config.notebook.startup {
+            app.workspace_mode = WorkspaceMode::Notebook;
+            app.focus = Focus::Notebook;
+        }
+
         app
     }
 
@@ -2835,6 +2904,29 @@ impl App {
             editor_content: self.editor.text(),
             schema_expanded: self.sidebar.get_expanded_nodes(),
             sidebar_visible: self.sidebar_visible,
+            workspace: match self.workspace_mode {
+                WorkspaceMode::Classic => "classic",
+                WorkspaceMode::Notebook => "notebook",
+            }
+            .to_string(),
+            notebook: NotebookSession {
+                cells: self
+                    .notebook
+                    .cells
+                    .iter()
+                    .map(|cell| NotebookCellSession {
+                        cell_id: Some(cell.id.0),
+                        source: cell.source(),
+                        output_collapsed: cell.output_collapsed,
+                        dependency: cell.dependency.map(|version| NotebookDependencySession {
+                            source_cell_id: version.source_cell.0,
+                            source_execution_id: version.source_execution.0,
+                            source_revision: version.source_revision,
+                        }),
+                    })
+                    .collect(),
+                selected_index: self.notebook.selected_index(),
+            },
         }
     }
 
@@ -2847,12 +2939,40 @@ impl App {
     /// Apply restored session state.
     /// Returns the connection name to auto-connect to, if any.
     pub fn apply_session_state(&mut self, state: SessionState) -> Option<String> {
+        let connection_name = state.connection_name;
         // Restore editor content (apply exactly, even if empty)
         self.editor.set_text(state.editor_content);
         self.editor.mark_saved();
 
         // Restore sidebar visibility
         self.sidebar_visible = state.sidebar_visible;
+        self.notebook = NotebookState::from_sources_with_ids(
+            state
+                .notebook
+                .cells
+                .into_iter()
+                .map(|cell| {
+                    (
+                        cell.cell_id.map(super::execution::CellId),
+                        cell.source,
+                        cell.output_collapsed,
+                        cell.dependency
+                            .map(|dependency| super::refinement::ResultVersion {
+                                source_cell: super::execution::CellId(dependency.source_cell_id),
+                                source_execution: super::execution::ExecutionId(
+                                    dependency.source_execution_id,
+                                ),
+                                source_revision: dependency.source_revision,
+                            }),
+                    )
+                })
+                .collect(),
+            state.notebook.selected_index,
+        );
+        if state.workspace == "notebook" {
+            self.workspace_mode = WorkspaceMode::Notebook;
+            self.focus = Focus::Notebook;
+        }
 
         // Store pending schema expanded for later application when schema loads
         // Always set (even to None) to clear any prior pending paths
@@ -2863,7 +2983,7 @@ impl App {
         };
 
         // Return connection name for auto-connect handling
-        state.connection_name
+        connection_name
     }
 
     /// Apply pending schema expanded state after schema loads.
@@ -2886,6 +3006,18 @@ impl App {
             }
         }
 
+        keymap
+    }
+
+    fn build_notebook_keymap(config: &Config) -> Keymap {
+        let mut keymap = Keymap::default_notebook_keymap();
+        for binding in &config.keymap.notebook {
+            if let Some(key) = KeyBinding::parse(&binding.key) {
+                if let Ok(action) = binding.action.parse::<Action>() {
+                    keymap.bind(key, action);
+                }
+            }
+        }
         keymap
     }
 
@@ -3002,6 +3134,9 @@ impl App {
             // Set terminal cursor style based on vim mode (only when changed)
             let cached_style = match (self.focus, self.mode) {
                 (Focus::Query, Mode::Insert) => CachedCursorStyle::BlinkingBar,
+                (Focus::Notebook, Mode::Insert) if self.notebook.focus == NotebookFocus::Editor => {
+                    CachedCursorStyle::BlinkingBar
+                }
                 _ => CachedCursorStyle::SteadyBlock,
             };
             if self.last_cursor_style != Some(cached_style) {
@@ -3105,7 +3240,7 @@ impl App {
                         self.ui_theme.label_focused.fg(query_accent),
                     ));
                 }
-                if self.editor.is_modified() {
+                if self.workspace_has_unsaved_changes() {
                     query_details.push(Span::styled(" [+]", self.ui_theme.warning));
                 }
                 let query_block = zone_block(
@@ -3304,6 +3439,10 @@ impl App {
                             .alignment(Alignment::Center);
                         frame.render_widget(elapsed_widget, chunks[1]);
                     }
+                }
+
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    self.render_notebook_workspace(frame, main_area);
                 }
 
                 // Status.
@@ -3732,7 +3871,7 @@ impl App {
 
             if self.pending_external_edit {
                 self.pending_external_edit = false;
-                if let Err(e) = self.open_in_external_editor(terminal) {
+                if let Err(e) = self.open_active_external_editor(terminal) {
                     self.last_error = Some(format!("External editor failed: {e}"));
                 }
             }
@@ -3830,6 +3969,40 @@ impl App {
 
         // Esc: cancel running query, close popups, or quit if nothing is open.
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            if self.workspace_mode == WorkspaceMode::Notebook
+                && matches!(self.focus, Focus::Sidebar(_))
+                && !self.search.active
+                && !self.command.active
+                && !self.completion.active
+                && self.last_error.is_none()
+            {
+                self.set_focus(Focus::Notebook);
+                self.notebook.focus = NotebookFocus::Cell;
+                self.mode = Mode::Normal;
+                return false;
+            }
+            let notebook_can_handle_escape = self.focus == Focus::Notebook
+                && !self.search.active
+                && !self.command.active
+                && !self.completion.active
+                && self.last_error.is_none();
+            if notebook_can_handle_escape {
+                match self.notebook.focus {
+                    NotebookFocus::Editor if self.mode == Mode::Normal => {
+                        self.notebook.focus = NotebookFocus::Cell;
+                        return false;
+                    }
+                    NotebookFocus::Editor => {
+                        self.handle_notebook_key(key);
+                        return false;
+                    }
+                    NotebookFocus::Result => {
+                        self.notebook.focus = NotebookFocus::Cell;
+                        return false;
+                    }
+                    NotebookFocus::Cell => {}
+                }
+            }
             if self.db.running {
                 self.cancel_query();
                 return false;
@@ -3877,7 +4050,7 @@ impl App {
                 self.grid_state.selected_rows.clear();
             } else {
                 // Nothing open - behave like 'q' and show quit confirmation
-                if self.editor.is_modified() {
+                if self.workspace_has_unsaved_changes() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Quit anyway?",
                         ConfirmContext::QuitApp,
@@ -3916,7 +4089,11 @@ impl App {
 
         // Global Ctrl+E to execute query (works regardless of mode/focus)
         if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
-            self.execute_query();
+            if self.workspace_mode == WorkspaceMode::Notebook {
+                self.execute_notebook_cell();
+            } else {
+                self.execute_query();
+            }
             return false;
         }
 
@@ -3947,6 +4124,9 @@ impl App {
 
         // Handle completion popup when active
         if self.completion.active {
+            if self.workspace_mode == WorkspaceMode::Notebook {
+                return self.handle_notebook_completion_key(key);
+            }
             match (key.code, key.modifiers) {
                 // Enter accepts the completion
                 (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -4038,7 +4218,9 @@ impl App {
         }
 
         // Handle key sequences (e.g., gg, gc, gt, ge, gr) in Normal mode
-        if self.mode == Mode::Normal {
+        if self.mode == Mode::Normal
+            && !(self.focus == Focus::Notebook && self.notebook.focus == NotebookFocus::Editor)
+        {
             // Start a new key sequence for 'g' key (only when no sequence is pending)
             if !self.key_sequence.is_waiting() {
                 if let KeyCode::Char('g') = key.code {
@@ -4080,7 +4262,7 @@ impl App {
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE) => {
                     // Always show confirmation prompt, with different message based on unsaved changes
-                    if self.editor.is_modified() {
+                    if self.workspace_has_unsaved_changes() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Quit anyway?",
                             ConfirmContext::QuitApp,
@@ -4260,6 +4442,7 @@ impl App {
             Focus::Query => {
                 self.handle_editor_key(key);
             }
+            Focus::Notebook => self.handle_notebook_key(key),
             Focus::Sidebar(section) => {
                 self.handle_sidebar_key(key, section);
             }
@@ -4276,6 +4459,15 @@ impl App {
                 Mode::Visual => self.editor_visual_keymap.get_action(key),
             },
             Focus::Grid => self.grid_keymap.get_action(key),
+            Focus::Notebook => match self.notebook.focus {
+                NotebookFocus::Cell => self.notebook_keymap.get_action(key),
+                NotebookFocus::Editor => match self.mode {
+                    Mode::Normal => self.editor_normal_keymap.get_action(key),
+                    Mode::Insert => self.editor_insert_keymap.get_action(key),
+                    Mode::Visual => self.editor_visual_keymap.get_action(key),
+                },
+                NotebookFocus::Result => self.grid_keymap.get_action(key),
+            },
             Focus::Sidebar(_) => self.sidebar_keymap.get_action(key),
         }?;
 
@@ -4325,7 +4517,7 @@ impl App {
                 self.sidebar_focus = SidebarSection::Schema;
                 self.select_first_schema_if_empty();
             }
-            Focus::Query | Focus::Grid => {}
+            Focus::Query | Focus::Grid | Focus::Notebook => {}
         }
 
         self.focus = focus;
@@ -4348,6 +4540,23 @@ impl App {
     }
 
     fn focus_next(&mut self) {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let next = if self.sidebar_visible {
+                match self.focus {
+                    Focus::Notebook => Focus::Sidebar(SidebarSection::Schema),
+                    Focus::Sidebar(SidebarSection::Schema) => {
+                        Focus::Sidebar(SidebarSection::Connections)
+                    }
+                    Focus::Sidebar(SidebarSection::Connections) => Focus::Notebook,
+                    Focus::Query | Focus::Grid => Focus::Notebook,
+                }
+            } else {
+                Focus::Notebook
+            };
+            self.set_focus(next);
+            return;
+        }
+
         let next = if self.sidebar_visible {
             match self.focus {
                 Focus::Query => Focus::Grid,
@@ -4356,17 +4565,36 @@ impl App {
                     Focus::Sidebar(SidebarSection::Connections)
                 }
                 Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+                Focus::Notebook => Focus::Sidebar(SidebarSection::Schema),
             }
         } else {
             match self.focus {
                 Focus::Query | Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
                 Focus::Grid | Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+                Focus::Notebook => Focus::Notebook,
             }
         };
         self.set_focus(next);
     }
 
     fn focus_previous(&mut self) {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let previous = if self.sidebar_visible {
+                match self.focus {
+                    Focus::Notebook => Focus::Sidebar(SidebarSection::Connections),
+                    Focus::Sidebar(SidebarSection::Connections) => {
+                        Focus::Sidebar(SidebarSection::Schema)
+                    }
+                    Focus::Sidebar(SidebarSection::Schema) => Focus::Notebook,
+                    Focus::Query | Focus::Grid => Focus::Notebook,
+                }
+            } else {
+                Focus::Notebook
+            };
+            self.set_focus(previous);
+            return;
+        }
+
         let previous = if self.sidebar_visible {
             match self.focus {
                 Focus::Query => Focus::Sidebar(SidebarSection::Connections),
@@ -4375,11 +4603,13 @@ impl App {
                 }
                 Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
                 Focus::Grid => Focus::Query,
+                Focus::Notebook => Focus::Sidebar(SidebarSection::Connections),
             }
         } else {
             match self.focus {
                 Focus::Query | Focus::Sidebar(SidebarSection::Schema) => Focus::Grid,
                 Focus::Grid | Focus::Sidebar(SidebarSection::Connections) => Focus::Query,
+                Focus::Notebook => Focus::Notebook,
             }
         };
         self.set_focus(previous);
@@ -4393,6 +4623,22 @@ impl App {
 
     /// Calculate the spatially adjacent pane, or None at a boundary.
     fn calculate_focus_for_direction(&self, direction: PanelDirection) -> Option<Focus> {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            return match (self.focus, direction) {
+                (Focus::Notebook, PanelDirection::Left) => {
+                    Some(Focus::Sidebar(SidebarSection::Schema))
+                }
+                (Focus::Sidebar(_), PanelDirection::Right) => Some(Focus::Notebook),
+                (Focus::Sidebar(SidebarSection::Connections), PanelDirection::Down) => {
+                    Some(Focus::Sidebar(SidebarSection::Schema))
+                }
+                (Focus::Sidebar(SidebarSection::Schema), PanelDirection::Up) => {
+                    Some(Focus::Sidebar(SidebarSection::Connections))
+                }
+                _ => None,
+            };
+        }
+
         // Navigation follows the visible 2x2 layout. set_focus reveals the sidebar
         // when a leftward move targets one of its panes.
         // ┌─────────────────┬──────────────────┐
@@ -4508,9 +4754,7 @@ impl App {
                     }
                     SchemaTreeSelection::Column { column, .. } => {
                         // Column node: preserve existing behavior (insert column name)
-                        self.editor.textarea.insert_str(&column);
-                        self.set_focus(Focus::Query);
-                        self.mode = Mode::Insert;
+                        self.insert_into_editor_and_focus(&column);
                     }
                     SchemaTreeSelection::Unknown { raw } => {
                         // Fallback to previous behavior: insert last segment after ':'
@@ -4518,9 +4762,7 @@ impl App {
                             .rsplit_once(':')
                             .map(|(_, name)| name.to_string())
                             .unwrap_or(raw);
-                        self.editor.textarea.insert_str(&insert_name);
-                        self.set_focus(Focus::Query);
-                        self.mode = Mode::Insert;
+                        self.insert_into_editor_and_focus(&insert_name);
                     }
                 }
             }
@@ -4604,8 +4846,16 @@ impl App {
             match action {
                 PickerAction::Selected(entry) => {
                     // Load selected query into editor (mirror keyboard path)
-                    self.editor.set_text(entry.query);
-                    self.editor.mark_saved(); // Mark as unmodified since it's loaded content
+                    if self.workspace_mode == WorkspaceMode::Notebook {
+                        let cell = self.notebook.selected_cell_mut();
+                        cell.replace_source(entry.query);
+                        cell.editor.mark_saved();
+                        self.notebook.focus = NotebookFocus::Editor;
+                        self.set_focus(Focus::Notebook);
+                    } else {
+                        self.editor.set_text(entry.query);
+                        self.editor.mark_saved();
+                    }
                     self.history_picker = None;
                     self.history_picker_pinned_only = false;
                     self.last_status = Some("Loaded from history".to_string());
@@ -4626,7 +4876,7 @@ impl App {
                 PickerAction::Selected(entry) => {
                     self.connection_picker = None;
                     self.last_error = None;
-                    if self.editor.is_modified() {
+                    if self.workspace_has_unsaved_changes() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
                             ConfirmContext::SwitchConnection {
@@ -4701,6 +4951,78 @@ impl App {
 
     /// Handle a mouse click at the given position
     fn handle_mouse_click(&mut self, x: u16, y: u16) {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let target = self.render_notebook_cells.iter().copied().find(|area| {
+                is_inside(x, y, area.composer)
+                    || area.output.is_some_and(|output| is_inside(x, y, output))
+            });
+            let Some(target) = target else {
+                return;
+            };
+
+            self.notebook.selected = target.cell_id;
+            self.set_focus(Focus::Notebook);
+            self.mode = Mode::Normal;
+            self.last_grid_click = None;
+
+            if target
+                .output_toggle
+                .is_some_and(|toggle| is_inside(x, y, toggle))
+            {
+                let cell = self.notebook.selected_cell_mut();
+                cell.output_collapsed = !cell.output_collapsed;
+                self.notebook.focus = NotebookFocus::Cell;
+            } else if target.output.is_some_and(|output| is_inside(x, y, output)) {
+                self.notebook.focus = NotebookFocus::Result;
+                let show_row_numbers = self.config.display.show_row_numbers;
+                if let Some(output) = self.notebook.selected_cell_mut().output.as_mut() {
+                    if let Some(mut grid_area) = target.grid {
+                        let body_rows = grid_area.height.saturating_sub(1) as usize;
+                        grid_area.width = grid_area
+                            .width
+                            .saturating_sub(u16::from(output.grid.rows.len() > body_rows));
+                        if let Some(grid_target) = grid_viewport_mouse_target(
+                            x,
+                            y,
+                            grid_area,
+                            show_row_numbers,
+                            output.grid.rows.len(),
+                            output.grid_state.row_offset,
+                            output.grid_state.col_offset,
+                            &output.grid.col_widths,
+                        ) {
+                            match grid_target {
+                                GridMouseTarget::Header { col } => {
+                                    if let Some(col) = col {
+                                        output.grid_state.cursor_col = col;
+                                    }
+                                }
+                                GridMouseTarget::Cell { row, col } => {
+                                    if row < output.grid.rows.len() {
+                                        output.grid_state.cursor_row = row;
+                                        if let Some(col) = col {
+                                            output.grid_state.cursor_col = col;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if target.compact {
+                let cell = self.notebook.selected_cell_mut();
+                if cell.output.is_some() {
+                    cell.output_collapsed = false;
+                    self.notebook.focus = NotebookFocus::Result;
+                } else {
+                    self.notebook.focus = NotebookFocus::Cell;
+                }
+            } else {
+                self.notebook.focus = NotebookFocus::Editor;
+            }
+            return;
+        }
+
         // Check if click is in query area
         if let Some(query_area) = self.render_query_area {
             if x >= query_area.x
@@ -4814,6 +5136,44 @@ impl App {
                 // Trigger auto-fetch when scrolling near the end of loaded rows
                 self.maybe_fetch_more_rows();
             }
+            Focus::Notebook => match self.notebook.focus {
+                NotebookFocus::Cell => {
+                    if delta < 0 {
+                        self.notebook.select_previous();
+                    } else {
+                        self.notebook.select_next();
+                    }
+                }
+                NotebookFocus::Editor => {
+                    let cell = self.notebook.selected_cell_mut();
+                    let direction = if delta < 0 {
+                        CursorMove::Up
+                    } else {
+                        CursorMove::Down
+                    };
+                    for _ in 0..delta.unsigned_abs() {
+                        cell.editor.textarea.move_cursor(direction);
+                    }
+                }
+                NotebookFocus::Result => {
+                    let Some(output) = self.notebook.selected_cell_mut().output.as_mut() else {
+                        return;
+                    };
+                    if output.grid.rows.is_empty() {
+                        return;
+                    }
+                    if delta < 0 {
+                        output.grid_state.cursor_row = output
+                            .grid_state
+                            .cursor_row
+                            .saturating_sub((-delta) as usize);
+                    } else {
+                        output.grid_state.cursor_row = (output.grid_state.cursor_row
+                            + delta as usize)
+                            .min(output.grid.rows.len().saturating_sub(1));
+                    }
+                }
+            },
             Focus::Sidebar(section) => {
                 // Scroll sidebar sections
                 match section {
@@ -4844,7 +5204,7 @@ impl App {
             match self.focus {
                 Focus::Sidebar(SidebarSection::Connections) => self.set_focus(Focus::Query),
                 Focus::Sidebar(SidebarSection::Schema) => self.set_focus(Focus::Grid),
-                Focus::Query | Focus::Grid => {}
+                Focus::Query | Focus::Grid | Focus::Notebook => {}
             }
         } else {
             self.sidebar_visible = true;
@@ -5032,6 +5392,26 @@ impl App {
         ));
     }
 
+    fn open_notebook_row_detail(&mut self, row: usize) {
+        let Some(output) = self.notebook.selected_cell().output.as_ref() else {
+            return;
+        };
+        if row >= output.grid.rows.len() {
+            return;
+        }
+
+        self.row_detail = Some(
+            RowDetailModal::new(
+                output.grid.headers.clone(),
+                output.grid.rows[row].clone(),
+                output.grid.col_types.clone(),
+                row,
+                self.syntax_theme.clone(),
+            )
+            .with_read_only(),
+        );
+    }
+
     /// Handle key events for the row detail modal.
     fn handle_row_detail_key(&mut self, key: KeyEvent) -> bool {
         // Take the modal temporarily to avoid borrow issues
@@ -5048,23 +5428,37 @@ impl App {
                 // Modal is already taken, just don't put it back
             }
             RowDetailAction::Edit { col } => {
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    self.last_status = Some("Notebook results are read-only".to_string());
+                    self.row_detail = Some(modal);
+                    return false;
+                }
                 let row = self.grid_state.cursor_row;
                 self.start_cell_edit(row, col);
             }
             RowDetailAction::Yank(fmt) => {
-                let row = self.grid_state.cursor_row;
+                let (grid, row) = if self.workspace_mode == WorkspaceMode::Notebook {
+                    let Some(output) = self.notebook.selected_cell().output.as_ref() else {
+                        self.last_status = Some("Cell has no result to copy".to_string());
+                        self.row_detail = Some(modal);
+                        return false;
+                    };
+                    (&output.grid, output.grid_state.cursor_row)
+                } else {
+                    (&self.grid, self.grid_state.cursor_row)
+                };
                 let indices = &[row];
                 let (text, label) = match fmt {
-                    YankFormat::Tsv => (self.grid.rows_as_tsv(indices, false), "TSV"),
+                    YankFormat::Tsv => (grid.rows_as_tsv(indices, false), "TSV"),
                     YankFormat::TsvHeaders => {
-                        (self.grid.rows_as_tsv(indices, true), "TSV (with headers)")
+                        (grid.rows_as_tsv(indices, true), "TSV (with headers)")
                     }
-                    YankFormat::Json => (self.grid.row_as_json(row).unwrap_or_default(), "JSON"),
-                    YankFormat::Csv => (self.grid.rows_as_csv(indices, false), "CSV"),
+                    YankFormat::Json => (grid.row_as_json(row).unwrap_or_default(), "JSON"),
+                    YankFormat::Csv => (grid.rows_as_csv(indices, false), "CSV"),
                     YankFormat::CsvHeaders => {
-                        (self.grid.rows_as_csv(indices, true), "CSV (with headers)")
+                        (grid.rows_as_csv(indices, true), "CSV (with headers)")
                     }
-                    YankFormat::Markdown => (self.grid.rows_as_markdown(indices), "Markdown"),
+                    YankFormat::Markdown => (grid.rows_as_markdown(indices), "Markdown"),
                 };
                 self.last_error = None;
                 self.copy_to_clipboard(&text);
@@ -5114,6 +5508,14 @@ impl App {
                 }
                 false
             }
+            ConfirmContext::DeleteNotebookCell { cell_id } => {
+                self.delete_notebook_cell(super::execution::CellId(cell_id));
+                false
+            }
+            ConfirmContext::ClearNotebookCellExecution { cell_id } => {
+                self.clear_notebook_cell_execution(super::execution::CellId(cell_id));
+                false
+            }
             ConfirmContext::CloseConnectionForm => {
                 // Close the connection form without saving
                 self.pending_duplicate_donor = None;
@@ -5159,6 +5561,13 @@ impl App {
             ConfirmContext::DeleteConnection { .. } => {
                 // Cancelled delete, nothing to do
                 self.last_status = Some("Delete cancelled".to_string());
+            }
+            ConfirmContext::DeleteNotebookCell { .. } => {
+                self.notebook.pending_delete = false;
+                self.last_status = Some("Cell deletion cancelled".to_string());
+            }
+            ConfirmContext::ClearNotebookCellExecution { .. } => {
+                self.last_status = Some("Cell execution clear cancelled".to_string());
             }
             ConfirmContext::CloseConnectionForm => {
                 // Keep the form open
@@ -5709,20 +6118,25 @@ impl App {
     }
 
     fn handle_editor_search(&mut self, pattern: String) {
+        let editor = if self.workspace_mode == WorkspaceMode::Notebook {
+            &mut self.notebook.selected_cell_mut().editor
+        } else {
+            &mut self.editor
+        };
         if pattern.is_empty() {
-            let _ = self.editor.textarea.set_search_pattern("");
+            let _ = editor.textarea.set_search_pattern("");
             self.search.last_applied = None;
             self.search.close();
             self.last_status = Some("Search cleared".to_string());
             return;
         }
 
-        match self.editor.textarea.set_search_pattern(&pattern) {
+        match editor.textarea.set_search_pattern(&pattern) {
             Ok(()) => {
                 self.search.last_applied = Some(pattern.clone());
                 self.search.close();
 
-                let found = self.editor.textarea.search_forward(true);
+                let found = editor.textarea.search_forward(true);
                 if found {
                     self.last_status = Some(format!("Search: /{}", pattern));
                 } else {
@@ -5737,6 +6151,30 @@ impl App {
     }
 
     fn handle_grid_search(&mut self, pattern: String) {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let Some(output) = self.notebook.selected_cell_mut().output.as_mut() else {
+                self.search.close();
+                self.last_status = Some("Cell has no result to search".to_string());
+                return;
+            };
+            if pattern.is_empty() {
+                output.grid_state.clear_search();
+                self.search.close();
+                self.last_status = Some("Grid search cleared".to_string());
+                return;
+            }
+
+            output.grid_state.apply_search(&pattern, &output.grid);
+            let match_count = output.grid_state.search.match_count();
+            self.search.close();
+            self.last_status = Some(if match_count > 0 {
+                format!("Grid: /{} ({} matches)", pattern, match_count)
+            } else {
+                format!("Grid: /{} (no matches)", pattern)
+            });
+            return;
+        }
+
         if pattern.is_empty() {
             self.grid_state.clear_search();
             self.search.close();
@@ -5789,6 +6227,30 @@ impl App {
         let command = parts[0];
         let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
+        let opens_classic_result = matches!(
+            command,
+            "\\dt"
+                | "dt"
+                | "\\dn"
+                | "dn"
+                | "\\d"
+                | "d"
+                | "\\di"
+                | "di"
+                | "\\l"
+                | "l"
+                | "\\du"
+                | "du"
+                | "\\dv"
+                | "dv"
+                | "\\df"
+                | "df"
+        ) || command == "show"
+            && matches!(args, "dbs" | "databases" | "collections");
+        if self.workspace_mode == WorkspaceMode::Notebook && opens_classic_result {
+            self.switch_workspace(WorkspaceMode::Classic);
+        }
+
         match command {
             "q" | "quit" | "exit" => {
                 return true;
@@ -5804,6 +6266,9 @@ impl App {
                 }
             }
             "disconnect" | "dc" => {
+                self.invalidate_active_execution("Connection closed");
+                self.invalidate_pg_snapshots(true);
+                self.connect_generation = self.connect_generation.wrapping_add(1);
                 self.db.client = None;
                 self.db.mongo_client = None;
                 self.db.mongo_database = None;
@@ -5811,6 +6276,7 @@ impl App {
                 self.db.cancel_token = None;
                 self.db.status = DbStatus::Disconnected;
                 self.db.running = false;
+                self.db.transaction_state = TransactionState::Unknown;
                 self.last_executed_query = None;
                 self.active_query_kind = None;
                 self.current_connection_name = None;
@@ -5818,6 +6284,29 @@ impl App {
                 self.query_ui.clear();
                 self.last_status = Some("Disconnected".to_string());
             }
+            "notebook" => self.switch_workspace(WorkspaceMode::Notebook),
+            "rebase" if self.workspace_mode == WorkspaceMode::Notebook => {
+                self.rebase_selected_dependency();
+            }
+            "rebind" if self.workspace_mode == WorkspaceMode::Notebook => {
+                self.notebook
+                    .selected_cell_mut()
+                    .bound_connection_generation = None;
+                self.last_status = Some("Cell will bind to the active connection on run".into());
+            }
+            "run-without-snapshot" if self.workspace_mode == WorkspaceMode::Notebook => {
+                self.execute_notebook_cell_with_snapshot(false);
+            }
+            "rebase" | "rebind" | "run-without-snapshot" => {
+                self.last_status = Some("This command is only available in Notebook mode".into());
+            }
+            "mode" => match args {
+                "notebook" => self.switch_workspace(WorkspaceMode::Notebook),
+                "classic" => self.switch_workspace(WorkspaceMode::Classic),
+                _ => {
+                    self.last_status = Some("Usage: :mode classic|notebook".to_string());
+                }
+            },
             "help" | "h" => {
                 self.help_popup = Some(HelpPopup::new());
             }
@@ -5985,7 +6474,10 @@ impl App {
     }
 
     fn query_editor_has_content(&self) -> bool {
-        !self.editor.text().trim().is_empty()
+        match self.workspace_mode {
+            WorkspaceMode::Classic => !self.editor.text().trim().is_empty(),
+            WorkspaceMode::Notebook => !self.notebook.selected_cell().is_empty(),
+        }
     }
 
     fn handle_export_connections_command(&mut self, args: &str) {
@@ -6203,8 +6695,16 @@ impl App {
                     return;
                 };
 
-                self.editor.set_text(query.to_string());
-                self.set_focus(Focus::Query);
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    self.notebook
+                        .selected_cell_mut()
+                        .replace_source(query.to_string());
+                    self.notebook.focus = NotebookFocus::Editor;
+                    self.focus = Focus::Notebook;
+                } else {
+                    self.editor.set_text(query.to_string());
+                    self.set_focus(Focus::Query);
+                }
                 self.mode = Mode::Insert;
                 self.ai_modal = None;
                 self.ai_modal_previous_mode = None;
@@ -6491,6 +6991,27 @@ impl App {
     }
 
     fn goto_result_row(&mut self, row_num: usize) -> bool {
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let Some(output) = self.notebook.selected_cell_mut().output.as_mut() else {
+                self.last_status = Some("Cell has no result to navigate".to_string());
+                return false;
+            };
+            if output.grid.rows.is_empty() {
+                self.last_status = Some("No results to navigate".to_string());
+                return false;
+            }
+
+            let target_row = row_num
+                .saturating_sub(1)
+                .min(output.grid.rows.len().saturating_sub(1));
+            output.grid_state.cursor_row = target_row;
+            let row_count = output.grid.rows.len();
+            self.notebook.focus = NotebookFocus::Result;
+            self.set_focus(Focus::Notebook);
+            self.last_status = Some(format!("Row {} of {}", target_row + 1, row_count));
+            return false;
+        }
+
         if self.grid.rows.is_empty() {
             self.last_status = Some("No results to navigate".to_string());
             return false;
@@ -6734,7 +7255,20 @@ impl App {
     }
 
     fn handle_export_command(&mut self, args: &str) {
-        if self.grid.rows.is_empty() {
+        let grid = if self.workspace_mode == WorkspaceMode::Notebook {
+            self.notebook
+                .selected_cell()
+                .output
+                .as_ref()
+                .map(|output| &output.grid)
+        } else {
+            Some(&self.grid)
+        };
+        let Some(grid) = grid else {
+            self.last_error = Some("No data to export".to_string());
+            return;
+        };
+        if grid.rows.is_empty() {
             self.last_error = Some("No data to export".to_string());
             return;
         }
@@ -6754,12 +7288,12 @@ impl App {
         }
 
         // Get all row indices
-        let indices: Vec<usize> = (0..self.grid.rows.len()).collect();
+        let indices: Vec<usize> = (0..grid.rows.len()).collect();
 
         let content = match format.as_str() {
-            "csv" => self.grid.rows_as_csv(&indices, true),
-            "json" => self.grid.rows_as_json(&indices),
-            "tsv" => self.grid.rows_as_tsv(&indices, true),
+            "csv" => grid.rows_as_csv(&indices, true),
+            "json" => grid.rows_as_json(&indices),
+            "tsv" => grid.rows_as_tsv(&indices, true),
             _ => {
                 self.last_error = Some(format!(
                     "Unknown format: {}. Use csv, json, or tsv.",
@@ -6782,7 +7316,7 @@ impl App {
 
         match std::fs::write(&expanded_path, &content) {
             Ok(()) => {
-                let rows = self.grid.rows.len();
+                let rows = indices.len();
                 self.last_status = Some(format!(
                     "Exported {} rows to {} as {}",
                     rows,
@@ -7965,6 +8499,8 @@ impl App {
     }
 
     pub fn start_connect(&mut self, conn_str: String) {
+        self.invalidate_active_execution("Connection changed");
+        self.invalidate_pg_snapshots(true);
         self.invalidate_password_resolves();
         self.db.status = DbStatus::Connecting;
         self.db.kind = None;
@@ -7973,6 +8509,7 @@ impl App {
         self.db.mongo_client = None;
         self.db.mongo_database = None;
         self.db.running = false;
+        self.db.transaction_state = TransactionState::Unknown;
         self.last_executed_query = None;
         self.active_query_kind = None;
         self.query_ui.clear();
@@ -8423,7 +8960,7 @@ impl App {
             PickerAction::Continue => false,
             PickerAction::Selected(entry) => {
                 self.connection_picker = None;
-                if self.editor.is_modified() {
+                if self.workspace_has_unsaved_changes() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
                         ConfirmContext::SwitchConnection {
@@ -8553,14 +9090,28 @@ impl App {
     }
 
     fn insert_into_editor_and_focus(&mut self, text: &str) {
-        self.editor.textarea.insert_str(text);
-        self.set_focus(Focus::Query);
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            let cell = self.notebook.selected_cell_mut();
+            cell.editor.textarea.insert_str(text);
+            cell.mark_edited();
+            self.notebook.focus = NotebookFocus::Editor;
+            self.focus = Focus::Notebook;
+        } else {
+            self.editor.textarea.insert_str(text);
+            self.set_focus(Focus::Query);
+        }
         self.mode = Mode::Insert;
     }
 
     fn replace_editor_with_schema_template(&mut self, query: String) {
-        self.editor.set_text(query);
-        self.set_focus(Focus::Query);
+        if self.workspace_mode == WorkspaceMode::Notebook {
+            self.notebook.selected_cell_mut().replace_source(query);
+            self.notebook.focus = NotebookFocus::Editor;
+            self.focus = Focus::Notebook;
+        } else {
+            self.editor.set_text(query);
+            self.set_focus(Focus::Query);
+        }
         self.mode = Mode::Insert;
         self.last_status = Some("Query replaced with schema template".to_string());
     }
@@ -8593,6 +9144,20 @@ impl App {
                         self.editor.textarea.move_cursor(CursorMove::Top);
                         self.editor.textarea.move_cursor(CursorMove::Head);
                     }
+                    Focus::Notebook => match self.notebook.focus {
+                        NotebookFocus::Cell => self.notebook.select_first(),
+                        NotebookFocus::Editor => {
+                            let editor = &mut self.notebook.selected_cell_mut().editor.textarea;
+                            editor.move_cursor(CursorMove::Top);
+                            editor.move_cursor(CursorMove::Head);
+                        }
+                        NotebookFocus::Result => {
+                            if let Some(output) = self.notebook.selected_cell_mut().output.as_mut()
+                            {
+                                output.grid_state.cursor_row = 0;
+                            }
+                        }
+                    },
                     Focus::Sidebar(_) => {
                         // In sidebar, just go to first item (connections section)
                         self.set_focus(Focus::Sidebar(SidebarSection::Connections));
@@ -8601,7 +9166,12 @@ impl App {
                 }
             }
             KeySequenceAction::GotoEditor => {
-                self.set_focus(Focus::Query);
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    self.set_focus(Focus::Notebook);
+                    self.notebook.focus = NotebookFocus::Editor;
+                } else {
+                    self.set_focus(Focus::Query);
+                }
             }
             KeySequenceAction::GotoConnections => {
                 self.set_focus(Focus::Sidebar(SidebarSection::Connections));
@@ -8610,7 +9180,12 @@ impl App {
                 self.focus_schema();
             }
             KeySequenceAction::GotoResults => {
-                self.set_focus(Focus::Grid);
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    self.set_focus(Focus::Notebook);
+                    self.notebook.focus = NotebookFocus::Result;
+                } else {
+                    self.set_focus(Focus::Grid);
+                }
             }
             KeySequenceAction::GotoHistory => {
                 self.open_history_picker();
@@ -8725,7 +9300,7 @@ impl App {
             }
             ConnectionManagerAction::Connect { entry } => {
                 self.connection_manager = None;
-                if self.editor.is_modified() {
+                if self.workspace_has_unsaved_changes() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Switch connection anyway?",
                         ConfirmContext::SwitchConnection {
@@ -8915,7 +9490,7 @@ impl App {
                     .into_iter()
                     .find(|e| e.name == name)
                 {
-                    if self.editor.is_modified() {
+                    if self.workspace_has_unsaved_changes() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Switch connection anyway?",
                             ConfirmContext::SwitchConnection {
@@ -9163,11 +9738,549 @@ impl App {
         match self.focus {
             Focus::Sidebar(SidebarSection::Schema) => self.refresh_schema(),
             Focus::Query | Focus::Grid => self.refresh_last_query(),
+            Focus::Notebook => self.execute_notebook_cell(),
             Focus::Sidebar(SidebarSection::Connections) => {
                 self.last_status =
                     Some("Nothing to refresh while connections are focused".to_string());
             }
         }
+    }
+
+    pub fn switch_workspace(&mut self, workspace_mode: WorkspaceMode) {
+        if self.workspace_mode == workspace_mode {
+            return;
+        }
+
+        if workspace_mode == WorkspaceMode::Notebook {
+            if self.notebook.cells.len() == 1
+                && self.notebook.cells[0].is_empty()
+                && !self.editor.text().trim().is_empty()
+            {
+                self.notebook.cells[0].replace_source(self.editor.text());
+            }
+            self.focus = Focus::Notebook;
+            self.notebook.focus = NotebookFocus::Cell;
+            self.mode = Mode::Normal;
+            self.completion.close();
+            self.last_status = Some("Notebook mode".to_string());
+        } else {
+            self.focus = Focus::Query;
+            self.mode = Mode::Normal;
+            self.last_status = Some("Classic mode".to_string());
+        }
+        self.workspace_mode = workspace_mode;
+    }
+
+    fn workspace_has_unsaved_changes(&self) -> bool {
+        match self.workspace_mode {
+            WorkspaceMode::Classic => self.editor.is_modified(),
+            WorkspaceMode::Notebook => self.notebook.cells.iter().any(|cell| {
+                !cell.is_empty()
+                    && (cell.output.is_none() || cell.is_dirty() || cell.editor.is_modified())
+            }),
+        }
+    }
+
+    fn handle_notebook_key(&mut self, key: KeyEvent) {
+        match self.notebook.focus {
+            NotebookFocus::Cell => {
+                if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::NONE {
+                    if self.notebook.pending_delete {
+                        self.notebook.pending_delete = false;
+                        self.request_delete_notebook_cell();
+                    } else {
+                        self.notebook.pending_delete = true;
+                        self.last_status = Some("d: press d again to delete cell".to_string());
+                    }
+                    return;
+                }
+                self.notebook.pending_delete = false;
+                let Some(action) = self.notebook_keymap.get_action(&key) else {
+                    return;
+                };
+                match action {
+                    Action::PreviousCell => self.notebook.select_previous(),
+                    Action::NextCell => self.notebook.select_next(),
+                    Action::FirstCell => self.notebook.select_first(),
+                    Action::LastCell => self.notebook.select_last(),
+                    Action::PageUp | Action::HalfPageUp => {
+                        for _ in 0..5 {
+                            self.notebook.select_previous();
+                        }
+                    }
+                    Action::PageDown | Action::HalfPageDown => {
+                        for _ in 0..5 {
+                            self.notebook.select_next();
+                        }
+                    }
+                    Action::EnterCellEditor => {
+                        self.notebook.focus = NotebookFocus::Editor;
+                        self.mode = Mode::Normal;
+                    }
+                    Action::InspectCellResult => {
+                        if self.notebook.selected_cell().output.is_some() {
+                            self.notebook.selected_cell_mut().output_collapsed = false;
+                            self.notebook.focus = NotebookFocus::Result;
+                        } else {
+                            self.last_status = Some("Cell has no result to inspect".to_string());
+                        }
+                    }
+                    Action::NewNotebookCell => {
+                        self.notebook.select_or_create_draft();
+                        self.mode = Mode::Insert;
+                    }
+                    Action::ToggleCellOutput => {
+                        let cell = self.notebook.selected_cell_mut();
+                        cell.output_collapsed = !cell.output_collapsed;
+                    }
+                    Action::CollapseCellOutput => {
+                        self.notebook.selected_cell_mut().output_collapsed = true;
+                    }
+                    Action::ExpandCellOutput => {
+                        self.notebook.selected_cell_mut().output_collapsed = false;
+                    }
+                    Action::ClearNotebookCellExecution => {
+                        self.request_clear_notebook_cell_execution();
+                    }
+                    Action::ExecuteQuery => self.execute_notebook_cell(),
+                    Action::ExecuteCellAndAdvance => {
+                        let can_start = !self.db.running;
+                        self.execute_notebook_cell();
+                        if can_start && self.db.running {
+                            self.notebook.select_next();
+                        }
+                    }
+                    Action::RefineNotebookCell => {
+                        self.refine_selected_cell();
+                    }
+                    Action::DeleteNotebookCell => {
+                        self.request_delete_notebook_cell();
+                    }
+                    Action::EnterCommandMode => self.command.open(),
+                    _ => {}
+                }
+            }
+            NotebookFocus::Editor => {
+                if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL
+                    || key.code == KeyCode::Enter && self.mode == Mode::Normal
+                {
+                    self.execute_notebook_cell();
+                    return;
+                }
+
+                let index = self.notebook.selected_index();
+                let before = self.notebook.cells[index].source();
+                let mut notebook_editor = std::mem::take(&mut self.notebook.cells[index].editor);
+                std::mem::swap(&mut self.editor, &mut notebook_editor);
+                self.handle_editor_key(key);
+                std::mem::swap(&mut self.editor, &mut notebook_editor);
+                self.notebook.cells[index].editor = notebook_editor;
+                if self.notebook.cells[index].source() != before {
+                    self.notebook.cells[index].mark_edited();
+                }
+            }
+            NotebookFocus::Result => {
+                let pending_yank = self
+                    .notebook
+                    .selected_cell()
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.grid_state.pending_yank);
+                let action = (!pending_yank)
+                    .then(|| self.grid_keymap.get_action(&key))
+                    .flatten();
+                let result = match action {
+                    Some(Action::FocusQuery) => {
+                        self.notebook.focus = NotebookFocus::Editor;
+                        self.mode = Mode::Insert;
+                        None
+                    }
+                    Some(Action::GotoEditor) => {
+                        self.notebook.focus = NotebookFocus::Editor;
+                        self.mode = Mode::Normal;
+                        None
+                    }
+                    Some(Action::GotoConnections) => {
+                        self.set_focus(Focus::Sidebar(SidebarSection::Connections));
+                        None
+                    }
+                    Some(Action::GotoTables) => {
+                        self.focus_schema();
+                        None
+                    }
+                    Some(Action::GotoResults) => None,
+                    Some(Action::ToggleSidebar) => {
+                        self.toggle_sidebar();
+                        None
+                    }
+                    Some(Action::Refresh) => {
+                        self.execute_notebook_cell();
+                        None
+                    }
+                    Some(Action::Help) => {
+                        self.help_popup = Some(HelpPopup::new());
+                        None
+                    }
+                    Some(Action::GotoFirst) => {
+                        if let Some(output) = self.notebook.selected_cell_mut().output.as_mut() {
+                            output.grid_state.cursor_row = 0;
+                        }
+                        None
+                    }
+                    Some(action) => self
+                        .notebook
+                        .selected_cell_mut()
+                        .output
+                        .as_mut()
+                        .map(|output| output.grid_state.handle_action(action, &output.grid)),
+                    None => self
+                        .notebook
+                        .selected_cell_mut()
+                        .output
+                        .as_mut()
+                        .map(|output| output.grid_state.handle_key(key, &output.grid)),
+                };
+                match result {
+                    Some(GridKeyResult::OpenSearch) => {
+                        self.search_target = SearchTarget::Grid;
+                        self.search.open();
+                    }
+                    Some(GridKeyResult::OpenCommand) => self.command.open(),
+                    Some(GridKeyResult::CopyToClipboard(text)) => {
+                        self.copy_to_clipboard(&text);
+                    }
+                    Some(GridKeyResult::Yank { text, status }) => {
+                        self.last_error = None;
+                        self.copy_to_clipboard(&text);
+                        if self.last_error.is_none() {
+                            self.last_status = Some(status);
+                        }
+                    }
+                    Some(GridKeyResult::ResizeColumn { col, action }) => {
+                        let Some(output) = self.notebook.selected_cell_mut().output.as_mut() else {
+                            return;
+                        };
+                        match action {
+                            ResizeAction::Widen => output.grid.widen_column(col, 2),
+                            ResizeAction::Narrow => output.grid.narrow_column(col, 2),
+                            ResizeAction::AutoFit => output.grid.autofit_column(col),
+                        }
+                    }
+                    Some(GridKeyResult::EditCell { .. }) => {
+                        self.last_status = Some("Notebook results are read-only".to_string());
+                    }
+                    Some(GridKeyResult::OpenRowDetail { row }) => {
+                        self.open_notebook_row_detail(row);
+                    }
+                    Some(GridKeyResult::StatusMessage(status)) => {
+                        self.last_status = Some(status);
+                    }
+                    Some(GridKeyResult::GotoFirstRow) => {
+                        if let Some(output) = self.notebook.selected_cell_mut().output.as_mut() {
+                            output.grid_state.cursor_row = 0;
+                        }
+                    }
+                    Some(GridKeyResult::None) | None => {}
+                }
+            }
+        }
+    }
+
+    fn handle_notebook_completion_key(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let index = self.notebook.selected_index();
+                let before = self.notebook.cells[index].source();
+                let mut notebook_editor = std::mem::take(&mut self.notebook.cells[index].editor);
+                std::mem::swap(&mut self.editor, &mut notebook_editor);
+                self.apply_completion();
+                std::mem::swap(&mut self.editor, &mut notebook_editor);
+                self.notebook.cells[index].editor = notebook_editor;
+                if self.notebook.cells[index].source() != before {
+                    self.notebook.cells[index].mark_edited();
+                }
+            }
+            (KeyCode::Tab | KeyCode::Down, KeyModifiers::NONE)
+            | (KeyCode::Char('n' | 'j'), KeyModifiers::CONTROL) => {
+                self.completion.select_next();
+            }
+            (KeyCode::BackTab, KeyModifiers::SHIFT)
+            | (KeyCode::Tab, KeyModifiers::SHIFT)
+            | (KeyCode::Up, KeyModifiers::NONE)
+            | (KeyCode::Char('p' | 'k'), KeyModifiers::CONTROL) => {
+                self.completion.select_prev();
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => self.completion.close(),
+            _ => {
+                self.completion.close();
+                self.handle_notebook_key(key);
+            }
+        }
+        false
+    }
+
+    fn refine_selected_cell(&mut self) {
+        let output = self.notebook.selected_cell().output.as_ref();
+        let retained = output.and_then(|output| output.retained.clone());
+        let Some(retained) = retained else {
+            self.last_status = Some(
+                match output.map(|output| &output.refinement) {
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::SnapshotDisabled,
+                    )) => "Snapshot retention is disabled; enable notebook.snapshot_mode to refine",
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::UnsupportedBackend,
+                    )) => "Refine is available only for PostgreSQL notebook results",
+                Some(RefinementAvailability::Unavailable(
+                    RefinementUnavailableReason::TransactionNotIdle,
+                )) => {
+                    "Connection transaction state is not idle; finish it in Classic mode or reconnect"
+                }
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::IneligibleStatement,
+                    )) => "This statement does not produce an eligible snapshot result",
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::SnapshotEvicted,
+                    )) => "This session snapshot was evicted; rerun the source cell",
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::ConnectionChanged,
+                    )) => "This snapshot belongs to a previous connection; rerun the source cell",
+                    Some(RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::ResultIncomplete,
+                    )) => "Refine requires a complete result within the configured snapshot limits",
+                    Some(RefinementAvailability::Available(_)) | None => {
+                        "Refine requires a complete retained PostgreSQL session snapshot"
+                    }
+                }
+                .to_string(),
+            );
+            return;
+        };
+        if retained.connection_generation != self.connect_generation
+            || !self.pg_snapshots.contains_key(&retained.handle)
+        {
+            self.last_status = Some("Session snapshot is no longer available".to_string());
+            return;
+        }
+        self.notebook.insert_refinement(retained.version);
+        self.mode = Mode::Normal;
+        self.last_status = Some(format!(
+            "Refining cell {} run {}",
+            retained.version.source_cell.0, retained.version.source_execution.0
+        ));
+    }
+
+    fn rebase_selected_dependency(&mut self) {
+        let Some(current) = self.notebook.selected_cell().dependency else {
+            self.last_status = Some("Selected cell has no result dependency".to_string());
+            return;
+        };
+        let replacement = self
+            .notebook
+            .cells
+            .iter()
+            .find(|cell| cell.id == current.source_cell)
+            .and_then(|cell| cell.output.as_ref())
+            .and_then(|output| output.retained.as_ref())
+            .map(|retained| retained.version);
+        let Some(replacement) = replacement else {
+            self.last_status = Some("Source cell has no current session snapshot".to_string());
+            return;
+        };
+        self.notebook.selected_cell_mut().dependency = Some(replacement);
+        self.last_status = Some(format!(
+            "Rebased to cell {} run {}",
+            replacement.source_cell.0, replacement.source_execution.0
+        ));
+    }
+
+    fn request_delete_notebook_cell(&mut self) {
+        let cell = self.notebook.selected_cell();
+        let needs_confirmation = !cell.is_empty()
+            || cell.output.is_some()
+            || cell.dependency.is_some()
+            || cell.execution != CellExecutionState::NeverRun;
+        if needs_confirmation {
+            let dependent_count = self
+                .notebook
+                .cells
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .dependency
+                        .is_some_and(|version| version.source_cell == cell.id)
+                })
+                .count();
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                format!(
+                    "Delete cell {}? {} dependent cell(s) will lose their source snapshot.",
+                    self.notebook.selected_index() + 1,
+                    dependent_count
+                ),
+                ConfirmContext::DeleteNotebookCell { cell_id: cell.id.0 },
+            ));
+        } else {
+            self.delete_notebook_cell(cell.id);
+        }
+    }
+
+    fn delete_notebook_cell(&mut self, cell_id: super::execution::CellId) {
+        let removed = self.notebook.remove_cell(cell_id);
+        let retained_handle = removed
+            .as_ref()
+            .and_then(|cell| cell.output.as_ref())
+            .and_then(|output| output.retained.as_ref())
+            .map(|retained| retained.handle);
+        if let Some(handle) = retained_handle {
+            self.pg_snapshot_order
+                .retain(|candidate| *candidate != handle);
+            self.retained_versions
+                .retain(|_, candidate| *candidate != handle);
+            if let Some(snapshot) = self.pg_snapshots.remove(&handle) {
+                if let Some(client) = self.db.client.clone() {
+                    self.rt.spawn(async move {
+                        let guard = client.lock().await;
+                        let physical_name = snapshot.physical_name.replace('"', "\"\"");
+                        let _ = guard
+                            .batch_execute(&format!(
+                                "DROP TABLE IF EXISTS pg_temp.\"{physical_name}\""
+                            ))
+                            .await;
+                    });
+                }
+            }
+        }
+        self.last_status = Some("Notebook cell deleted".to_string());
+    }
+
+    fn notebook_execution_tree(&self, root: CellId) -> HashSet<CellId> {
+        let mut affected = HashSet::from([root]);
+        loop {
+            let previous_len = affected.len();
+            for cell in &self.notebook.cells {
+                let bound_to_affected = cell
+                    .dependency
+                    .is_some_and(|version| affected.contains(&version.source_cell));
+                let references_affected = matches!(
+                    logical_result_reference(&cell.source()),
+                    Ok(Some(LogicalResultReference::Cell(source_cell)))
+                        if affected.contains(&source_cell)
+                );
+                if bound_to_affected || references_affected {
+                    affected.insert(cell.id);
+                }
+            }
+            if affected.len() == previous_len {
+                return affected;
+            }
+        }
+    }
+
+    fn request_clear_notebook_cell_execution(&mut self) {
+        if self.db.running {
+            self.last_status = Some("Wait for the running query before clearing cells".to_string());
+            return;
+        }
+
+        let cell_id = self.notebook.selected;
+        let affected = self.notebook_execution_tree(cell_id);
+        let has_execution = self.notebook.cells.iter().any(|cell| {
+            affected.contains(&cell.id)
+                && (cell.output.is_some()
+                    || cell.failure.is_some()
+                    || cell.execution != CellExecutionState::NeverRun)
+        }) || self
+            .retained_versions
+            .keys()
+            .any(|version| affected.contains(&version.source_cell));
+        if !has_execution {
+            self.last_status = Some("Selected cell has no execution to clear".to_string());
+            return;
+        }
+
+        let dependent_count = affected.len().saturating_sub(1);
+        let message = if dependent_count == 0 {
+            format!("Clear execution for cell {}? SQL will be kept.", cell_id.0)
+        } else {
+            format!(
+                "Clear cell {} and {} dependent execution(s)? SQL and lineage will be kept.",
+                cell_id.0, dependent_count
+            )
+        };
+        self.confirm_prompt = Some(ConfirmPrompt::new(
+            message,
+            ConfirmContext::ClearNotebookCellExecution { cell_id: cell_id.0 },
+        ));
+    }
+
+    fn clear_notebook_cell_execution(&mut self, cell_id: CellId) {
+        if self.db.running {
+            self.last_status = Some("Wait for the running query before clearing cells".to_string());
+            return;
+        }
+
+        let affected = self.notebook_execution_tree(cell_id);
+        let mut handles = self
+            .retained_versions
+            .iter()
+            .filter_map(|(version, handle)| {
+                affected.contains(&version.source_cell).then_some(*handle)
+            })
+            .collect::<HashSet<_>>();
+        handles.extend(self.notebook.cells.iter().filter_map(|cell| {
+            affected
+                .contains(&cell.id)
+                .then(|| {
+                    cell.output
+                        .as_ref()?
+                        .retained
+                        .as_ref()
+                        .map(|value| value.handle)
+                })
+                .flatten()
+        }));
+
+        self.retained_versions.retain(|version, handle| {
+            !affected.contains(&version.source_cell) && !handles.contains(handle)
+        });
+        self.pg_snapshot_order
+            .retain(|handle| !handles.contains(handle));
+        let snapshots = handles
+            .into_iter()
+            .filter_map(|handle| self.pg_snapshots.remove(&handle))
+            .collect::<Vec<_>>();
+
+        for cell in &mut self.notebook.cells {
+            if affected.contains(&cell.id) {
+                cell.output = None;
+                cell.failure = None;
+                cell.execution = CellExecutionState::NeverRun;
+                cell.bound_connection_generation = None;
+                cell.output_collapsed = false;
+            }
+        }
+
+        if let Some(client) = self.db.client.clone().filter(|_| !snapshots.is_empty()) {
+            self.rt.spawn(async move {
+                let guard = client.lock().await;
+                for snapshot in snapshots {
+                    let physical_name = snapshot.physical_name.replace('"', "\"\"");
+                    let _ = guard
+                        .batch_execute(&format!("DROP TABLE IF EXISTS pg_temp.\"{physical_name}\""))
+                        .await;
+                }
+            });
+        }
+
+        let dependent_count = affected.len().saturating_sub(1);
+        self.last_status = Some(if dependent_count == 0 {
+            format!("Cleared execution for cell {}", cell_id.0)
+        } else {
+            format!(
+                "Cleared cell {} and {} dependent execution(s)",
+                cell_id.0, dependent_count
+            )
+        });
     }
 
     fn refresh_schema(&mut self) {
@@ -9214,6 +10327,8 @@ impl App {
                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
                 WHERE c.relkind IN ('r', 'v', 'm')
                     AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                    AND n.nspname NOT LIKE 'pg_temp_%'
+                    AND n.nspname NOT LIKE 'pg_toast_temp_%'
                     AND a.attnum > 0
                     AND NOT a.attisdropped
                 ORDER BY n.nspname, c.relname, a.attnum
@@ -9446,8 +10561,406 @@ impl App {
         Ok(())
     }
 
+    fn open_active_external_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        if self.workspace_mode != WorkspaceMode::Notebook {
+            return self.open_in_external_editor(terminal);
+        }
+        let index = self.notebook.selected_index();
+        let before = self.notebook.cells[index].source();
+        let mut notebook_editor = std::mem::take(&mut self.notebook.cells[index].editor);
+        std::mem::swap(&mut self.editor, &mut notebook_editor);
+        let result = self.open_in_external_editor(terminal);
+        std::mem::swap(&mut self.editor, &mut notebook_editor);
+        self.notebook.cells[index].editor = notebook_editor;
+        if self.notebook.cells[index].source() != before {
+            self.notebook.cells[index].mark_edited();
+        }
+        result
+    }
+
     fn execute_query(&mut self) {
         self.execute_query_text(self.editor.text(), QueryExecutionKind::New);
+    }
+
+    fn invalidate_active_execution(&mut self, reason: &str) {
+        if let Some(active) = self.active_execution.take() {
+            if let ExecutionTarget::Notebook(cell_id) = active.context.target {
+                if let Some(cell) = self.notebook.cell_mut(cell_id) {
+                    cell.execution = CellExecutionState::Cancelled;
+                    cell.failure = Some(reason.to_string());
+                }
+            }
+        }
+        self.db.running = false;
+        self.active_query_kind = None;
+        self.query_ui.clear();
+    }
+
+    fn invalidate_pg_snapshots(&mut self, drop_relations: bool) {
+        let snapshots = std::mem::take(&mut self.pg_snapshots);
+        self.retained_versions.clear();
+        self.pg_snapshot_order.clear();
+        for cell in &mut self.notebook.cells {
+            if let Some(output) = &mut cell.output {
+                if output.retained.is_some() {
+                    output.refinement = RefinementAvailability::Unavailable(
+                        RefinementUnavailableReason::ConnectionChanged,
+                    );
+                }
+            }
+        }
+        if !drop_relations || snapshots.is_empty() {
+            return;
+        }
+        let Some(client) = self.db.client.clone() else {
+            return;
+        };
+        self.rt.spawn(async move {
+            let guard = client.lock().await;
+            for snapshot in snapshots.into_values() {
+                let physical_name = snapshot.physical_name.replace('"', "\"\"");
+                let _ = guard
+                    .batch_execute(&format!("DROP TABLE IF EXISTS pg_temp.\"{physical_name}\""))
+                    .await;
+            }
+        });
+    }
+
+    fn register_pg_snapshot(
+        &mut self,
+        retained: &super::refinement::RetainedResult,
+        snapshot: PgTempSnapshot,
+    ) {
+        self.pg_snapshot_order.push_back(retained.handle);
+        self.retained_versions
+            .insert(retained.version, retained.handle);
+        self.pg_snapshots.insert(retained.handle, snapshot);
+
+        loop {
+            let total_bytes: u64 = self
+                .pg_snapshots
+                .values()
+                .map(|snapshot| snapshot.byte_size)
+                .sum();
+            let over_count =
+                self.pg_snapshots.len() > self.config.notebook.max_retained_snapshots.max(1);
+            let over_bytes = total_bytes > self.config.notebook.snapshot_total_bytes;
+            if !over_count && !over_bytes {
+                break;
+            }
+            let Some(handle) = self.pg_snapshot_order.pop_front() else {
+                break;
+            };
+            let Some(evicted) = self.pg_snapshots.remove(&handle) else {
+                continue;
+            };
+            self.retained_versions
+                .retain(|_, candidate| *candidate != handle);
+            for cell in &mut self.notebook.cells {
+                if let Some(output) = &mut cell.output {
+                    if output.retained.as_ref().map(|value| value.handle) == Some(handle) {
+                        output.refinement = RefinementAvailability::Unavailable(
+                            RefinementUnavailableReason::SnapshotEvicted,
+                        );
+                    }
+                }
+            }
+            if let Some(client) = self.db.client.clone() {
+                self.rt.spawn(async move {
+                    let guard = client.lock().await;
+                    let physical_name = evicted.physical_name.replace('"', "\"\"");
+                    let _ = guard
+                        .batch_execute(&format!("DROP TABLE IF EXISTS pg_temp.\"{physical_name}\""))
+                        .await;
+                });
+            }
+        }
+    }
+
+    fn latest_notebook_result_version(&self, source_cell: Option<CellId>) -> Option<ResultVersion> {
+        self.pg_snapshot_order.iter().rev().find_map(|handle| {
+            let snapshot = self.pg_snapshots.get(handle)?;
+            if snapshot.connection_generation != self.connect_generation {
+                return None;
+            }
+
+            self.notebook.cells.iter().find_map(|cell| {
+                let output = cell.output.as_ref()?;
+                let retained = output.retained.as_ref()?;
+                let RefinementAvailability::Available(available) = &output.refinement else {
+                    return None;
+                };
+                (retained.handle == *handle
+                    && available.handle == *handle
+                    && retained.connection_generation == self.connect_generation
+                    && self.retained_versions.get(&retained.version) == Some(handle)
+                    && source_cell
+                        .is_none_or(|source_cell| retained.version.source_cell == source_cell))
+                .then_some(retained.version)
+            })
+        })
+    }
+
+    fn execute_notebook_cell(&mut self) {
+        self.execute_notebook_cell_with_snapshot(true);
+    }
+
+    fn notebook_snapshot_for_version(&self, version: ResultVersion) -> Option<PgTempSnapshot> {
+        let handle = self.retained_versions.get(&version)?;
+        let snapshot = self.pg_snapshots.get(handle)?;
+        (snapshot.connection_generation == self.connect_generation).then(|| snapshot.clone())
+    }
+
+    fn resolve_notebook_result_dependency(
+        &self,
+        source: &str,
+        dependency: Option<ResultVersion>,
+    ) -> Result<Option<(ResultVersion, PgTempSnapshot)>, String> {
+        let reference = logical_result_reference(source)?;
+
+        match reference {
+            Some(LogicalResultReference::Latest) => self
+                .latest_notebook_result_version(None)
+                .and_then(|version| {
+                    self.notebook_snapshot_for_version(version)
+                        .map(|snapshot| (version, snapshot))
+                })
+                .map(Some)
+                .ok_or_else(|| {
+                    "No retained result is available for @result. Run a source cell first"
+                        .to_string()
+                }),
+            Some(LogicalResultReference::Cell(source_cell)) => {
+                if dependency.is_some_and(|version| version.source_cell != source_cell) {
+                    return Err("logical result reference does not match cell dependency".into());
+                }
+
+                if let Some((version, snapshot)) = dependency.and_then(|version| {
+                    self.notebook_snapshot_for_version(version)
+                        .map(|snapshot| (version, snapshot))
+                }) {
+                    return Ok(Some((version, snapshot)));
+                }
+
+                self.latest_notebook_result_version(Some(source_cell))
+                    .and_then(|version| {
+                        self.notebook_snapshot_for_version(version)
+                            .map(|snapshot| (version, snapshot))
+                    })
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!(
+                            "Result for cell {} is unavailable. Run cell {} first",
+                            source_cell.0, source_cell.0
+                        )
+                    })
+            }
+            None => dependency
+                .map(|version| {
+                    self.notebook_snapshot_for_version(version)
+                        .map(|snapshot| (version, snapshot))
+                        .ok_or_else(|| {
+                            "Source snapshot is unavailable. Run the source cell first".to_string()
+                        })
+                })
+                .transpose(),
+        }
+    }
+
+    fn execute_notebook_cell_with_snapshot(&mut self, allow_snapshot: bool) {
+        if self.db.running {
+            self.last_status = Some("A query is already running".to_string());
+            return;
+        }
+
+        let (cell_id, source_revision, logical_query, dependency) = {
+            let cell = self.notebook.selected_cell();
+            if cell
+                .bound_connection_generation
+                .is_some_and(|generation| generation != self.connect_generation)
+            {
+                self.last_status = Some(
+                    "Cell belongs to a previous connection; use :rebind to run it here".to_string(),
+                );
+                return;
+            }
+            (cell.id, cell.revision, cell.source(), cell.dependency)
+        };
+        if logical_query.trim().is_empty() {
+            self.last_status = Some("No query to run".to_string());
+            return;
+        }
+        let is_mongo = self.db.kind == Some(DbKind::Mongo);
+        if is_mongo && self.db.mongo_client.is_none() || !is_mongo && self.db.client.is_none() {
+            self.last_error =
+                Some("Not connected. Use :connect <url> or select a connection first.".to_string());
+            return;
+        }
+        let resolved_dependency =
+            match self.resolve_notebook_result_dependency(&logical_query, dependency) {
+                Ok(dependency) => dependency,
+                Err(error) => {
+                    if let Some(cell) = self.notebook.cell_mut(cell_id) {
+                        cell.execution = CellExecutionState::Failed;
+                        cell.failure = Some(error);
+                    }
+                    self.last_status = Some(format!("Notebook cell {} failed", cell_id.0));
+                    return;
+                }
+            };
+        let (query, source_snapshot) = if let Some((version, snapshot)) = resolved_dependency {
+            match compile_logical_reference(
+                &logical_query,
+                version,
+                &snapshot.physical_name,
+                &snapshot.public_columns,
+            ) {
+                Ok(compiled) => {
+                    self.notebook.selected_cell_mut().dependency = Some(version);
+                    (compiled, Some(snapshot))
+                }
+                Err(error) => {
+                    if let Some(cell) = self.notebook.cell_mut(cell_id) {
+                        cell.execution = CellExecutionState::Failed;
+                        cell.failure = Some(error);
+                    }
+                    self.last_status = Some(format!("Notebook cell {} failed", cell_id.0));
+                    return;
+                }
+            }
+        } else {
+            (logical_query.clone(), None)
+        };
+        if !is_mongo
+            && matches!(
+                classify_transaction_control(&query),
+                TransactionControl::Begin
+                    | TransactionControl::Commit
+                    | TransactionControl::CommitAndChain
+                    | TransactionControl::Rollback
+                    | TransactionControl::RollbackAndChain
+            )
+        {
+            self.last_status = Some(
+                "Transaction control is available in Classic mode for this release".to_string(),
+            );
+            return;
+        }
+
+        let context = ExecutionContext {
+            id: ExecutionId(self.next_execution_id),
+            target: ExecutionTarget::Notebook(cell_id),
+            source_revision,
+            connection_generation: self.connect_generation,
+        };
+        self.next_execution_id = self.next_execution_id.wrapping_add(1);
+        self.active_execution = Some(ActiveExecution {
+            context,
+            kind: QueryExecutionKind::New,
+            cancelling: false,
+        });
+        if let Some(cell) = self.notebook.cell_mut(cell_id) {
+            cell.execution = CellExecutionState::Running(context);
+            cell.failure = None;
+        }
+        self.notebook.ensure_trailing_draft();
+        self.db.running = true;
+        self.query_ui.start();
+        self.last_status = Some(format!("Running notebook cell {}...", cell_id.0));
+
+        let conn_info = self
+            .db
+            .conn_str
+            .as_ref()
+            .map(|connection| ConnectionInfo::parse(connection).format(50));
+        self.history.push(logical_query, conn_info);
+
+        let max_rows = effective_max_rows(self.config.connection.max_rows);
+        if is_mongo {
+            let Some(mongo_client) = self.db.mongo_client.clone() else {
+                return;
+            };
+            let database = self
+                .db
+                .mongo_database
+                .clone()
+                .unwrap_or_else(|| "admin".to_string());
+            let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel();
+            self.execute_query_mongo(mongo_client, database, query, max_rows, proxy_tx);
+            let tx = self.db_events_tx.clone();
+            self.rt.spawn(async move {
+                while let Some(event) = proxy_rx.recv().await {
+                    match event {
+                        DbEvent::QueryFinished { result } => {
+                            let _ = tx.send(DbEvent::NotebookQueryFinished {
+                                context,
+                                result,
+                                retained: None,
+                                snapshot: None,
+                            });
+                            break;
+                        }
+                        DbEvent::QueryError { error } => {
+                            let _ = tx.send(DbEvent::NotebookQueryError { context, error });
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            return;
+        }
+
+        let Some(client) = self.db.client.clone() else {
+            return;
+        };
+        let source_table = extract_table_from_query(&query);
+        let can_snapshot = allow_snapshot
+            && self.config.notebook.snapshot_mode == SnapshotMode::Auto
+            && self.db.transaction_state == TransactionState::Idle
+            && pg_snapshot::is_snapshot_candidate(&query);
+        if can_snapshot {
+            let handle = RetainedResultHandle(self.next_retained_handle);
+            self.next_retained_handle = self.next_retained_handle.wrapping_add(1);
+            let request = PgSnapshotRequest {
+                context,
+                query,
+                handle,
+                max_rows: self.config.notebook.snapshot_max_rows,
+                display_max_rows: max_rows,
+                max_bytes: self.config.notebook.snapshot_max_bytes,
+                timeout_secs: self.config.connection.query_timeout_secs,
+                source_snapshot,
+            };
+            let tx = self.db_events_tx.clone();
+            self.rt.spawn(async move {
+                match pg_snapshot::execute(client, request).await {
+                    Ok(snapshot_result) => {
+                        let _ = tx.send(DbEvent::NotebookQueryFinished {
+                            context,
+                            result: snapshot_result.query_result,
+                            retained: snapshot_result.retained,
+                            snapshot: snapshot_result.snapshot,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(DbEvent::NotebookQueryError { context, error });
+                    }
+                }
+            });
+            return;
+        }
+        self.execute_query_simple(
+            client,
+            query,
+            max_rows,
+            source_table,
+            self.db_events_tx.clone(),
+            Some(context),
+        );
     }
 
     fn execute_query_text(&mut self, query: String, kind: QueryExecutionKind) {
@@ -9549,7 +11062,7 @@ impl App {
             );
         } else {
             self.paged_query = None;
-            self.execute_query_simple(client, query, max_rows, source_table, tx);
+            self.execute_query_simple(client, query, max_rows, source_table, tx, None);
         }
     }
 
@@ -9829,6 +11342,7 @@ impl App {
         max_rows: usize,
         source_table: Option<String>,
         tx: mpsc::UnboundedSender<DbEvent>,
+        context: Option<ExecutionContext>,
     ) {
         let started = Instant::now();
 
@@ -9934,12 +11448,26 @@ impl App {
                         col_types,
                     };
 
-                    let _ = tx.send(DbEvent::QueryFinished { result });
+                    let event = if let Some(context) = context {
+                        DbEvent::NotebookQueryFinished {
+                            context,
+                            result,
+                            retained: None,
+                            snapshot: None,
+                        }
+                    } else {
+                        DbEvent::QueryFinished { result }
+                    };
+                    let _ = tx.send(event);
                 }
                 Err(e) => {
-                    let _ = tx.send(DbEvent::QueryError {
-                        error: format_pg_error(&e),
-                    });
+                    let error = format_pg_error(&e);
+                    let event = if let Some(context) = context {
+                        DbEvent::NotebookQueryError { context, error }
+                    } else {
+                        DbEvent::QueryError { error }
+                    };
+                    let _ = tx.send(event);
                 }
             }
         });
@@ -10353,6 +11881,9 @@ impl App {
         };
 
         self.last_status = Some("Cancelling...".to_string());
+        if let Some(active) = &mut self.active_execution {
+            active.cancelling = true;
+        }
 
         // If cancelling a paged fetch, clear the paged_query state.
         // This closes the fetch-more channel, causing the cursor task to exit
@@ -10404,6 +11935,7 @@ impl App {
                 self.db.mongo_database = None;
                 self.db.cancel_token = Some(cancel_token);
                 self.db.running = false;
+                self.db.transaction_state = TransactionState::Idle;
                 self.db.connected_with_tls = connected_with_tls;
                 self.query_ui.clear();
                 self.last_status = Some("Connected, loading schema...".to_string());
@@ -10426,7 +11958,7 @@ impl App {
                 self.db.mongo_database = Some(database.clone());
                 self.db.cancel_token = None;
                 self.db.running = false;
-                self.db.in_transaction = false;
+                self.db.transaction_state = TransactionState::Unknown;
                 self.db.connected_with_tls = true;
                 self.query_ui.clear();
                 self.last_status = Some(format!(
@@ -10442,6 +11974,8 @@ impl App {
                 if connect_generation != self.connect_generation {
                     return;
                 }
+                self.invalidate_active_execution("Connection failed");
+                self.invalidate_pg_snapshots(false);
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -10464,6 +11998,8 @@ impl App {
                 if connect_generation != self.connect_generation {
                     return;
                 }
+                self.invalidate_active_execution("Connection lost");
+                self.invalidate_pg_snapshots(false);
                 self.db.status = DbStatus::Error;
                 self.db.kind = None;
                 self.db.client = None;
@@ -10490,18 +12026,12 @@ impl App {
                 self.db.last_elapsed = Some(result.elapsed);
                 self.last_error = None; // Clear any previous error.
 
-                // Track transaction state based on command tag (skip for paged queries)
-                if !is_paged {
-                    if let Some(ref tag) = result.command_tag {
-                        let tag_upper = tag.to_uppercase();
-                        if tag_upper.starts_with("BEGIN") {
-                            self.db.in_transaction = true;
-                        } else if tag_upper.starts_with("COMMIT")
-                            || tag_upper.starts_with("ROLLBACK")
-                            || tag_upper.starts_with("END")
-                        {
-                            self.db.in_transaction = false;
-                        }
+                // Internal paging owns its own transaction. Only user-submitted,
+                // non-paged SQL contributes to the user transaction reducer.
+                if !is_paged && query_kind.is_some() {
+                    if let Some(sql) = self.last_executed_query.as_deref() {
+                        self.db.transaction_state =
+                            self.db.transaction_state.after_execution(sql, true);
                     }
                 }
 
@@ -10524,8 +12054,10 @@ impl App {
                     paged.loading = false;
                 }
 
-                // Move focus to grid to show results
-                self.set_focus(Focus::Grid);
+                // Completing Classic work must not steal Notebook focus after a mode switch.
+                if self.workspace_mode == WorkspaceMode::Classic {
+                    self.set_focus(Focus::Grid);
+                }
 
                 // A refresh may complete after the user has edited the buffer. Only
                 // mark a newly executed buffer as saved when it still matches the SQL
@@ -10548,7 +12080,90 @@ impl App {
                     self.last_status = Some("Ready".to_string());
                 }
             }
+            DbEvent::NotebookQueryFinished {
+                context,
+                result,
+                retained,
+                snapshot,
+            } => {
+                let is_current = self
+                    .active_execution
+                    .is_some_and(|active| active.context == context)
+                    && context.connection_generation == self.connect_generation;
+                if !is_current {
+                    return;
+                }
+                self.active_execution = None;
+                self.db.running = false;
+                self.query_ui.clear();
+
+                let ExecutionTarget::Notebook(cell_id) = context.target else {
+                    return;
+                };
+                if let (Some(retained), Some(snapshot)) = (&retained, snapshot) {
+                    self.register_pg_snapshot(retained, snapshot);
+                }
+                let Some(cell) = self.notebook.cell_mut(cell_id) else {
+                    return;
+                };
+                if cell.revision != context.source_revision {
+                    cell.execution = CellExecutionState::Succeeded;
+                    self.last_status = Some(format!(
+                        "Cell {} finished, but its source changed; output was ignored",
+                        cell_id.0
+                    ));
+                    return;
+                }
+
+                if self.db.kind == Some(DbKind::Postgres) {
+                    self.db.transaction_state = self
+                        .db
+                        .transaction_state
+                        .after_execution(&cell.source(), true);
+                }
+                cell.execution = CellExecutionState::Succeeded;
+                cell.bound_connection_generation = Some(context.connection_generation);
+                cell.output = Some(NotebookOutput {
+                    grid: GridModel::new(result.headers, result.rows)
+                        .with_source_table(result.source_table)
+                        .with_primary_keys(result.primary_keys)
+                        .with_col_types(result.col_types),
+                    grid_state: GridState::default(),
+                    command_tag: result.command_tag,
+                    elapsed: result.elapsed,
+                    error: None,
+                    refinement: retained.clone().map_or_else(
+                        || {
+                            let reason = if self.db.kind == Some(DbKind::Mongo) {
+                                RefinementUnavailableReason::UnsupportedBackend
+                            } else if self.config.notebook.snapshot_mode == SnapshotMode::Off {
+                                RefinementUnavailableReason::SnapshotDisabled
+                            } else if self.db.transaction_state != TransactionState::Idle {
+                                RefinementUnavailableReason::TransactionNotIdle
+                            } else if !pg_snapshot::is_snapshot_candidate(&cell.source()) {
+                                RefinementUnavailableReason::IneligibleStatement
+                            } else {
+                                RefinementUnavailableReason::ResultIncomplete
+                            };
+                            RefinementAvailability::Unavailable(reason)
+                        },
+                        RefinementAvailability::Available,
+                    ),
+                    retained,
+                    executed_revision: context.source_revision,
+                    truncated: result.truncated,
+                });
+                cell.editor.mark_saved();
+                self.last_error = None;
+                self.last_status = Some(format!("Notebook cell {} finished", cell_id.0));
+            }
             DbEvent::QueryError { error } => {
+                if self.active_query_kind.is_some() {
+                    if let Some(sql) = self.last_executed_query.as_deref() {
+                        self.db.transaction_state =
+                            self.db.transaction_state.after_execution(sql, false);
+                    }
+                }
                 self.db.running = false;
                 self.active_query_kind = None;
                 self.query_ui.clear();
@@ -10556,7 +12171,48 @@ impl App {
                 self.last_status = Some("Query error (see above)".to_string());
                 self.last_error = Some(error);
             }
+            DbEvent::NotebookQueryError { context, error } => {
+                let active = self
+                    .active_execution
+                    .filter(|active| active.context == context);
+                if active.is_none() || context.connection_generation != self.connect_generation {
+                    return;
+                }
+                let was_cancelled = active.is_some_and(|active| active.cancelling);
+                self.active_execution = None;
+                self.db.running = false;
+                self.query_ui.clear();
+                let ExecutionTarget::Notebook(cell_id) = context.target else {
+                    return;
+                };
+                if let Some(cell) = self.notebook.cell_mut(cell_id) {
+                    if cell.revision == context.source_revision
+                        && self.db.kind == Some(DbKind::Postgres)
+                    {
+                        self.db.transaction_state = self
+                            .db
+                            .transaction_state
+                            .after_execution(&cell.source(), false);
+                    }
+                    if was_cancelled {
+                        cell.execution = CellExecutionState::Cancelled;
+                        cell.failure = None;
+                    } else {
+                        cell.execution = CellExecutionState::Failed;
+                        cell.failure = Some(error);
+                    }
+                }
+                self.last_status = Some(if was_cancelled {
+                    format!("Notebook cell {} cancelled", cell_id.0)
+                } else {
+                    format!("Notebook cell {} failed", cell_id.0)
+                });
+            }
             DbEvent::QueryCancelled => {
+                if self.active_execution.is_some() {
+                    self.last_status = Some("Cancelling notebook cell...".to_string());
+                    return;
+                }
                 self.paged_query = None; // Clear paged query state on cancel
                 self.db.running = false;
                 self.active_query_kind = None;
@@ -10771,16 +12427,492 @@ impl App {
         }
     }
 
+    fn render_notebook_workspace(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        self.render_query_area = None;
+        self.render_grid_area = None;
+        self.render_notebook_cells.clear();
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new("").style(self.ui_theme.notebook_canvas),
+            area,
+        );
+
+        let selected_index = self.notebook.selected_index();
+        let composer_max_rows = self.config.notebook.composer_max_rows.max(1);
+        let output_preview_rows = self.config.notebook.output_preview_rows;
+        let available_height = area.height.saturating_sub(1) as usize;
+        let focused_result_layout = self.focus == Focus::Notebook
+            && self.notebook.focus == NotebookFocus::Result
+            && self.notebook.cells[selected_index]
+                .output
+                .as_ref()
+                .is_some_and(|_| !self.notebook.cells[selected_index].output_collapsed);
+        let (start, end) = if focused_result_layout {
+            notebook_focused_cell_window(
+                self.notebook.cells.len(),
+                selected_index,
+                available_height,
+            )
+        } else {
+            let mut start = selected_index;
+            let mut used_height = notebook_cell_render_height(
+                &self.notebook.cells[selected_index],
+                composer_max_rows,
+                output_preview_rows,
+            )
+            .min(available_height);
+            while start > 0 {
+                let previous_height = notebook_cell_render_height(
+                    &self.notebook.cells[start - 1],
+                    composer_max_rows,
+                    output_preview_rows,
+                );
+                if used_height.saturating_add(previous_height) > available_height {
+                    break;
+                }
+                start -= 1;
+                used_height = used_height.saturating_add(previous_height);
+            }
+            (start, self.notebook.cells.len())
+        };
+        self.notebook.scroll_cell = start;
+        let mut y = area.y.saturating_add(1);
+        let bottom = area.y.saturating_add(area.height);
+        let language = if self.db.kind == Some(DbKind::Mongo) {
+            "MONGOSH"
+        } else {
+            "SQL"
+        };
+        let notebook_focus = self.notebook.focus;
+        let selected_cell = self.notebook.selected;
+        let retained_versions = &self.retained_versions;
+        let pg_snapshots = &self.pg_snapshots;
+        let has_latest_result = self.latest_notebook_result_version(None).is_some();
+        let available_source_cells = self
+            .notebook
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                self.latest_notebook_result_version(Some(cell.id))
+                    .map(|_| cell.id)
+            })
+            .collect::<HashSet<_>>();
+        let mut render_areas = Vec::new();
+
+        for (index, cell) in self
+            .notebook
+            .cells
+            .iter_mut()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
+        {
+            if y >= bottom {
+                break;
+            }
+            let selected = cell.id == selected_cell;
+            let source_lines = cell.editor.textarea.lines();
+            let source_height = if focused_result_layout {
+                1
+            } else {
+                source_lines.len().clamp(1, composer_max_rows) as u16
+            };
+            let composer_height = if focused_result_layout {
+                if selected {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                source_height.saturating_add(3)
+            };
+            let remaining = bottom.saturating_sub(y);
+            if remaining < if focused_result_layout { 1 } else { 3 } {
+                break;
+            }
+            let composer_area = Rect {
+                x: area.x.saturating_add(1),
+                y,
+                width: area.width.saturating_sub(2),
+                height: composer_height.min(remaining),
+            };
+            let rail_area = Rect {
+                x: composer_area.x,
+                y: composer_area.y,
+                width: 1,
+                height: composer_area.height,
+            };
+            let composer_body = Rect {
+                x: composer_area.x.saturating_add(1),
+                y: composer_area.y,
+                width: composer_area.width.saturating_sub(1),
+                height: composer_area.height,
+            };
+            let output_toggle = cell.output.as_ref().and_then(|_| {
+                (composer_body.width >= 3).then_some(Rect::new(
+                    composer_body.right().saturating_sub(2),
+                    composer_body.y,
+                    1,
+                    1,
+                ))
+            });
+            let accent = if selected {
+                self.ui_theme.accent
+            } else {
+                self.ui_theme.text_muted
+            };
+            let rail = "┃\n".repeat(composer_area.height as usize);
+            frame.render_widget(
+                Paragraph::new(rail).style(
+                    self.ui_theme
+                        .notebook_rail
+                        .fg(accent)
+                        .bg(self.ui_theme.bg_elevated),
+                ),
+                rail_area,
+            );
+
+            let live_dependency = cell.dependency.is_some_and(|version| {
+                retained_versions
+                    .get(&version)
+                    .and_then(|handle| pg_snapshots.get(handle))
+                    .is_some_and(|snapshot| {
+                        snapshot.connection_generation == self.connect_generation
+                    })
+            });
+            let source_available = match logical_result_reference(&cell.source()) {
+                Ok(Some(LogicalResultReference::Latest)) => has_latest_result,
+                Ok(Some(LogicalResultReference::Cell(source_cell))) => {
+                    cell.dependency
+                        .is_none_or(|dependency| dependency.source_cell == source_cell)
+                        && (live_dependency || available_source_cells.contains(&source_cell))
+                }
+                Ok(None) => cell.dependency.is_none() || live_dependency,
+                Err(_) => true,
+            };
+            let state = match cell.execution {
+                CellExecutionState::NeverRun if cell.is_empty() => "DRAFT",
+                CellExecutionState::NeverRun if !source_available => "SOURCE UNAVAILABLE",
+                CellExecutionState::NeverRun => "NEEDS RUN",
+                CellExecutionState::Running(_) => "RUNNING",
+                CellExecutionState::Succeeded if cell.is_dirty() => "DIRTY",
+                CellExecutionState::Succeeded => "SUCCEEDED",
+                CellExecutionState::Failed => "FAILED",
+                CellExecutionState::Cancelled => "CANCELLED",
+            };
+            let header_style = if cell.is_dirty() {
+                self.ui_theme.notebook_stale
+            } else {
+                Style::default().fg(accent)
+            }
+            .add_modifier(Modifier::BOLD);
+            let focus_label = if selected {
+                match notebook_focus {
+                    NotebookFocus::Cell => " · CELL",
+                    NotebookFocus::Editor => " · EDITOR",
+                    NotebookFocus::Result => " · RESULT",
+                }
+            } else {
+                ""
+            };
+            let dependency = cell.dependency.map_or_else(String::new, |version| {
+                format!(
+                    " · from cell {}/run {}",
+                    version.source_cell.0, version.source_execution.0
+                )
+            });
+            let output_summary = cell.output.as_ref().map_or_else(String::new, |output| {
+                format!(
+                    " · {}",
+                    notebook_output_summary(output, cell.output_is_stale(), focused_result_layout)
+                )
+            });
+            let mut lines = Vec::with_capacity(source_lines.len().saturating_add(2));
+            let (cursor_row, cursor_col) = cell.editor.textarea.cursor();
+            let source_scroll = if selected && notebook_focus == NotebookFocus::Editor {
+                cell.editor_scroll = calculate_editor_scroll(
+                    cursor_row,
+                    cursor_col,
+                    cell.editor_scroll,
+                    source_height as usize,
+                    composer_body.width.saturating_sub(4) as usize,
+                );
+                cell.editor_scroll
+            } else {
+                (0, 0)
+            };
+            if focused_result_layout && !selected {
+                let source = notebook_source_summary(source_lines);
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "▸ CELL {} · {language} · {state}{dependency}{output_summary}{}",
+                        cell.id.0,
+                        if source.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {source}")
+                        }
+                    ),
+                    header_style,
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{}CELL {} · {language} · {state}{dependency}{focus_label}{}",
+                        if focused_result_layout { "▾ " } else { "" },
+                        cell.id.0,
+                        if focused_result_layout {
+                            output_summary.as_str()
+                        } else {
+                            ""
+                        }
+                    ),
+                    header_style,
+                )));
+                if focused_result_layout {
+                    lines.push(Line::from(notebook_source_summary(source_lines)));
+                } else {
+                    lines.extend(
+                        source_lines
+                            .iter()
+                            .skip(source_scroll.0 as usize)
+                            .take(composer_max_rows)
+                            .map(|line| {
+                                Line::from(
+                                    line.chars()
+                                        .skip(source_scroll.1 as usize)
+                                        .collect::<String>(),
+                                )
+                            }),
+                    );
+                    lines.push(Line::from(Span::styled(
+                        if selected {
+                            match notebook_focus {
+                                NotebookFocus::Cell => {
+                                    "j/k cells · h/l output · x clear · Enter edit · Ctrl+E run"
+                                }
+                                NotebookFocus::Editor => "Ctrl+E run · Esc cell mode",
+                                NotebookFocus::Result => {
+                                    "h/j/k/l table · / search · yy copy · Esc cell"
+                                }
+                            }
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(self.ui_theme.text_muted),
+                    )));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default().padding(Padding::new(
+                        2,
+                        if output_toggle.is_some() { 4 } else { 2 },
+                        0,
+                        0,
+                    )))
+                    .style(if selected {
+                        self.ui_theme.notebook_composer_focused
+                    } else {
+                        self.ui_theme.notebook_composer
+                    }),
+                composer_body,
+            );
+            if let Some(output_toggle) = output_toggle {
+                frame.render_widget(
+                    Paragraph::new(if cell.output_collapsed { "▸" } else { "▾" })
+                        .style(header_style),
+                    output_toggle,
+                );
+            }
+
+            if selected && notebook_focus == NotebookFocus::Editor {
+                let visible_row = cursor_row.saturating_sub(source_scroll.0 as usize);
+                let visible_col = cursor_col.saturating_sub(source_scroll.1 as usize);
+                if visible_row < composer_max_rows {
+                    let cursor_x = composer_body
+                        .x
+                        .saturating_add(2)
+                        .saturating_add(visible_col as u16)
+                        .min(composer_body.right().saturating_sub(1));
+                    let cursor_y = composer_body
+                        .y
+                        .saturating_add(1)
+                        .saturating_add(visible_row as u16)
+                        .min(composer_body.bottom().saturating_sub(1));
+                    frame.set_cursor_position((cursor_x, cursor_y));
+                }
+            }
+
+            y = y.saturating_add(composer_area.height);
+            let mut output_area = None;
+            let mut grid_area = None;
+            if let Some(failure) = cell
+                .failure
+                .as_ref()
+                .filter(|_| !focused_result_layout || selected)
+            {
+                let error_height =
+                    if focused_result_layout { 1 } else { 2 }.min(bottom.saturating_sub(y));
+                if error_height > 0 {
+                    frame.render_widget(
+                        Paragraph::new(format!("  ERROR · {failure}"))
+                            .style(Style::default().fg(self.ui_theme.error)),
+                        Rect::new(composer_body.x, y, composer_body.width, error_height),
+                    );
+                    y = y.saturating_add(error_height);
+                }
+            }
+            let output_is_stale = cell.output_is_stale();
+            if let Some(output) = cell.output.as_mut() {
+                if !cell.output_collapsed && (!focused_result_layout || selected) {
+                    let preview_rows = output.grid.rows.len().min(output_preview_rows);
+                    let desired_height = if output.grid.headers.is_empty() {
+                        1
+                    } else {
+                        preview_rows.max(1) as u16 + 2
+                    };
+                    let remaining_summaries = if focused_result_layout {
+                        end.saturating_sub(index + 1) as u16
+                    } else {
+                        0
+                    };
+                    let available_output_height =
+                        bottom.saturating_sub(y).saturating_sub(remaining_summaries);
+                    let output_height = if focused_result_layout {
+                        available_output_height
+                    } else {
+                        desired_height.min(available_output_height)
+                    };
+                    if output_height > 0 {
+                        let result_focused = selected && notebook_focus == NotebookFocus::Result;
+                        let visible_rows =
+                            output_height.saturating_sub(if focused_result_layout { 1 } else { 2 })
+                                as usize;
+                        if result_focused {
+                            let row_number_width = if self.config.display.show_row_numbers
+                                && !output.grid.rows.is_empty()
+                            {
+                                output.grid.rows.len().to_string().len() as u16 + 1
+                            } else {
+                                0
+                            };
+                            let marker_width = 3 + row_number_width;
+                            let scrollbar_width = u16::from(output.grid.rows.len() > visible_rows);
+                            output.grid_state.ensure_cursor_visible(
+                                visible_rows,
+                                output.grid.rows.len(),
+                                output.grid.headers.len(),
+                                &output.grid.col_widths,
+                                composer_body
+                                    .width
+                                    .saturating_sub(marker_width)
+                                    .saturating_sub(scrollbar_width),
+                            );
+                        }
+                        let area =
+                            Rect::new(composer_body.x, y, composer_body.width, output_height);
+                        output_area = Some(area);
+                        frame.render_widget(
+                            Block::default().style(self.ui_theme.notebook_output),
+                            area,
+                        );
+                        if !focused_result_layout {
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!(
+                                        "  {}",
+                                        notebook_output_summary(output, output_is_stale, false)
+                                    ),
+                                    self.ui_theme.notebook_meta,
+                                ))),
+                                Rect::new(area.x, area.y, area.width, 1),
+                            );
+                        }
+                        if !output.grid.headers.is_empty() {
+                            let viewport = Rect::new(
+                                area.x,
+                                area.y.saturating_add(u16::from(!focused_result_layout)),
+                                area.width,
+                                area.height
+                                    .saturating_sub(u16::from(!focused_result_layout)),
+                            );
+                            grid_area = Some(viewport);
+                            frame.render_widget(
+                                GridViewport {
+                                    model: &output.grid,
+                                    state: &output.grid_state,
+                                    theme: &self.ui_theme,
+                                    focused: result_focused,
+                                    show_row_numbers: self.config.display.show_row_numbers,
+                                    show_scrollbar: true,
+                                },
+                                viewport,
+                            );
+                        }
+                        y = y.saturating_add(output_height);
+                    }
+                }
+            }
+            if !focused_result_layout {
+                y = y.saturating_add(1);
+            }
+            render_areas.push(NotebookCellRenderArea {
+                cell_id: cell.id,
+                composer: composer_area,
+                output_toggle,
+                output: output_area,
+                grid: grid_area,
+                compact: focused_result_layout && !selected,
+            });
+        }
+        self.render_notebook_cells = render_areas;
+    }
+
     fn status_line(&self, width: u16) -> Paragraph<'static> {
-        let row_count = self.grid.rows.len();
-        let selected_count = self.grid_state.selected_rows.len();
+        let notebook_main_focused = self.focus == Focus::Notebook;
+        let notebook_output = (self.workspace_mode == WorkspaceMode::Notebook)
+            .then(|| self.notebook.selected_cell().output.as_ref())
+            .flatten();
+        let row_count = if self.workspace_mode == WorkspaceMode::Notebook {
+            notebook_output.map_or(0, |output| output.grid.rows.len())
+        } else {
+            self.grid.rows.len()
+        };
+        let col_count = if self.workspace_mode == WorkspaceMode::Notebook {
+            notebook_output.map_or(0, |output| output.grid.headers.len())
+        } else {
+            self.grid.headers.len()
+        };
+        let selected_count = if self.workspace_mode == WorkspaceMode::Notebook {
+            notebook_output.map_or(0, |output| output.grid_state.selected_rows.len())
+        } else {
+            self.grid_state.selected_rows.len()
+        };
         let cursor_row = if row_count == 0 {
             0
         } else {
-            self.grid_state.cursor_row.saturating_add(1)
+            notebook_output
+                .map_or(self.grid_state.cursor_row, |output| {
+                    output.grid_state.cursor_row
+                })
+                .saturating_add(1)
+        };
+        let cursor_col = if col_count == 0 {
+            0
+        } else {
+            notebook_output
+                .map_or(self.grid_state.cursor_col, |output| {
+                    output.grid_state.cursor_col
+                })
+                .saturating_add(1)
         };
 
-        let mode_text = format!(" {} ", self.mode.label());
+        let mode_text = if self.workspace_mode == WorkspaceMode::Notebook {
+            " NOTEBOOK ".to_string()
+        } else {
+            format!(" {} ", self.mode.label())
+        };
         let mode_style = Style::default()
             .fg(self.ui_theme.pill_fg)
             .bg(self.ui_theme.mode_accent(self.mode))
@@ -10816,7 +12948,22 @@ impl App {
         };
 
         // Row info
-        let row_info = format!("Row {}/{}", cursor_row, row_count);
+        let row_info = if self.workspace_mode == WorkspaceMode::Notebook {
+            if notebook_main_focused && self.notebook.focus == NotebookFocus::Result {
+                format!(
+                    "Row {}/{} · Col {}/{} · {} cells",
+                    cursor_row,
+                    row_count,
+                    cursor_col,
+                    col_count,
+                    self.notebook.cells.len()
+                )
+            } else {
+                format!("{} cells", self.notebook.cells.len())
+            }
+        } else {
+            format!("Row {}/{}", cursor_row, row_count)
+        };
 
         // Selection info (only if selected)
         let selection_info = if selected_count > 0 {
@@ -10826,7 +12973,14 @@ impl App {
         };
 
         // Query timing info
-        let timing_info = if let Some(ref tag) = self.db.last_command_tag {
+        let timing_info = if let Some(output) = notebook_output {
+            output
+                .command_tag
+                .as_ref()
+                .map(|tag| format!("{} ({}ms)", tag, output.elapsed.as_millis()))
+        } else if self.workspace_mode == WorkspaceMode::Notebook {
+            None
+        } else if let Some(ref tag) = self.db.last_command_tag {
             let time_part = self
                 .db
                 .last_elapsed
@@ -10859,7 +13013,19 @@ impl App {
         let focus_style = Style::default()
             .fg(self.ui_theme.accent)
             .add_modifier(Modifier::BOLD);
-        let navigation_hint = if self.focus == Focus::Query && self.mode != Mode::Normal {
+        let navigation_hint = if self.workspace_mode == WorkspaceMode::Notebook {
+            if notebook_main_focused {
+                match self.notebook.focus {
+                    NotebookFocus::Cell => "j/k cells · Enter edit · Ctrl+E run",
+                    NotebookFocus::Editor => "Ctrl+E run · Esc cell mode",
+                    NotebookFocus::Result => {
+                        "h/j/k/l table · / search · yy copy · Esc restore cells"
+                    }
+                }
+            } else {
+                "Esc notebook · Tab/S-Tab cycle · Ctrl/Alt-hjkl move"
+            }
+        } else if self.focus == Focus::Query && self.mode != Mode::Normal {
             "Alt-hjkl move · Esc then Tab/S-Tab cycle"
         } else {
             "Tab/S-Tab cycle · Ctrl/Alt-hjkl move · g… jump"
@@ -10873,8 +13039,24 @@ impl App {
             .segment(StatusSegment::new(mode_text, Priority::Critical).style(mode_style))
             // Critical: active pane (always shown)
             .segment(
-                StatusSegment::new(self.focus.label().to_string(), Priority::Critical)
-                    .style(focus_style),
+                StatusSegment::new(
+                    if self.workspace_mode == WorkspaceMode::Notebook && notebook_main_focused {
+                        format!(
+                            "{} · {}/{}",
+                            match self.notebook.focus {
+                                NotebookFocus::Cell => "CELL".to_string(),
+                                NotebookFocus::Editor => format!("EDITOR · {}", self.mode.label()),
+                                NotebookFocus::Result => "RESULT".to_string(),
+                            },
+                            self.notebook.selected_index() + 1,
+                            self.notebook.cells.len()
+                        )
+                    } else {
+                        self.focus.label().to_string()
+                    },
+                    Priority::Critical,
+                )
+                .style(focus_style),
             )
             // Critical: Connection info
             .segment(
@@ -10894,7 +13076,8 @@ impl App {
             )
             // High: Transaction indicator (if in transaction)
             .segment_if(
-                self.db.in_transaction,
+                self.db.transaction_state == TransactionState::Active
+                    || self.db.transaction_state == TransactionState::Failed,
                 StatusSegment::new("TXN", Priority::High)
                     .style(Style::default().fg(self.ui_theme.transaction)),
             )
@@ -11059,8 +13242,15 @@ impl App {
             PickerAction::Continue => false,
             PickerAction::Selected(entry) => {
                 // Load selected query into editor.
-                self.editor.set_text(entry.query);
-                self.editor.mark_saved(); // Mark as unmodified since it's loaded content
+                if self.workspace_mode == WorkspaceMode::Notebook {
+                    let cell = self.notebook.selected_cell_mut();
+                    cell.replace_source(entry.query);
+                    cell.editor.mark_saved();
+                    self.notebook.focus = NotebookFocus::Editor;
+                } else {
+                    self.editor.set_text(entry.query);
+                    self.editor.mark_saved(); // Mark as unmodified since it's loaded content
+                }
                 self.history_picker = None;
                 self.history_picker_pinned_only = false;
                 self.last_status = Some("Loaded from history".to_string());
@@ -11102,7 +13292,30 @@ fn grid_mouse_target(
     col_offset: usize,
     col_widths: &[u16],
 ) -> Option<GridMouseTarget> {
-    let inner = zone_inner(grid_area);
+    grid_viewport_mouse_target(
+        x,
+        y,
+        zone_inner(grid_area),
+        show_row_numbers,
+        row_count,
+        row_offset,
+        col_offset,
+        col_widths,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grid_viewport_mouse_target(
+    x: u16,
+    y: u16,
+    viewport: Rect,
+    show_row_numbers: bool,
+    row_count: usize,
+    row_offset: usize,
+    col_offset: usize,
+    col_widths: &[u16],
+) -> Option<GridMouseTarget> {
+    let inner = viewport;
 
     if inner.width == 0 || inner.height == 0 {
         return None;
@@ -11191,6 +13404,114 @@ fn hit_test_data_column(
     }
 
     None
+}
+
+fn notebook_source_summary(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn notebook_output_summary(output: &NotebookOutput, stale: bool, compact: bool) -> String {
+    let completeness = if output.retained.is_some() {
+        if compact {
+            "SNAPSHOT"
+        } else {
+            "SESSION SNAPSHOT · COMPLETE"
+        }
+    } else if output.truncated {
+        "PREVIEW · NO SNAPSHOT"
+    } else {
+        "COMPLETE · NO SNAPSHOT"
+    };
+    let extent = if output.truncated {
+        if compact {
+            format!("≥{} rows", output.grid.rows.len().saturating_add(1))
+        } else {
+            format!(
+                "{} fetched · at least {} total",
+                output.grid.rows.len(),
+                output.grid.rows.len().saturating_add(1)
+            )
+        }
+    } else {
+        format!("{} rows", output.grid.rows.len())
+    };
+    format!(
+        "{}{completeness} · {extent} · {}ms",
+        if stale { "STALE OUTPUT · " } else { "" },
+        output.elapsed.as_millis()
+    )
+}
+
+fn notebook_focused_cell_window(
+    cell_count: usize,
+    selected_index: usize,
+    available_height: usize,
+) -> (usize, usize) {
+    const MAX_SUMMARY_ROWS: usize = 6;
+    const MIN_ACTIVE_ROWS: usize = 4;
+
+    let summary_budget = cell_count
+        .saturating_sub(1)
+        .min(MAX_SUMMARY_ROWS)
+        .min(available_height.saturating_sub(MIN_ACTIVE_ROWS));
+    let mut before = selected_index.min(summary_budget.div_ceil(2));
+    let mut after = cell_count
+        .saturating_sub(selected_index + 1)
+        .min(summary_budget.saturating_sub(before));
+    let unused = summary_budget.saturating_sub(before + after);
+    before = before.saturating_add(selected_index.saturating_sub(before).min(unused));
+    after = after.saturating_add(
+        cell_count
+            .saturating_sub(selected_index + after + 1)
+            .min(summary_budget.saturating_sub(before + after)),
+    );
+
+    (
+        selected_index.saturating_sub(before),
+        selected_index + after + 1,
+    )
+}
+
+/// Calculate the height needed to render one inline notebook cell.
+fn notebook_cell_render_height(
+    cell: &NotebookCell,
+    composer_max_rows: usize,
+    output_preview_rows: usize,
+) -> usize {
+    let composer = cell
+        .editor
+        .textarea
+        .lines()
+        .len()
+        .clamp(1, composer_max_rows)
+        .saturating_add(3);
+    let error = usize::from(cell.failure.is_some()).saturating_mul(2);
+    let output = cell
+        .output
+        .as_ref()
+        .filter(|_| !cell.output_collapsed)
+        .map_or(0, |output| {
+            if output.grid.headers.is_empty() {
+                1
+            } else {
+                output
+                    .grid
+                    .rows
+                    .len()
+                    .min(output_preview_rows)
+                    .max(1)
+                    .saturating_add(2)
+            }
+        });
+    composer
+        .saturating_add(error)
+        .saturating_add(output)
+        .saturating_add(1)
 }
 
 /// Calculate the scroll offset needed to keep cursor visible in the editor viewport.
@@ -11354,6 +13675,1112 @@ mod tests {
     }
 
     // ========== Grid Mouse Tests ==========
+
+    fn notebook_test_app(runtime: &tokio::runtime::Runtime) -> App {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(GridModel::empty(), runtime.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.switch_workspace(WorkspaceMode::Notebook);
+        app
+    }
+
+    fn notebook_test_output(rows: usize) -> NotebookOutput {
+        NotebookOutput {
+            grid: GridModel::new(
+                vec!["value".to_string()],
+                (1..=rows).map(|row| vec![row.to_string()]).collect(),
+            ),
+            grid_state: GridState::default(),
+            command_tag: Some(format!("SELECT {rows}")),
+            elapsed: Duration::from_millis(4),
+            error: None,
+            refinement: RefinementAvailability::Unavailable(
+                RefinementUnavailableReason::ResultIncomplete,
+            ),
+            retained: None,
+            executed_revision: 0,
+            truncated: rows > 12,
+        }
+    }
+
+    fn install_notebook_test_snapshot(
+        app: &mut App,
+        cell_index: usize,
+        execution: u64,
+        handle: u64,
+    ) -> ResultVersion {
+        let cell_id = app.notebook.cells[cell_index].id;
+        let version = ResultVersion {
+            source_cell: cell_id,
+            source_execution: ExecutionId(execution),
+            source_revision: app.notebook.cells[cell_index].revision,
+        };
+        let handle = RetainedResultHandle(handle);
+        let retained = super::super::refinement::RetainedResult {
+            provider: super::super::refinement::RefinementProviderId::PostgresTemp,
+            handle,
+            version,
+            rows: 1,
+            retained_bytes: 16,
+            connection_generation: app.connect_generation,
+        };
+        let mut output = notebook_test_output(1);
+        output.refinement = RefinementAvailability::Available(retained.clone());
+        output.retained = Some(retained);
+        app.notebook.cells[cell_index].output = Some(output);
+        app.retained_versions.insert(version, handle);
+        app.pg_snapshots.insert(
+            handle,
+            PgTempSnapshot {
+                physical_name: format!("snapshot_{execution}"),
+                public_columns: vec!["value".to_string()],
+                relation_oid: execution as u32,
+                connection_generation: app.connect_generation,
+                backend_pid: 1,
+                row_count: 1,
+                byte_size: 16,
+            },
+        );
+        app.pg_snapshot_order.push_back(handle);
+        version
+    }
+
+    fn notebook_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| app.render_notebook_workspace(frame, frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut text = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                text.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn notebook_cell_colon_opens_command_prompt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+
+        assert!(app.command.active);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+    }
+
+    #[test]
+    fn notebook_cell_command_can_switch_back_to_classic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+
+        for character in "mode classic".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.workspace_mode, WorkspaceMode::Classic);
+        assert_eq!(app.focus, Focus::Query);
+    }
+
+    #[test]
+    fn notebook_meta_command_switches_to_visible_classic_results_without_losing_cells() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT 1".to_string());
+
+        app.execute_command("\\dt");
+
+        assert_eq!(app.workspace_mode, WorkspaceMode::Classic);
+        assert_eq!(app.notebook.cells[0].source(), "SELECT 1");
+    }
+
+    #[test]
+    fn notebook_sidebar_escape_returns_to_cell_focus_without_quit_prompt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::Notebook);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+        assert!(app.confirm_prompt.is_none());
+    }
+
+    #[test]
+    fn notebook_tab_reaches_sidebar_and_status_reports_schema_focus() {
+        use ratatui::widgets::Widget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.sidebar_visible = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::Sidebar(SidebarSection::Schema));
+        let area = Rect::new(0, 0, 160, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        app.status_line(area.width).render(area, &mut buffer);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("SCHEMA"));
+        assert!(text.contains("Esc notebook"));
+    }
+
+    #[test]
+    fn notebook_execute_and_advance_stays_on_cell_when_execution_is_rejected() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT 1".to_string());
+        app.notebook.ensure_trailing_draft();
+        let selected = app.notebook.selected;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.notebook.selected, selected);
+        assert!(!app.db.running);
+    }
+
+    #[test]
+    fn notebook_mouse_click_targets_composer_and_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(5));
+        app.notebook.ensure_trailing_draft();
+        notebook_buffer(&mut app, 100, 30);
+
+        let first = app.render_notebook_cells[0];
+        let result = first.output.unwrap();
+        app.handle_mouse_click(result.x + 1, result.y + 4);
+        assert_eq!(app.notebook.selected, first.cell_id);
+        assert_eq!(app.notebook.focus, NotebookFocus::Result);
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_row,
+            2
+        );
+
+        let draft = app.render_notebook_cells[1];
+        app.handle_mouse_click(draft.composer.x + 1, draft.composer.y + 1);
+        assert_eq!(app.notebook.selected, draft.cell_id);
+        assert_eq!(app.notebook.focus, NotebookFocus::Editor);
+    }
+
+    #[test]
+    fn notebook_cell_h_l_collapse_output_while_result_h_l_move_columns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT left_value, right_value".to_string());
+        let mut output = notebook_test_output(1);
+        output.grid = GridModel::new(
+            vec!["left_value".to_string(), "right_value".to_string()],
+            vec![vec!["left".to_string(), "right".to_string()]],
+        );
+        output.grid_state.cursor_col = 1;
+        app.notebook.cells[0].output = Some(output);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(app.notebook.cells[0].output_collapsed);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(!app.notebook.cells[0].output_collapsed);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+
+        app.notebook.focus = NotebookFocus::Result;
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_col,
+            0
+        );
+        assert!(!app.notebook.cells[0].output_collapsed);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_col,
+            1
+        );
+        assert!(!app.notebook.cells[0].output_collapsed);
+    }
+
+    #[test]
+    fn notebook_output_chevron_stays_visible_and_click_toggles_cell_output() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source(
+            "SELECT a_very_long_column_name, another_very_long_column_name FROM example"
+                .to_string(),
+        );
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(5));
+        let buffer = notebook_buffer(&mut app, 52, 20);
+        let toggle = app.render_notebook_cells[0].output_toggle.unwrap();
+
+        assert_eq!(buffer.cell((toggle.x, toggle.y)).unwrap().symbol(), "▾");
+        app.handle_mouse_click(toggle.x, toggle.y);
+        assert!(app.notebook.cells[0].output_collapsed);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+
+        let buffer = notebook_buffer(&mut app, 52, 20);
+        let toggle = app.render_notebook_cells[0].output_toggle.unwrap();
+        assert_eq!(buffer.cell((toggle.x, toggle.y)).unwrap().symbol(), "▸");
+        assert!(app.render_notebook_cells[0].output.is_none());
+        app.handle_mouse_click(toggle.x, toggle.y);
+        assert!(!app.notebook.cells[0].output_collapsed);
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+    }
+
+    #[test]
+    fn notebook_clear_execution_recurses_through_bound_and_restored_dependents() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1 AS value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        let root_older = install_notebook_test_snapshot(&mut app, 0, 1, 1);
+        let root_latest = install_notebook_test_snapshot(&mut app, 0, 2, 2);
+
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT value FROM @result_1".to_string());
+        app.notebook.selected_cell_mut().dependency = Some(root_older);
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        let child = install_notebook_test_snapshot(&mut app, 1, 3, 3);
+
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT value FROM @result_2".to_string());
+        app.notebook.selected_cell_mut().dependency = Some(child);
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Failed;
+        app.notebook.selected_cell_mut().failure = Some("old execution error".to_string());
+        app.notebook.selected_cell_mut().bound_connection_generation = Some(42);
+        app.notebook.selected_cell_mut().output_collapsed = true;
+        let grandchild = install_notebook_test_snapshot(&mut app, 2, 4, 4);
+
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT value FROM @result_3".to_string());
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Failed;
+        app.notebook.selected_cell_mut().failure = Some("restored execution error".to_string());
+
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT 99 AS unrelated".to_string());
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        let unrelated = install_notebook_test_snapshot(&mut app, 4, 5, 5);
+
+        let sources = app
+            .notebook
+            .cells
+            .iter()
+            .map(|cell| cell.source())
+            .collect::<Vec<_>>();
+        let dependencies = app
+            .notebook
+            .cells
+            .iter()
+            .map(|cell| cell.dependency)
+            .collect::<Vec<_>>();
+        app.notebook.selected = CellId(1);
+        app.notebook.focus = NotebookFocus::Cell;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+            Some(ConfirmContext::ClearNotebookCellExecution { cell_id: 1 })
+        ));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm_prompt.is_none());
+        assert!(app.notebook.cells[0].output.is_some());
+        assert!(app.pg_snapshots.contains_key(&RetainedResultHandle(1)));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(
+            app.notebook
+                .cells
+                .iter()
+                .map(|cell| cell.source())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        assert_eq!(
+            app.notebook
+                .cells
+                .iter()
+                .map(|cell| cell.dependency)
+                .collect::<Vec<_>>(),
+            dependencies
+        );
+        for cell in &app.notebook.cells[..4] {
+            assert!(cell.output.is_none());
+            assert!(cell.failure.is_none());
+            assert_eq!(cell.execution, CellExecutionState::NeverRun);
+            assert_eq!(cell.bound_connection_generation, None);
+            assert!(!cell.output_collapsed);
+        }
+        assert!(app.notebook.cells[4].output.is_some());
+        assert_eq!(
+            app.notebook.cells[4].execution,
+            CellExecutionState::Succeeded
+        );
+        for version in [root_older, root_latest, child, grandchild] {
+            assert!(!app.retained_versions.contains_key(&version));
+        }
+        assert!(app.retained_versions.contains_key(&unrelated));
+        for handle in 1..=4 {
+            assert!(!app.pg_snapshots.contains_key(&RetainedResultHandle(handle)));
+            assert!(!app
+                .pg_snapshot_order
+                .contains(&RetainedResultHandle(handle)));
+        }
+        assert!(app.pg_snapshots.contains_key(&RetainedResultHandle(5)));
+        assert!(app.pg_snapshot_order.contains(&RetainedResultHandle(5)));
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Cleared cell 1 and 3 dependent execution(s)")
+        );
+    }
+
+    #[test]
+    fn notebook_clear_execution_ignores_empty_cells_and_rejects_running_queries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.confirm_prompt.is_none());
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Selected cell has no execution to clear")
+        );
+
+        app.notebook.cells[0].output = Some(notebook_test_output(1));
+        app.db.running = true;
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.confirm_prompt.is_none());
+        assert!(app.notebook.cells[0].output.is_some());
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Wait for the running query before clearing cells")
+        );
+    }
+
+    #[test]
+    fn notebook_result_focus_renders_cursor_and_scrolls_beyond_preview() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(40));
+        app.notebook.focus = NotebookFocus::Result;
+
+        for _ in 0..20 {
+            app.handle_notebook_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let text = buffer_text(&notebook_buffer(&mut app, 100, 24));
+
+        assert!(
+            text.contains("21 >  21"),
+            "focused row should be visible: {text}"
+        );
+        assert!(
+            text.contains("#    value"),
+            "grid header is missing: {text}"
+        );
+        assert!(
+            text.contains("PREVIEW · NO SNAPSHOT · ≥41 rows · 4ms"),
+            "result metadata is missing from the active header: {text}"
+        );
+        assert!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .row_offset
+                > 0
+        );
+    }
+
+    #[test]
+    fn notebook_focused_result_expands_table_and_compacts_nearby_cells() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT previous_value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(40));
+        app.notebook.cells[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .executed_revision = app.notebook.cells[0].revision;
+        app.notebook.cells[0].output_collapsed = true;
+        app.notebook.select_or_create_draft();
+        app.notebook.selected_cell_mut().replace_source(
+            "SELECT value\nFROM example\nWHERE enabled\nORDER BY value".to_string(),
+        );
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        app.notebook.selected_cell_mut().output = Some(notebook_test_output(60));
+        app.notebook
+            .selected_cell_mut()
+            .output
+            .as_mut()
+            .unwrap()
+            .executed_revision = app.notebook.selected_cell().revision;
+        app.notebook.ensure_trailing_draft();
+        app.notebook.focus = NotebookFocus::Result;
+
+        let text = buffer_text(&notebook_buffer(&mut app, 120, 24));
+        let areas = &app.render_notebook_cells;
+        let previous = areas.iter().find(|area| area.cell_id == CellId(1)).unwrap();
+        let active = areas.iter().find(|area| area.cell_id == CellId(2)).unwrap();
+        let draft = areas.iter().find(|area| area.cell_id == CellId(3)).unwrap();
+
+        assert!(previous.compact);
+        assert_eq!(previous.composer.height, 1);
+        assert!(draft.compact);
+        assert_eq!(draft.composer.height, 1);
+        assert!(!active.compact);
+        assert_eq!(active.composer.height, 2);
+        assert!(active.grid.unwrap().height > 13);
+        assert!(
+            text.contains("SELECT value FROM example WHERE enabled ORDER BY value"),
+            "active SQL should be summarized on one line: {text}"
+        );
+        assert!(text.contains("▸ CELL 1 · SQL · SUCCEEDED"), "{text}");
+        assert!(text.contains("▸ CELL 3 · SQL · DRAFT"), "{text}");
+        assert!(!text.contains("h/j/k/l table"), "{text}");
+        assert!(app.notebook.cells[0].output_collapsed);
+    }
+
+    #[test]
+    fn notebook_compact_result_summary_click_switches_and_restores_its_table() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT previous_value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(30));
+        app.notebook.cells[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .grid_state
+            .cursor_row = 7;
+        app.notebook.cells[0].output_collapsed = true;
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT active_value".to_string());
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        app.notebook.selected_cell_mut().output = Some(notebook_test_output(30));
+        app.notebook.focus = NotebookFocus::Result;
+        notebook_buffer(&mut app, 100, 24);
+        let previous = app
+            .render_notebook_cells
+            .iter()
+            .find(|area| area.cell_id == CellId(1))
+            .copied()
+            .unwrap();
+
+        app.handle_mouse_click(previous.composer.x + 1, previous.composer.y);
+        notebook_buffer(&mut app, 100, 24);
+
+        assert_eq!(app.notebook.selected, CellId(1));
+        assert_eq!(app.notebook.focus, NotebookFocus::Result);
+        assert!(!app.notebook.cells[0].output_collapsed);
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_row,
+            7
+        );
+        let active = app
+            .render_notebook_cells
+            .iter()
+            .find(|area| area.cell_id == CellId(1))
+            .unwrap();
+        assert!(!active.compact);
+        assert!(active.grid.unwrap().height > 13);
+    }
+
+    #[test]
+    fn notebook_result_escape_restores_the_full_notebook_flow() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT previous_value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(2));
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT active_value".to_string());
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        app.notebook.selected_cell_mut().output = Some(notebook_test_output(2));
+        app.notebook.focus = NotebookFocus::Result;
+        notebook_buffer(&mut app, 100, 30);
+        assert!(app.render_notebook_cells[0].compact);
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        notebook_buffer(&mut app, 100, 30);
+
+        assert_eq!(app.notebook.focus, NotebookFocus::Cell);
+        assert!(app.render_notebook_cells.iter().all(|area| !area.compact));
+        assert!(app.render_notebook_cells[0].grid.is_some());
+        assert!(app.render_notebook_cells[1].grid.is_some());
+    }
+
+    #[test]
+    fn notebook_result_layout_stays_expanded_when_sidebar_has_focus() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT previous_value".to_string());
+        app.notebook.cells[0].output = Some(notebook_test_output(2));
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT active_value".to_string());
+        app.notebook.selected_cell_mut().output = Some(notebook_test_output(2));
+        app.notebook.focus = NotebookFocus::Result;
+        app.focus = Focus::Sidebar(SidebarSection::Schema);
+
+        notebook_buffer(&mut app, 100, 30);
+
+        assert!(app.render_notebook_cells.iter().all(|area| !area.compact));
+        assert!(app.render_notebook_cells[0].grid.is_some());
+    }
+
+    #[test]
+    fn notebook_focused_window_reserves_nearby_summaries_without_starving_table() {
+        assert_eq!(notebook_focused_cell_window(3, 1, 23), (0, 3));
+        assert_eq!(notebook_focused_cell_window(20, 10, 23), (7, 14));
+        assert_eq!(notebook_focused_cell_window(20, 0, 23), (0, 7));
+        assert_eq!(notebook_focused_cell_window(20, 19, 23), (13, 20));
+        assert_eq!(notebook_focused_cell_window(3, 1, 4), (1, 2));
+        assert_eq!(notebook_focused_cell_window(3, 1, 2), (1, 2));
+    }
+
+    #[test]
+    fn notebook_result_mouse_click_selects_exact_row_and_column() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT left_value, right_value".to_string());
+        let mut output = notebook_test_output(3);
+        output.grid = GridModel::new(
+            vec!["left_value".to_string(), "right_value".to_string()],
+            vec![
+                vec!["left-1".to_string(), "right-1".to_string()],
+                vec!["left-2".to_string(), "right-2".to_string()],
+                vec!["left-3".to_string(), "right-3".to_string()],
+            ],
+        );
+        app.notebook.cells[0].output = Some(output);
+        notebook_buffer(&mut app, 100, 30);
+
+        let grid = app.render_notebook_cells[0].grid.unwrap();
+        let widths = app.notebook.cells[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .grid
+            .col_widths
+            .clone();
+        let marker_width = 5;
+        let second_column_x = grid.x + marker_width + widths[0] + 1;
+        app.handle_mouse_click(second_column_x, grid.y);
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_col,
+            1
+        );
+
+        app.handle_mouse_click(second_column_x, grid.y + 3);
+        let state = &app.notebook.cells[0].output.as_ref().unwrap().grid_state;
+        assert_eq!(app.notebook.focus, NotebookFocus::Result);
+        assert_eq!((state.cursor_row, state.cursor_col), (2, 1));
+    }
+
+    #[test]
+    fn notebook_result_uses_grid_keymap_and_keeps_cell_navigation_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT left_value, right_value".to_string());
+        let mut output = notebook_test_output(20);
+        output.grid = GridModel::new(
+            vec!["left_value".to_string(), "right_value".to_string()],
+            (1..=20)
+                .map(|row| vec![format!("left-{row}"), format!("right-{row}")])
+                .collect(),
+        );
+        app.notebook.cells[0].output = Some(output);
+        app.notebook.focus = NotebookFocus::Result;
+        app.grid_keymap.bind(
+            KeyBinding::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            Action::MoveRight,
+        );
+
+        app.handle_notebook_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.handle_notebook_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.handle_notebook_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let state = &app.notebook.cells[0].output.as_ref().unwrap().grid_state;
+        assert_eq!((state.cursor_row, state.cursor_col), (6, 1));
+        assert!(state.selected_rows.contains(&5));
+
+        app.notebook.select_or_create_draft();
+        app.notebook.focus = NotebookFocus::Cell;
+        app.notebook.select_previous();
+        app.notebook.focus = NotebookFocus::Result;
+        let state = &app.notebook.cells[0].output.as_ref().unwrap().grid_state;
+        assert_eq!((state.cursor_row, state.cursor_col), (6, 1));
+        assert!(state.selected_rows.contains(&5));
+    }
+
+    #[test]
+    fn notebook_inspect_expands_output_and_row_detail_stays_read_only() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].output = Some(notebook_test_output(2));
+        app.notebook.cells[0].output_collapsed = true;
+
+        app.handle_notebook_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(app.notebook.focus, NotebookFocus::Result);
+        assert!(!app.notebook.cells[0].output_collapsed);
+
+        app.handle_notebook_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(app.row_detail.is_some());
+        app.handle_row_detail_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.row_detail.is_some());
+        assert!(!app.cell_editor.active);
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Notebook results are read-only")
+        );
+    }
+
+    #[test]
+    fn notebook_result_status_reports_row_and_column() {
+        use ratatui::widgets::Widget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        let mut output = notebook_test_output(3);
+        output.grid = GridModel::new(
+            vec!["left_value".to_string(), "right_value".to_string()],
+            vec![
+                vec!["left-1".to_string(), "right-1".to_string()],
+                vec!["left-2".to_string(), "right-2".to_string()],
+                vec!["left-3".to_string(), "right-3".to_string()],
+            ],
+        );
+        output.grid_state.cursor_row = 1;
+        output.grid_state.cursor_col = 1;
+        app.notebook.cells[0].output = Some(output);
+        app.notebook.focus = NotebookFocus::Result;
+        let area = Rect::new(0, 0, 200, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        app.status_line(area.width).render(area, &mut buffer);
+        let text = buffer_text(&buffer);
+
+        assert!(text.contains("Row 2/3 · Col 2/2 · 1 cells"), "{text}");
+        assert!(
+            text.contains("h/j/k/l table · / search · yy copy · Esc restore cells"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn notebook_latest_reference_rebinds_to_latest_published_result_each_run() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        let older = install_notebook_test_snapshot(&mut app, 0, 1, 1);
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT 2".to_string());
+        let latest = install_notebook_test_snapshot(&mut app, 1, 2, 2);
+
+        let orphan = ResultVersion {
+            source_cell: CellId(99),
+            source_execution: ExecutionId(3),
+            source_revision: 1,
+        };
+        let orphan_handle = RetainedResultHandle(3);
+        app.retained_versions.insert(orphan, orphan_handle);
+        app.pg_snapshots.insert(
+            orphan_handle,
+            PgTempSnapshot {
+                physical_name: "orphan".to_string(),
+                public_columns: vec!["value".to_string()],
+                relation_oid: 3,
+                connection_generation: app.connect_generation,
+                backend_pid: 1,
+                row_count: 1,
+                byte_size: 16,
+            },
+        );
+        app.pg_snapshot_order.push_back(orphan_handle);
+
+        let (version, snapshot) = app
+            .resolve_notebook_result_dependency("SELECT * FROM @result", Some(older))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(version, latest);
+        assert_eq!(snapshot.physical_name, "snapshot_2");
+    }
+
+    #[test]
+    fn notebook_numbered_reference_rebinds_restored_or_unbound_cell() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        let latest = install_notebook_test_snapshot(&mut app, 0, 2, 2);
+        let restored = ResultVersion {
+            source_cell: CellId(1),
+            source_execution: ExecutionId(1),
+            source_revision: 1,
+        };
+
+        for dependency in [None, Some(restored)] {
+            let (version, snapshot) = app
+                .resolve_notebook_result_dependency("SELECT * FROM @result_1", dependency)
+                .unwrap()
+                .unwrap();
+            assert_eq!(version, latest);
+            assert_eq!(snapshot.physical_name, "snapshot_2");
+        }
+    }
+
+    #[test]
+    fn notebook_numbered_reference_keeps_a_live_immutable_binding() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        let older = install_notebook_test_snapshot(&mut app, 0, 1, 1);
+        let _latest = install_notebook_test_snapshot(&mut app, 0, 2, 2);
+
+        let (version, snapshot) = app
+            .resolve_notebook_result_dependency("SELECT * FROM @result_1", Some(older))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(version, older);
+        assert_eq!(snapshot.physical_name, "snapshot_1");
+    }
+
+    #[test]
+    fn notebook_missing_result_reference_reports_which_source_to_run() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = notebook_test_app(&runtime);
+
+        assert_eq!(
+            app.resolve_notebook_result_dependency("SELECT * FROM @result", None)
+                .unwrap_err(),
+            "No retained result is available for @result. Run a source cell first"
+        );
+        assert_eq!(
+            app.resolve_notebook_result_dependency("SELECT * FROM @result_1", None)
+                .unwrap_err(),
+            "Result for cell 1 is unavailable. Run cell 1 first"
+        );
+    }
+
+    #[test]
+    fn notebook_result_wheel_moves_rows_without_switching_cells() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].output = Some(notebook_test_output(40));
+        app.notebook.ensure_trailing_draft();
+        app.notebook.focus = NotebookFocus::Result;
+        let selected = app.notebook.selected;
+
+        app.handle_mouse_scroll(3);
+
+        assert_eq!(app.notebook.selected, selected);
+        assert_eq!(app.notebook.focus, NotebookFocus::Result);
+        assert_eq!(
+            app.notebook.cells[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .grid_state
+                .cursor_row,
+            3
+        );
+    }
+
+    #[test]
+    fn notebook_long_editor_keeps_active_line_and_rail_visible() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.config.notebook.composer_max_rows = 8;
+        let source = (1..=14)
+            .map(|line| format!("SELECT {line} AS line_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.notebook.cells[0].replace_source(source);
+        app.notebook.cells[0]
+            .editor
+            .textarea
+            .move_cursor(CursorMove::Bottom);
+        app.notebook.focus = NotebookFocus::Editor;
+
+        let buffer = notebook_buffer(&mut app, 100, 24);
+        let text = buffer_text(&buffer);
+        let area = app.render_notebook_cells[0].composer;
+
+        assert!(
+            text.contains("SELECT 14 AS line_14"),
+            "active line is clipped: {text}"
+        );
+        assert!(!text.contains("SELECT 1 AS line_1 "));
+        assert_eq!(
+            (area.y..area.bottom())
+                .filter(|row| buffer.cell((area.x, *row)).unwrap().symbol() == "┃")
+                .count(),
+            area.height as usize
+        );
+    }
+
+    #[test]
+    fn notebook_selected_cell_stays_visible_after_tall_output() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].output = Some(notebook_test_output(40));
+        app.notebook.select_or_create_draft();
+        app.notebook
+            .selected_cell_mut()
+            .replace_source("SELECT 42 AS final_value".to_string());
+        app.notebook.selected_cell_mut().execution = CellExecutionState::Succeeded;
+        app.notebook.selected_cell_mut().output = Some(notebook_test_output(1));
+        let selected = app.notebook.selected;
+
+        let text = buffer_text(&notebook_buffer(&mut app, 60, 16));
+
+        assert!(
+            text.contains("SELECT 42 AS final_value"),
+            "selected cell vanished: {text}"
+        );
+        assert!(app
+            .render_notebook_cells
+            .iter()
+            .any(|area| area.cell_id == selected));
+    }
+
+    #[test]
+    fn notebook_failed_rerun_keeps_stale_output_visible() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        app.notebook.cells[0].execution = CellExecutionState::Failed;
+        app.notebook.cells[0].failure = Some("relation does not exist".to_string());
+        app.notebook.cells[0].output = Some(notebook_test_output(1));
+
+        let text = buffer_text(&notebook_buffer(&mut app, 100, 24));
+
+        assert!(text.contains("ERROR · relation does not exist"));
+        assert!(text.contains("STALE OUTPUT"));
+    }
+
+    #[test]
+    fn notebook_cell_ids_match_refinement_headers_after_insertion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        app.notebook.ensure_trailing_draft();
+        app.notebook
+            .insert_refinement(super::super::refinement::ResultVersion {
+                source_cell: CellId(1),
+                source_execution: ExecutionId(1),
+                source_revision: 1,
+            });
+
+        let text = buffer_text(&notebook_buffer(&mut app, 100, 30));
+
+        assert!(text.contains("CELL 3 · SQL · SOURCE UNAVAILABLE · from cell 1/run 1"));
+        assert!(text.contains("CELL 2 · SQL · DRAFT"));
+    }
+
+    #[test]
+    fn notebook_restored_reference_renders_runnable_after_source_is_rerun() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        app.notebook.ensure_trailing_draft();
+        app.notebook.insert_refinement(ResultVersion {
+            source_cell: CellId(1),
+            source_execution: ExecutionId(1),
+            source_revision: 1,
+        });
+
+        let unavailable = buffer_text(&notebook_buffer(&mut app, 100, 30));
+        assert!(unavailable.contains("CELL 3 · SQL · SOURCE UNAVAILABLE · from cell 1/run 1"));
+
+        let _latest = install_notebook_test_snapshot(&mut app, 0, 2, 2);
+        let runnable = buffer_text(&notebook_buffer(&mut app, 100, 30));
+        assert!(runnable.contains("CELL 3 · SQL · NEEDS RUN · from cell 1/run 1"));
+    }
+
+    #[test]
+    fn notebook_status_does_not_leak_classic_result_timing_or_selection() {
+        use ratatui::widgets::Widget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.grid = GridModel::new(vec!["classic".to_string()], vec![vec!["42".to_string()]]);
+        app.grid_state.selected_rows.insert(0);
+        app.db.last_command_tag = Some("CLASSIC SELECT 1".to_string());
+        app.db.last_elapsed = Some(Duration::from_secs(9));
+        let area = Rect::new(0, 0, 160, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        app.status_line(area.width).render(area, &mut buffer);
+        let text = buffer_text(&buffer);
+
+        assert!(!text.contains("CLASSIC SELECT 1"));
+        assert!(!text.contains("9000ms"));
+        assert!(!text.contains("1 sel"));
+    }
 
     #[test]
     fn test_grid_mouse_target_selects_column_from_header_and_body() {

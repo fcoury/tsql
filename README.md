@@ -16,6 +16,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 ## Features
 
 - **Full-screen TUI** - Split-pane interface with query editor and results grid
+- **Notebook workspace** - Build an ordered SQL narrative with durable inline outputs and PostgreSQL session-snapshot refinement
 - **Vim-style keybindings** - Navigate and edit with familiar modal commands
 - **Syntax highlighting** - SQL and JSON highlighting powered by tree-sitter
 - **Smart completion** - Schema-aware autocomplete for tables, columns, and keywords
@@ -71,6 +72,9 @@ Once connected:
 2. Press `Enter` to execute
 3. Use `Tab` / `Shift-Tab` to cycle panes, or `Ctrl-h/j/k/l` to move spatially
 4. Press `?` for help with all keybindings (type `/` inside the help popup to filter)
+
+Switch to the opt-in notebook workspace with `:notebook` or `:mode notebook`.
+Use `:mode classic` to return without discarding either workspace.
 
 ## Keybindings
 
@@ -158,6 +162,53 @@ editor. When it already contains a query, tsql asks for confirmation first.
 
 Yank commands operate on all selected rows when a selection is active, or the cursor row otherwise.
 
+### Notebook Workspace
+
+Notebook mode keeps one selected cell with Cell, Editor, and Result focus. PostgreSQL
+`SELECT`, `WITH`, `VALUES`, and `TABLE` results that fit the configured retention
+limits are captured once as session-local TEMP snapshots. Pressing `r` creates a
+dependent cell bound to that immutable result version; it does not rerun the source.
+MongoDB cells execute normally, but refinement is unavailable.
+
+Cell numbers are stable identities used by `@result_N`, so inserting or deleting
+cells can leave them out of visual sequence. `@result` uses the most recently
+completed refinable result, while `@result_N` uses the latest available result from
+cell `N` when a restored or loaded cell has no live binding. The chosen snapshot is
+pinned for that execution; existing live `@result_N` dependencies remain immutable.
+After restarting, rerun the source cell before running its dependent cell.
+
+| Key | Cell-focus action |
+| --- | --- |
+| `j` / `k` | Next / previous cell |
+| `Enter` / `e` | Enter the selected editor |
+| `Ctrl-e` | Execute in place |
+| `o` | Inspect the result |
+| `n` | Select or create the trailing draft |
+| `r` | Refine a complete retained PostgreSQL result |
+| `h` / `l` | Collapse / expand the selected result |
+| `z` | Collapse or expand output |
+| `x` | Clear the selected cell and dependent executions |
+| `Esc` | Return from Editor/Result to Cell focus |
+
+Mouse input is also supported: click a composer to focus its editor, click the right-edge
+`▾` / `▸` chevron to expand or collapse its result, click an inline result to select its row
+and column, and use the wheel to move within the focused region.
+Clearing an execution preserves the SQL in every affected cell so the chain can be
+rerun; a confirmation prompt lists how many dependent results will be cleared.
+
+Result focus uses the same navigable table as the Classic results grid. Use `h/j/k/l` or
+the arrow keys to move between cells, `gg/G` and `0/$` to jump between rows and columns,
+`/` and `n/N` to search, `Space` to select rows, the yank commands to copy, `+/-` or `=`
+to size a column, and `o` to open row detail. The active result expands to fill the
+workspace while other cells compact into one-line summaries. Notebook results are
+read-only; press `Esc` to restore the notebook flow and return to Cell focus.
+
+Snapshots last only for the current database session. Reconnects keep displayed
+output but disable refinement. Transaction/statement poolers are not compatible
+with cross-cell TEMP snapshots; set `snapshot_mode = "off"` for those connections.
+Metadata commands such as `:\\dt` open their results in the Classic grid; use
+`:notebook` to return to the preserved notebook workspace.
+
 ### Row Detail (`o` to open)
 
 | Key           | Action                             |
@@ -205,6 +256,11 @@ tsql --debug-keys --mouse
 | `:export csv\|json\|tsv <path>` | Export results      |
 | `:update [check\|status\|apply]` | Check/apply updates |
 | `:refresh`                      | Refresh focused schema or last query |
+| `:notebook` / `:mode notebook` | Switch to Notebook workspace |
+| `:mode classic`                | Switch to Classic workspace |
+| `:rebase`                      | Rebind a dependent cell to its source's latest snapshot |
+| `:rebind`                      | Allow the selected cell to run on the active connection |
+| `:run-without-snapshot`        | Explicitly retry a cell without retaining its result |
 | `:sbt` / `:sidebar-toggle`      | Toggle sidebar      |
 | `:q` / `:quit`                  | Quit                |
 | `:\dt`                          | List tables         |
@@ -236,6 +292,14 @@ theme = "one_dark"
 default_url = "postgres://localhost/mydb"
 # Enable 1Password CLI support for `password_onepassword` refs
 enable_onepassword = false
+
+[notebook]
+startup = false
+snapshot_mode = "auto" # use "off" with transaction/statement poolers
+snapshot_max_rows = 2000
+snapshot_max_bytes = 67108864
+snapshot_total_bytes = 134217728
+max_retained_snapshots = 8
 
 [updates]
 # Update checks + optional in-app apply for standalone installs

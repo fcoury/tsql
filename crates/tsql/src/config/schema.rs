@@ -23,6 +23,54 @@ pub struct Config {
     pub updates: UpdatesConfig,
     /// AI assistant settings
     pub ai: AiConfig,
+    /// Notebook workspace and snapshot retention settings.
+    pub notebook: NotebookConfig,
+}
+
+/// Notebook workspace and retained-result settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotebookConfig {
+    /// Start in Notebook instead of Classic workspace.
+    pub startup: bool,
+    /// Whether eligible PostgreSQL results should be retained automatically.
+    pub snapshot_mode: SnapshotMode,
+    /// Maximum complete row count retained for refinement.
+    pub snapshot_max_rows: usize,
+    /// Maximum size of one retained snapshot.
+    pub snapshot_max_bytes: u64,
+    /// Maximum aggregate size of retained snapshots.
+    pub snapshot_total_bytes: u64,
+    /// Maximum number of retained snapshots.
+    pub max_retained_snapshots: usize,
+    /// Maximum visible source rows in one composer.
+    pub composer_max_rows: usize,
+    /// Maximum result rows shown inline.
+    pub output_preview_rows: usize,
+}
+
+impl Default for NotebookConfig {
+    fn default() -> Self {
+        Self {
+            startup: false,
+            snapshot_mode: SnapshotMode::Auto,
+            snapshot_max_rows: 2_000,
+            snapshot_max_bytes: 64 * 1024 * 1024,
+            snapshot_total_bytes: 128 * 1024 * 1024,
+            max_retained_snapshots: 8,
+            composer_max_rows: 10,
+            output_preview_rows: 12,
+        }
+    }
+}
+
+/// Automatic snapshot behavior for notebook queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 /// Display-related settings
@@ -192,6 +240,9 @@ pub struct KeymapConfig {
     /// Custom keybindings for grid navigation
     #[serde(default)]
     pub grid: Vec<CustomKeyBinding>,
+    /// Custom keybindings for Notebook Cell focus.
+    #[serde(default)]
+    pub notebook: Vec<CustomKeyBinding>,
     /// Custom keybindings for sidebar navigation
     #[serde(default)]
     pub sidebar: Vec<CustomKeyBinding>,
@@ -209,6 +260,7 @@ impl Default for KeymapConfig {
             insert: Vec::new(),
             visual: Vec::new(),
             grid: Vec::new(),
+            notebook: Vec::new(),
             sidebar: Vec::new(),
             connection_form: Vec::new(),
         }

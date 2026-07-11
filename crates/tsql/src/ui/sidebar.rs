@@ -250,9 +250,9 @@ impl Sidebar {
             return;
         }
 
-        // Handle empty/not connected state
+        // Handle an empty cache (either disconnected or a database with no visible relations).
         if schema_items.is_empty() {
-            let empty = Paragraph::new("Connect to view schema")
+            let empty = Paragraph::new("No schema items · r refresh")
                 .block(block)
                 .style(Style::default().fg(theme.text_muted));
             frame.render_widget(empty, area);
@@ -566,6 +566,7 @@ mod tests {
         let first_row = row_text(buffer, 0);
         assert!(first_row.contains("CONNECTIONS"));
         assert!(row_text(buffer, schema_area.y).contains("SCHEMA"));
+        assert!(row_text(buffer, schema_area.y + 1).contains("No schema items"));
         assert_eq!(
             buffer.cell((0, connections_area.y + 1)).unwrap().fg,
             theme.accent

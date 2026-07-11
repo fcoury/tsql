@@ -11,10 +11,41 @@ use tempfile::NamedTempFile;
 use crate::config::config_dir;
 
 /// Current session file schema version.
-const SESSION_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 2;
+
+/// Persisted notebook cell state. Runtime outputs and snapshot handles are excluded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotebookCellSession {
+    /// Stable runtime cell identity used by persisted structural dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<u64>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub output_collapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<NotebookDependencySession>,
+}
+
+/// Persisted structural lineage to an immutable result version.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotebookDependencySession {
+    pub source_cell_id: u64,
+    pub source_execution_id: u64,
+    pub source_revision: u64,
+}
+
+/// Persisted notebook document state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotebookSession {
+    #[serde(default)]
+    pub cells: Vec<NotebookCellSession>,
+    #[serde(default)]
+    pub selected_index: usize,
+}
 
 /// Serializable session state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     /// Active connection name (if connected via saved connection).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -32,6 +63,31 @@ pub struct SessionState {
     /// Whether sidebar is visible (default: false to match App default).
     #[serde(default)]
     pub sidebar_visible: bool,
+
+    /// Last active workspace (`classic` or `notebook`).
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+
+    /// Notebook sources and document UI state.
+    #[serde(default)]
+    pub notebook: NotebookSession,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            connection_name: None,
+            editor_content: String::new(),
+            schema_expanded: Vec::new(),
+            sidebar_visible: false,
+            workspace: default_workspace(),
+            notebook: NotebookSession::default(),
+        }
+    }
+}
+
+fn default_workspace() -> String {
+    "classic".to_string()
 }
 
 /// The session file format with versioning.
@@ -168,6 +224,7 @@ mod tests {
                 vec!["public".to_string(), "users".to_string()],
             ],
             sidebar_visible: false,
+            ..SessionState::default()
         };
 
         save_session_to_path(&state, &path).unwrap();
@@ -215,6 +272,80 @@ mod tests {
         assert_eq!(loaded.editor_content, "SELECT 1");
         assert!(loaded.schema_expanded.is_empty());
         assert!(!loaded.sidebar_visible); // default false
+        assert_eq!(loaded.workspace, "classic");
+        assert!(loaded.notebook.cells.is_empty());
+    }
+
+    #[test]
+    fn test_notebook_state_round_trip_excludes_runtime_outputs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            workspace: "notebook".to_string(),
+            notebook: NotebookSession {
+                cells: vec![NotebookCellSession {
+                    cell_id: Some(3),
+                    source: "SELECT * FROM @result_1".to_string(),
+                    output_collapsed: true,
+                    dependency: Some(NotebookDependencySession {
+                        source_cell_id: 1,
+                        source_execution_id: 4,
+                        source_revision: 2,
+                    }),
+                }],
+                selected_index: 0,
+            },
+            ..SessionState::default()
+        };
+
+        save_session_to_path(&state, &path).unwrap();
+        let loaded = load_session_from_path(&path).unwrap();
+
+        assert_eq!(loaded.workspace, "notebook");
+        assert_eq!(loaded.notebook, state.notebook);
+    }
+
+    #[test]
+    fn test_v2_notebook_cells_without_ids_remain_compatible() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let content = r#"{
+            "version": 2,
+            "workspace": "notebook",
+            "notebook": {
+                "cells": [
+                    {"source": "SELECT 1"},
+                    {
+                        "source": "SELECT * FROM @result_1",
+                        "dependency": {
+                            "source_cell_id": 1,
+                            "source_execution_id": 4,
+                            "source_revision": 2
+                        }
+                    }
+                ],
+                "selected_index": 1
+            }
+        }"#;
+        fs::write(&path, content).unwrap();
+
+        let loaded = load_session_from_path(&path).unwrap();
+
+        assert_eq!(loaded.workspace, "notebook");
+        assert_eq!(loaded.notebook.selected_index, 1);
+        assert!(loaded
+            .notebook
+            .cells
+            .iter()
+            .all(|cell| cell.cell_id.is_none()));
+        assert_eq!(
+            loaded.notebook.cells[1].dependency,
+            Some(NotebookDependencySession {
+                source_cell_id: 1,
+                source_execution_id: 4,
+                source_revision: 2,
+            })
+        );
     }
 
     #[test]

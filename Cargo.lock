@@ -3609,6 +3609,8 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls-improved",
  "toml",
+ "tree-sitter",
+ "tree-sitter-sequel",
  "tui-syntax",
  "tui-textarea",
  "tui-tree-widget",

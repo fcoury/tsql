@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use tsql::app::App;
+use tsql::app::{App, WorkspaceMode};
 use tsql::config;
 use tsql::session::load_session;
 use tsql::ui::GridModel;
@@ -155,6 +155,7 @@ fn print_usage() {
     eprintln!("      --debug-keys  Print detected key/mouse events (for troubleshooting)");
     eprintln!("      --mouse       (with --debug-keys) Also print mouse events");
     eprintln!("      --safe-mode   Skip session reconnect and startup side effects");
+    eprintln!("      --notebook    Start in the notebook workspace");
     eprintln!("      --no-auto-connect");
     eprintln!("                    Alias for --safe-mode");
     eprintln!();
@@ -303,6 +304,7 @@ fn main() -> Result<()> {
     }
 
     let safe_mode = has_any_startup_option(&args, &["--safe-mode", "--no-auto-connect"]);
+    let notebook_mode = has_any_startup_option(&args, &["--notebook"]);
     let mut startup_warnings: Vec<String> = Vec::new();
 
     if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
@@ -371,6 +373,9 @@ fn main() -> Result<()> {
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
     let session_connection = app.apply_session_state(session);
+    if notebook_mode {
+        app.switch_workspace(WorkspaceMode::Notebook);
+    }
 
     // Auto-connect from session if no CLI/env connection was specified. Queue
     // it for after the first draw so keychain/1Password cannot black-screen

@@ -153,6 +153,51 @@ const SIDEBAR_SCHEMA: HelpSection = HelpSection::new(
     ],
 );
 
+const NOTEBOOK: HelpSection = HelpSection::new(
+    "Notebook - Cell Focus",
+    &[
+        KeyBinding::new("j/k or arrows", "Select next/previous cell"),
+        KeyBinding::new("gg / G, Home / End", "Select first/last cell"),
+        KeyBinding::new("PageUp/Down, Ctrl-u/d", "Move between cells by page"),
+        KeyBinding::new("Enter / e", "Focus the selected cell editor"),
+        KeyBinding::new("o", "Expand and inspect the selected result"),
+        KeyBinding::new("Ctrl+E", "Execute the selected cell"),
+        KeyBinding::new("E", "Execute cell and advance"),
+        KeyBinding::new("n", "Select or create the trailing draft"),
+        KeyBinding::new("r", "Refine a retained result snapshot"),
+        KeyBinding::new(
+            "@result / @result_N",
+            "Reference the latest result or cell N",
+        ),
+        KeyBinding::new("h / l", "Collapse / expand the selected result"),
+        KeyBinding::new("z", "Collapse/expand cell output"),
+        KeyBinding::new("x", "Clear cell and dependent executions"),
+        KeyBinding::new("dd / Delete", "Delete the selected cell"),
+        KeyBinding::new(":", "Open command prompt"),
+        KeyBinding::new("Esc", "Return from editor/result to cell focus"),
+    ],
+);
+
+const NOTEBOOK_RESULT: HelpSection = HelpSection::new(
+    "Notebook - Result Focus (read-only)",
+    &[
+        KeyBinding::new("o / click result", "Expand result and compact other cells"),
+        KeyBinding::new("h/j/k/l or arrows", "Navigate result cells"),
+        KeyBinding::new("gg / G, 0 / $", "First/last row or column"),
+        KeyBinding::new("PageUp/Down, Ctrl-u/d", "Move between rows by page"),
+        KeyBinding::new(
+            "Space / a / A",
+            "Toggle, select all, or invert row selection",
+        ),
+        KeyBinding::new("c, yy / yY", "Copy cell or yank row(s) as TSV"),
+        KeyBinding::new("yj, yc / yC, ym", "Yank row(s) as JSON, CSV, or Markdown"),
+        KeyBinding::new("/ then n / N", "Search and move between matches"),
+        KeyBinding::new("+ / -, =", "Resize or fit/collapse the current column"),
+        KeyBinding::new("o", "Open row detail"),
+        KeyBinding::new("Esc", "Restore notebook flow and cell focus"),
+    ],
+);
+
 const QUERY_NAVIGATION: HelpSection = HelpSection::new(
     "Query Editor - Navigation",
     &[
@@ -323,6 +368,8 @@ const ALL_SECTIONS: &[HelpSection] = &[
     SIDEBAR_CONNECTIONS,
     CONNECTION_MANAGER,
     SIDEBAR_SCHEMA,
+    NOTEBOOK,
+    NOTEBOOK_RESULT,
     QUERY_NAVIGATION,
     QUERY_EDITING,
     QUERY_VISUAL,
@@ -923,5 +970,74 @@ mod tests {
         assert_eq!(key_span.style.fg, theme.search_match.fg);
         assert_eq!(key_span.style.bg, theme.search_match.bg);
         assert!(key_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn notebook_section_lists_cell_bindings() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Notebook - Cell Focus")
+            .expect("notebook help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        assert_eq!(
+            keys,
+            [
+                "j/k or arrows",
+                "gg / G, Home / End",
+                "PageUp/Down, Ctrl-u/d",
+                "Enter / e",
+                "o",
+                "Ctrl+E",
+                "E",
+                "n",
+                "r",
+                "@result / @result_N",
+                "h / l",
+                "z",
+                "x",
+                "dd / Delete",
+                ":",
+                "Esc",
+            ]
+        );
+    }
+
+    #[test]
+    fn notebook_result_section_lists_table_bindings() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Notebook - Result Focus (read-only)")
+            .expect("notebook result help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        assert_eq!(
+            keys,
+            [
+                "o / click result",
+                "h/j/k/l or arrows",
+                "gg / G, 0 / $",
+                "PageUp/Down, Ctrl-u/d",
+                "Space / a / A",
+                "c, yy / yY",
+                "yj, yc / yC, ym",
+                "/ then n / N",
+                "+ / -, =",
+                "o",
+                "Esc",
+            ]
+        );
     }
 }

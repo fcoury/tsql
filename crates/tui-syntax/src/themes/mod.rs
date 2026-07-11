@@ -280,6 +280,31 @@ fg = "#9DA5B4"
 fg = "#DCDFE4"
 bg = "#2C313A"
 modifiers = ["bold"]
+
+["ui.notebook.canvas"]
+fg = "#DCDFE4"
+bg = "#282C34"
+
+["ui.notebook.composer"]
+fg = "#DCDFE4"
+bg = "#2C313A"
+
+["ui.notebook.composer.focused"]
+fg = "#DCDFE4"
+bg = "#333B49"
+
+["ui.notebook.rail"]
+fg = "#56B6C2"
+
+["ui.notebook.output"]
+fg = "#DCDFE4"
+bg = "#282C34"
+
+["ui.notebook.meta"]
+fg = "#9DA5B4"
+
+["ui.notebook.stale"]
+fg = "#E5C07B"
 "##;
 
 /// GitHub Light theme TOML.
@@ -546,4 +571,29 @@ fg = "#57606A"
 fg = "#1F2328"
 bg = "#EAEEF2"
 modifiers = ["bold"]
+
+["ui.notebook.canvas"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.notebook.composer"]
+fg = "#1F2328"
+bg = "#EAEEF2"
+
+["ui.notebook.composer.focused"]
+fg = "#1F2328"
+bg = "#DDE8F5"
+
+["ui.notebook.rail"]
+fg = "#0969DA"
+
+["ui.notebook.output"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.notebook.meta"]
+fg = "#57606A"
+
+["ui.notebook.stale"]
+fg = "#9A6700"
 "##;
