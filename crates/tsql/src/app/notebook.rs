@@ -425,6 +425,7 @@ impl NotebookState {
             self.cells[0].additional_dependencies.clear();
             self.cells[0].execution_history.clear();
             self.cells[0].execution = CellExecutionState::NeverRun;
+            self.cells[0].bound_connection_generation = None;
             return None;
         }
         let removed = self.cells.remove(index);
@@ -463,6 +464,7 @@ mod tests {
         cell.result_name = Some("recent_rows".to_string());
         cell.source_collapsed = true;
         cell.output_collapsed = true;
+        cell.bound_connection_generation = Some(42);
 
         assert!(notebook.remove_cell(cell_id).is_none());
         let cell = notebook.selected_cell();
@@ -471,6 +473,7 @@ mod tests {
         assert!(!cell.source_collapsed);
         assert!(!cell.output_collapsed);
         assert_eq!(cell.execution, CellExecutionState::NeverRun);
+        assert_eq!(cell.bound_connection_generation, None);
     }
 
     #[test]
