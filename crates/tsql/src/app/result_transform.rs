@@ -671,6 +671,7 @@ mod tests {
             "VALUES (1), (2)",
             "TABLE users",
             "SELECT '; FOR UPDATE' AS value /* ignored; */",
+            "SELECT foo$1 FROM (VALUES (1)) AS source(foo$1)",
         ] {
             assert!(
                 compile_result_transform(

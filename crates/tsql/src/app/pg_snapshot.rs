@@ -484,7 +484,7 @@ pub(crate) fn snapshot_eligibility(query: &str) -> SnapshotEligibility {
     if matches!(first, "VALUES" | "TABLE") {
         return SnapshotEligibility::Eligible(source.to_string());
     }
-    let parser_source = match sql_lexer::mask_comments(source) {
+    let parser_source = match parser_validation_source(source) {
         Ok(source) => source,
         Err(error) => return SnapshotEligibility::Invalid(error),
     };
@@ -546,13 +546,52 @@ pub(crate) fn is_snapshot_candidate(query: &str) -> bool {
 fn has_unbound_parameter(source: &str) -> bool {
     sql_lexer::scan(source).is_ok_and(|segments| {
         segments.into_iter().any(|segment| {
-            segment.kind == sql_lexer::SqlSegmentKind::Code
-                && source[segment.range]
-                    .as_bytes()
-                    .windows(2)
-                    .any(|pair| pair[0] == b'$' && pair[1].is_ascii_digit())
+            if segment.kind != sql_lexer::SqlSegmentKind::Code {
+                return false;
+            }
+            let code = &source[segment.range];
+            code.char_indices().any(|(index, character)| {
+                character == '$'
+                    && code
+                        .as_bytes()
+                        .get(index + 1)
+                        .is_some_and(u8::is_ascii_digit)
+                    && code[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|previous| !is_identifier_character(previous))
+            })
         })
     })
+}
+
+fn parser_validation_source(source: &str) -> Result<String, String> {
+    let masked = sql_lexer::mask_comments(source)?;
+    let mut normalized = String::with_capacity(masked.len());
+    // tree-sitter-sequel rejects PostgreSQL's valid identifier-internal `$` characters.
+    for segment in sql_lexer::scan(&masked)? {
+        let text = &masked[segment.range];
+        if segment.kind != sql_lexer::SqlSegmentKind::Code {
+            normalized.push_str(text);
+            continue;
+        }
+        let mut previous = None;
+        for character in text.chars() {
+            normalized.push(
+                if character == '$' && previous.is_some_and(is_identifier_character) {
+                    '_'
+                } else {
+                    character
+                },
+            );
+            previous = Some(character);
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
 }
 
 fn has_locking_clause(words: &[String]) -> bool {
@@ -794,6 +833,38 @@ mod tests {
             snapshot_eligibility("SELECT E'unterminated\\'"),
             SnapshotEligibility::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn distinguishes_postgres_identifier_dollars_from_unbound_parameters() {
+        for source in [
+            "SELECT foo$1",
+            "SELECT _x$2",
+            "SELECT café$3",
+            "SELECT '$1' AS literal",
+            "SELECT \"$2\" AS quoted",
+            "SELECT $$value $3$$ AS literal",
+            "SELECT 1 /* $4 */ -- $5\n",
+        ] {
+            assert!(!has_unbound_parameter(source), "false parameter: {source}");
+        }
+        for source in ["SELECT $1", "SELECT ($2)", "SELECT café$3, $4"] {
+            assert!(has_unbound_parameter(source), "missed parameter: {source}");
+        }
+    }
+
+    #[test]
+    fn normalizes_identifier_dollars_only_for_parser_validation() {
+        let source = "SELECT foo$1, _x$2, café$3, '$4', \"$5\", $$value $6$$ /* $7 */ -- $8\n";
+
+        assert_eq!(
+            parser_validation_source(source).unwrap(),
+            "SELECT foo_1, _x_2, café_3, '$4', \"$5\", $$value $6$$               \n"
+        );
+        assert_eq!(
+            snapshot_source("SELECT 1 AS foo$1, 2 AS _x$2, 3 AS café$3;").unwrap(),
+            "SELECT 1 AS foo$1, 2 AS _x$2, 3 AS café$3"
+        );
     }
 
     #[tokio::test]
