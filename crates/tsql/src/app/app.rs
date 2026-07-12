@@ -8282,7 +8282,8 @@ impl App {
             return;
         }
 
-        let format_name = parts[0].to_lowercase();
+        let format_token = parts[0];
+        let format_name = format_token.to_ascii_lowercase();
         let path = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
         if path.is_empty() {
@@ -8300,7 +8301,10 @@ impl App {
             "tsv" => NotebookExportFormat::Tsv,
             "sql" => NotebookExportFormat::Sql { table: sql_table },
             token if token.starts_with("sql:") => {
-                let table = token.trim_start_matches("sql:").trim();
+                let table = format_token
+                    .split_once(':')
+                    .map_or("", |(_, table)| table)
+                    .trim();
                 if table.is_empty() {
                     self.last_error = Some("SQL export table name cannot be empty".to_string());
                     return;
@@ -19422,6 +19426,48 @@ mod tests {
         assert!(selected[0]["actual_null"].is_null());
         assert_eq!(selected[0]["literal_null"], "NULL");
         assert_eq!(selected[0]["empty"], "");
+    }
+
+    #[test]
+    fn sql_export_preserves_explicit_table_case_in_classic_and_notebook_workspaces() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        for notebook in [false, true] {
+            let mut app = if notebook {
+                let mut app = notebook_test_app(&runtime);
+                app.notebook.cells[0].output = Some(notebook_test_output(1));
+                app
+            } else {
+                classic_result_transform_test_app(&runtime)
+            };
+            let path = dir.path().join(if notebook {
+                "notebook.sql"
+            } else {
+                "classic.sql"
+            });
+
+            app.handle_export_command(&format!("SqL:MySchema.MyTable {}", path.display()));
+
+            let exported = std::fs::read_to_string(&path).unwrap();
+            assert!(!exported.is_empty());
+            assert!(exported
+                .lines()
+                .all(|line| line.starts_with("INSERT INTO \"MySchema\".\"MyTable\" ")));
+        }
+
+        let mut app = classic_result_transform_test_app(&runtime);
+        let invalid_path = dir.path().join("invalid.sql");
+        app.handle_export_command(&format!("SQL: {}", invalid_path.display()));
+
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("SQL export table name cannot be empty")
+        );
+        assert!(!invalid_path.exists());
     }
 
     #[test]
