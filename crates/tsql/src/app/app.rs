@@ -14102,6 +14102,7 @@ impl App {
             }
             let before = notebook_grid_bytes(output);
             output.grid.rows.truncate(preview_rows);
+            output.grid.null_cells.truncate(preview_rows);
             output.grid_state.clamp_to_bounds(&output.grid);
             output.truncated = true;
             cell.output_collapsed = true;
@@ -19640,6 +19641,12 @@ mod tests {
             vec!["old-row-one-xxxxxxxx".to_string()],
             vec!["old-row-two-xxxxxxxx".to_string()],
         ];
+        app.notebook.cells[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .grid
+            .null_cells = vec![vec![false], vec![true]];
         app.notebook.select_or_create_draft();
         app.notebook
             .selected_cell_mut()
@@ -19664,6 +19671,21 @@ mod tests {
         );
         assert!(app.notebook.cells[0].output_collapsed);
         assert!(app.notebook.cells[0].output.as_ref().unwrap().truncated);
+        let older_grid = &mut app.notebook.cells[0].output.as_mut().unwrap().grid;
+        assert_eq!(older_grid.null_cells, vec![vec![false]]);
+        older_grid.append_rows_with_nulls(
+            vec![vec!["NULL".to_string()], vec!["NULL".to_string()]],
+            vec![vec![false], vec![true]],
+        );
+        assert!(!older_grid.cell_is_null(1, 0));
+        assert!(older_grid.cell_is_null(2, 0));
+        assert_eq!(
+            older_grid.rows_as_sql_inserts(&[1, 2], "result"),
+            concat!(
+                "INSERT INTO result (value) VALUES ('NULL');\n",
+                "INSERT INTO result (value) VALUES (NULL);"
+            )
+        );
         assert_eq!(
             app.notebook.cells[1]
                 .output
