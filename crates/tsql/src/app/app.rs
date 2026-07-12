@@ -10925,15 +10925,17 @@ impl App {
     fn workspace_has_unsaved_changes(&self) -> bool {
         match self.workspace_mode {
             WorkspaceMode::Classic => self.editor.is_modified(),
-            WorkspaceMode::Notebook => {
-                self.notebook_document_dirty
-                    || self
-                        .notebook
-                        .cells
-                        .iter()
-                        .any(|cell| cell.is_dirty() || cell.editor.is_modified())
-            }
+            WorkspaceMode::Notebook => self.notebook_has_unsaved_changes(),
         }
+    }
+
+    fn notebook_has_unsaved_changes(&self) -> bool {
+        self.notebook_document_dirty
+            || self
+                .notebook
+                .cells
+                .iter()
+                .any(|cell| cell.is_dirty() || cell.editor.is_modified())
     }
 
     fn handle_notebook_key(&mut self, key: KeyEvent) {
@@ -11702,7 +11704,7 @@ impl App {
             return;
         }
         let path = expand_user_path(args);
-        if self.workspace_has_unsaved_changes() {
+        if self.workspace_has_unsaved_changes() || self.notebook_has_unsaved_changes() {
             self.confirm_prompt = Some(ConfirmPrompt::new(
                 format!(
                     "You have unsaved changes. Open notebook '{}' anyway?",
@@ -19345,6 +19347,56 @@ mod tests {
     }
 
     #[test]
+    fn notebook_json_export_preserves_loaded_and_selected_sql_nulls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].output = Some(NotebookOutput {
+            grid: GridModel::new(
+                vec![
+                    "actual_null".to_string(),
+                    "literal_null".to_string(),
+                    "empty".to_string(),
+                ],
+                vec![
+                    vec!["value".to_string(), "NULL".to_string(), String::new()],
+                    vec!["NULL".to_string(), "NULL".to_string(), String::new()],
+                ],
+            )
+            .with_null_cells(vec![vec![false, false, false], vec![true, false, false]]),
+            ..notebook_test_output(2)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("full.json");
+        let selected_path = dir.path().join("selected.json");
+
+        app.handle_export_command(&format!("json {}", full_path.display()));
+        let full: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(full_path).unwrap()).unwrap();
+        assert_eq!(full[0]["actual_null"], "value");
+        assert!(full[1]["actual_null"].is_null());
+        assert_eq!(full[1]["literal_null"], "NULL");
+        assert_eq!(full[1]["empty"], "");
+
+        app.notebook.cells[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .grid_state
+            .selected_rows
+            .insert(1);
+        app.handle_export_command(&format!("json {}", selected_path.display()));
+        let selected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(selected_path).unwrap()).unwrap();
+        assert_eq!(selected.as_array().unwrap().len(), 1);
+        assert!(selected[0]["actual_null"].is_null());
+        assert_eq!(selected[0]["literal_null"], "NULL");
+        assert_eq!(selected[0]["empty"], "");
+    }
+
+    #[test]
     fn notebook_export_requires_live_snapshot_when_loaded_output_is_truncated() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -19917,6 +19969,46 @@ mod tests {
 
         assert_eq!(app.notebook.cells[0].source(), "SELECT 'keep me'");
         assert_eq!(app.last_status.as_deref(), Some("Notebook open cancelled"));
+    }
+
+    #[test]
+    fn opening_notebook_from_classic_prompts_for_unsaved_notebook_changes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other.json");
+        save_notebook_to_path(
+            &NotebookSession {
+                cells: vec![NotebookCellSession {
+                    cell_id: Some(1),
+                    source: "SELECT 'other'".to_string(),
+                    ..NotebookCellSession::default()
+                }],
+                selected_index: 0,
+            },
+            &path,
+        )
+        .unwrap();
+
+        for document_dirty in [false, true] {
+            let mut app = notebook_test_app(&runtime);
+            if document_dirty {
+                app.notebook_document_dirty = true;
+            } else {
+                app.notebook.cells[0].replace_source("SELECT 'keep me'".to_string());
+            }
+            app.switch_workspace(WorkspaceMode::Classic);
+
+            assert!(!app.workspace_has_unsaved_changes());
+            assert!(app.notebook_has_unsaved_changes());
+            assert!(!app.execute_command(&format!("open-notebook {}", path.display())));
+            assert!(matches!(
+                app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+                Some(ConfirmContext::OpenNotebook { path: pending }) if pending == &path
+            ));
+        }
     }
 
     fn notebook_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {

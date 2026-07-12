@@ -1031,7 +1031,14 @@ impl GridModel {
                 .headers
                 .iter()
                 .zip(row.iter())
-                .map(|(h, v)| format!("  \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                .enumerate()
+                .map(|(col, (header, value))| {
+                    if self.cell_is_null(row_idx, col) {
+                        format!("  \"{}\": null", escape_json(header))
+                    } else {
+                        format!("  \"{}\": \"{}\"", escape_json(header), escape_json(value))
+                    }
+                })
                 .collect();
             format!("{{\n{}\n}}", pairs.join(",\n"))
         })
@@ -1047,7 +1054,18 @@ impl GridModel {
                         .headers
                         .iter()
                         .zip(row.iter())
-                        .map(|(h, v)| format!("    \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                        .enumerate()
+                        .map(|(col, (header, value))| {
+                            if self.cell_is_null(idx, col) {
+                                format!("    \"{}\": null", escape_json(header))
+                            } else {
+                                format!(
+                                    "    \"{}\": \"{}\"",
+                                    escape_json(header),
+                                    escape_json(value)
+                                )
+                            }
+                        })
                         .collect();
                     format!("  {{\n{}\n  }}", pairs.join(",\n"))
                 })
@@ -2100,6 +2118,29 @@ mod tests {
             decoded[0]["odd\u{0001}header"],
             "back\u{0008} form\u{000c} line\nend"
         );
+    }
+
+    #[test]
+    fn rows_as_json_preserves_sql_null_identity() {
+        let model = GridModel::new(
+            vec![
+                "actual_null".to_string(),
+                "literal_null".to_string(),
+                "empty".to_string(),
+            ],
+            vec![vec!["NULL".to_string(), "NULL".to_string(), String::new()]],
+        )
+        .with_null_cells(vec![vec![true, false, false]]);
+
+        let row: serde_json::Value = serde_json::from_str(&model.row_as_json(0).unwrap()).unwrap();
+        assert!(row["actual_null"].is_null());
+        assert_eq!(row["literal_null"], "NULL");
+        assert_eq!(row["empty"], "");
+
+        let rows: serde_json::Value = serde_json::from_str(&model.rows_as_json(&[0])).unwrap();
+        assert!(rows[0]["actual_null"].is_null());
+        assert_eq!(rows[0]["literal_null"], "NULL");
+        assert_eq!(rows[0]["empty"], "");
     }
 
     #[test]
