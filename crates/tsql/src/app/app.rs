@@ -14319,6 +14319,17 @@ impl App {
             }
             DbEvent::QueryFinished { result } => {
                 let query_kind = self.active_query_kind.take();
+                if query_kind.is_none() {
+                    self.last_executed_query = None;
+                    self.classic_result_base_query = None;
+                    self.classic_result_base_headers.clear();
+                    self.classic_result_transform.reset();
+                    self.classic_result_applied_transform.reset();
+                    self.result_columns_picker = None;
+                    self.result_columns_draft.clear();
+                    self.paged_query = None;
+                    self.active_classic_execution = None;
+                }
                 // Always clear running state after first page loads - the "Executing..."
                 // dialog should only show during initial query, not while waiting for
                 // on-demand scroll fetches. Subsequent page fetches show status line only.
@@ -14337,7 +14348,7 @@ impl App {
                     }
                 }
 
-                if self.classic_result_transform.is_empty() {
+                if query_kind.is_some() && self.classic_result_transform.is_empty() {
                     self.classic_result_base_headers = result.headers.clone();
                 }
                 self.classic_result_applied_transform = self.classic_result_transform.clone();
@@ -14558,6 +14569,31 @@ impl App {
                 let ExecutionTarget::Notebook(cell_id) = context.target else {
                     return;
                 };
+                let destination_matches = self
+                    .notebook
+                    .cells
+                    .iter()
+                    .any(|cell| cell.id == cell_id && cell.revision == context.source_revision);
+                if !destination_matches {
+                    if let Some(cell) = self.notebook.cell_mut(cell_id) {
+                        cell.execution = CellExecutionState::NeverRun;
+                    }
+                    self.last_status = Some(format!(
+                        "Cell {} {}, but its source changed; error was ignored",
+                        cell_id.0,
+                        if was_cancelled {
+                            "was cancelled"
+                        } else {
+                            "failed"
+                        }
+                    ));
+                    if self.notebook_run_total > 0 {
+                        self.notebook_run_queue.clear();
+                        self.notebook_run_total = 0;
+                        self.notebook_run_rebind_sources.clear();
+                    }
+                    return;
+                }
                 if let Some(cell) = self.notebook.cell_mut(cell_id) {
                     let history = NotebookRunRecord::new(
                         context.id.0,
@@ -18038,6 +18074,88 @@ mod tests {
     }
 
     #[test]
+    fn classic_result_transform_direct_result_clears_previous_source_and_paging() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = classic_result_transform_test_app(&runtime);
+        app.classic_result_transform.add_filter(ResultFilter {
+            ordinal: 1,
+            op: FilterOp::Gt,
+            value: FilterValue::Integer(0),
+        });
+        app.classic_result_transform
+            .set_order(0, OrderDirection::Desc, false);
+        app.classic_result_applied_transform = app.classic_result_transform.clone();
+        app.last_executed_query = Some("SELECT transformed_result".to_string());
+        app.paged_query = Some(PagedQueryState::new(
+            "SELECT transformed_result".to_string(),
+            1500,
+            DEFAULT_PAGE_SIZE,
+            Some("source_rows".to_string()),
+        ));
+        app.active_classic_execution = Some(ExecutionContext {
+            id: ExecutionId(8),
+            target: ExecutionTarget::Classic,
+            source_revision: 0,
+            connection_generation: app.connect_generation,
+        });
+        app.open_result_columns_picker();
+        assert!(app.result_columns_picker.is_some());
+
+        app.apply_db_event(DbEvent::QueryFinished {
+            result: QueryResult {
+                null_cells: Vec::new(),
+                headers: vec!["schema".to_string(), "table".to_string()],
+                rows: vec![vec!["public".to_string(), "users".to_string()]],
+                command_tag: None,
+                truncated: false,
+                elapsed: Duration::ZERO,
+                source_table: None,
+                primary_keys: Vec::new(),
+                col_types: Vec::new(),
+            },
+        });
+
+        assert_eq!(app.grid.headers, ["schema", "table"]);
+        assert_eq!(app.grid.rows, [["public", "users"]]);
+        assert!(app.last_executed_query.is_none());
+        assert!(app.classic_result_base_query.is_none());
+        assert!(app.classic_result_base_headers.is_empty());
+        assert!(app.classic_result_transform.is_empty());
+        assert!(app.classic_result_applied_transform.is_empty());
+        assert!(app.result_columns_picker.is_none());
+        assert!(app.result_columns_draft.is_empty());
+        assert!(app.paged_query.is_none());
+        assert!(app.active_classic_execution.is_none());
+        assert_eq!(app.last_status.as_deref(), Some("Ready"));
+
+        app.open_action_palette();
+        let picker = app.action_palette.as_mut().unwrap();
+        for action in [
+            "Clear result filters",
+            "Clear result sorting",
+            "Reset result transformations",
+            "Copy transformed SQL",
+            "Open transformed SQL in editor",
+        ] {
+            picker.set_query(action.to_string());
+            assert_eq!(
+                picker.filtered_count(),
+                0,
+                "unexpected meta action: {action}"
+            );
+        }
+        app.action_palette = None;
+        app.refresh_last_query();
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("No previous query to refresh")
+        );
+    }
+
+    #[test]
     fn classic_result_transform_rejects_mutations_while_query_is_running() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -21372,7 +21490,8 @@ mod tests {
         });
         app.active_notebook_sql = Some("SELECT 1".to_string());
         app.db.running = true;
-        app.notebook.cells[0].mark_edited();
+        app.notebook.cells[0].execution = CellExecutionState::Running(context);
+        app.notebook.cells[0].replace_source("SELECT changed".to_string());
 
         app.apply_db_event(DbEvent::NotebookQueryError {
             context,
@@ -21382,6 +21501,70 @@ mod tests {
         assert_eq!(app.db.transaction_state, TransactionState::Failed);
         assert!(app.active_notebook_sql.is_none());
         assert!(!app.db.running);
+        assert_eq!(app.notebook.cells[0].source(), "SELECT changed");
+        assert_eq!(
+            app.notebook.cells[0].execution,
+            CellExecutionState::NeverRun
+        );
+        assert!(app.notebook.cells[0].failure.is_none());
+        assert!(app.notebook.cells[0].execution_history.is_empty());
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Cell 1 failed, but its source changed; error was ignored")
+        );
+    }
+
+    #[test]
+    fn notebook_edited_cancel_does_not_overwrite_source_or_leave_a_run_queued() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.db.kind = Some(DbKind::Postgres);
+        app.db.transaction_state = TransactionState::Active;
+        app.notebook.cells[0].replace_source("SELECT 1".to_string());
+        let context = ExecutionContext {
+            id: ExecutionId(1),
+            target: ExecutionTarget::Notebook(CellId(1)),
+            source_revision: app.notebook.cells[0].revision,
+            connection_generation: app.connect_generation,
+        };
+        app.active_execution = Some(ActiveExecution {
+            context,
+            kind: QueryExecutionKind::New,
+            cancelling: true,
+        });
+        app.active_notebook_sql = Some("SELECT 1".to_string());
+        app.db.running = true;
+        app.notebook.cells[0].execution = CellExecutionState::Running(context);
+        app.notebook.cells[0].replace_source("SELECT changed".to_string());
+        app.notebook_run_queue.push_back(CellId(2));
+        app.notebook_run_total = 2;
+        app.notebook_run_rebind_sources.insert(CellId(1));
+
+        app.apply_db_event(DbEvent::NotebookQueryError {
+            context,
+            error: "cancelled".to_string(),
+        });
+
+        assert_eq!(app.db.transaction_state, TransactionState::Failed);
+        assert!(app.active_notebook_sql.is_none());
+        assert!(!app.db.running);
+        assert_eq!(app.notebook.cells[0].source(), "SELECT changed");
+        assert_eq!(
+            app.notebook.cells[0].execution,
+            CellExecutionState::NeverRun
+        );
+        assert!(app.notebook.cells[0].failure.is_none());
+        assert!(app.notebook.cells[0].execution_history.is_empty());
+        assert!(app.notebook_run_queue.is_empty());
+        assert_eq!(app.notebook_run_total, 0);
+        assert!(app.notebook_run_rebind_sources.is_empty());
+        assert_eq!(
+            app.last_status.as_deref(),
+            Some("Cell 1 was cancelled, but its source changed; error was ignored")
+        );
     }
 
     #[test]
