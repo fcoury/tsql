@@ -4594,7 +4594,7 @@ impl App {
                 self.grid_state.selected_rows.clear();
             } else {
                 // Nothing open - behave like 'q' and show quit confirmation
-                if self.workspace_has_unsaved_changes() {
+                if self.app_has_unsaved_changes() {
                     self.confirm_prompt = Some(ConfirmPrompt::new(
                         "You have unsaved changes. Quit anyway?",
                         ConfirmContext::QuitApp,
@@ -4839,7 +4839,7 @@ impl App {
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE) => {
                     // Always show confirmation prompt, with different message based on unsaved changes
-                    if self.workspace_has_unsaved_changes() {
+                    if self.app_has_unsaved_changes() {
                         self.confirm_prompt = Some(ConfirmPrompt::new(
                             "You have unsaved changes. Quit anyway?",
                             ConfirmContext::QuitApp,
@@ -10949,6 +10949,10 @@ impl App {
             WorkspaceMode::Classic => self.editor.is_modified(),
             WorkspaceMode::Notebook => self.notebook_has_unsaved_changes(),
         }
+    }
+
+    fn app_has_unsaved_changes(&self) -> bool {
+        self.editor.is_modified() || self.notebook_has_unsaved_changes()
     }
 
     fn notebook_has_unsaved_changes(&self) -> bool {
@@ -20126,6 +20130,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quitting_from_classic_warns_about_hidden_unsaved_notebook_changes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for document_dirty in [false, true] {
+            for key in [KeyCode::Char('q'), KeyCode::Esc] {
+                let mut app = notebook_test_app(&runtime);
+                if document_dirty {
+                    app.notebook_document_dirty = true;
+                } else {
+                    app.notebook.cells[0].replace_source("SELECT 'keep me'".to_string());
+                }
+                app.switch_workspace(WorkspaceMode::Classic);
+
+                assert!(!app.workspace_has_unsaved_changes());
+                assert!(app.notebook_has_unsaved_changes());
+                assert!(app.app_has_unsaved_changes());
+                assert!(!app.on_key(KeyEvent::new(key, KeyModifiers::NONE)));
+                assert!(matches!(
+                    app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+                    Some(ConfirmContext::QuitApp)
+                ));
+            }
+        }
+    }
+
     fn notebook_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
@@ -20310,6 +20343,15 @@ mod tests {
         assert!(app.notebook.cells[0].output_is_stale());
         assert!(!app.notebook_has_unsaved_changes());
         assert!(!app.workspace_has_unsaved_changes());
+        app.switch_workspace(WorkspaceMode::Classic);
+        for key in [KeyCode::Char('q'), KeyCode::Esc] {
+            assert!(!app.on_key(KeyEvent::new(key, KeyModifiers::NONE)));
+            assert!(matches!(
+                app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+                Some(ConfirmContext::QuitAppClean)
+            ));
+            app.confirm_prompt = None;
+        }
         assert!(!app.execute_command(&format!("open-notebook {}", path.display())));
         assert!(app.confirm_prompt.is_none());
     }
