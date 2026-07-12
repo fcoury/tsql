@@ -1076,11 +1076,18 @@ impl GridModel {
             .join(", ");
         row_indices
             .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .map(|row| {
+            .filter_map(|&row_index| self.rows.get(row_index).map(|row| (row_index, row)))
+            .map(|(row_index, row)| {
                 let values = row
                     .iter()
-                    .map(|value| escape_sql_value(value))
+                    .enumerate()
+                    .map(|(col_index, value)| {
+                        if self.cell_is_null(row_index, col_index) {
+                            "NULL".to_string()
+                        } else {
+                            format!("'{}'", value.replace('\'', "''"))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("INSERT INTO {table} ({columns}) VALUES ({values});")
@@ -2103,6 +2110,7 @@ mod tests {
                 "display \"name\"".to_string(),
                 "enabled".to_string(),
                 "missing".to_string(),
+                "empty".to_string(),
             ],
             vec![
                 vec![
@@ -2110,25 +2118,31 @@ mod tests {
                     "O'Reilly".to_string(),
                     "true".to_string(),
                     "NULL".to_string(),
+                    String::new(),
                 ],
                 vec![
                     "2".to_string(),
                     "line one\nline two".to_string(),
                     "false".to_string(),
+                    "NULL".to_string(),
                     String::new(),
                 ],
             ],
-        );
+        )
+        .with_null_cells(vec![
+            vec![false, false, false, true, false],
+            vec![false, false, false, false, false],
+        ]);
 
         assert_eq!(
             model.rows_as_sql_inserts(&[1, 99, 0], "reporting.user \"copy\""),
             concat!(
                 "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
-                "(id, \"display \"\"name\"\"\", enabled, missing) ",
-                "VALUES (2, 'line one\nline two', FALSE, NULL);\n",
+                "(id, \"display \"\"name\"\"\", enabled, missing, empty) ",
+                "VALUES ('2', 'line one\nline two', 'false', 'NULL', '');\n",
                 "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
-                "(id, \"display \"\"name\"\"\", enabled, missing) ",
-                "VALUES (1, 'O''Reilly', TRUE, NULL);"
+                "(id, \"display \"\"name\"\"\", enabled, missing, empty) ",
+                "VALUES ('1', 'O''Reilly', 'true', NULL, '');"
             )
         );
     }

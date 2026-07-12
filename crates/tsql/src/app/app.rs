@@ -8318,7 +8318,14 @@ impl App {
         if notebook && !exporting_selection {
             if let Some(retained) = retained {
                 let loaded = grid.rows.len();
-                if loaded < retained.rows {
+                if loaded < retained.rows
+                    || self
+                        .notebook
+                        .selected_cell()
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.truncated)
+                {
                     if self.notebook_export_loading.is_some() {
                         self.last_status = Some("A notebook export is already running".to_string());
                         return;
@@ -19216,6 +19223,30 @@ mod tests {
             .last_status
             .as_deref()
             .is_some_and(|status| status.contains("Exported 1 selected row")));
+    }
+
+    #[test]
+    fn notebook_export_requires_live_snapshot_when_loaded_output_is_truncated() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].replace_source("SELECT value".to_string());
+        let _version = install_notebook_test_snapshot(&mut app, 0, 1, 1);
+        let output = app.notebook.cells[0].output.as_mut().unwrap();
+        output.grid.rows[0][0] = "partial…".to_string();
+        output.truncated = true;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.csv");
+        app.handle_export_command(&format!("csv {}", path.display()));
+
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Not connected; cannot export snapshot")));
+        assert!(!path.exists());
     }
 
     #[test]
