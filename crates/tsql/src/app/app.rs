@@ -8271,7 +8271,10 @@ impl App {
                 })
         });
         let retained = retained.flatten();
-        if grid.rows.is_empty() && retained.as_ref().is_none_or(|retained| retained.rows == 0) {
+        if grid.headers.is_empty()
+            && grid.rows.is_empty()
+            && retained.as_ref().is_none_or(|retained| retained.rows == 0)
+        {
             self.last_error = Some("No data to export".to_string());
             return;
         }
@@ -16077,7 +16080,7 @@ impl App {
                 (
                     cell.output
                         .as_ref()
-                        .is_some_and(|output| !output.grid.rows.is_empty()),
+                        .is_some_and(|output| !output.grid.headers.is_empty()),
                     cell.output.as_ref().is_some_and(|output| {
                         matches!(output.refinement, RefinementAvailability::Available(_))
                     }),
@@ -16121,6 +16124,15 @@ impl App {
             notebook,
             has_query: self.query_editor_has_content(),
             has_result,
+            has_rows: if notebook {
+                self.notebook
+                    .selected_cell()
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| !output.grid.rows.is_empty())
+            } else {
+                !self.grid.rows.is_empty()
+            },
             has_refinable_result,
             has_selection,
             has_error,
@@ -19537,6 +19549,145 @@ mod tests {
             .last_status
             .as_deref()
             .is_some_and(|status| status.contains("Exported 1 selected row")));
+    }
+
+    #[test]
+    fn notebook_zero_row_results_export_all_formats() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        for retained in [false, true] {
+            let mut app = notebook_test_app(&runtime);
+            if retained {
+                let version = install_notebook_test_snapshot(&mut app, 0, 1, 1);
+                let handle = app.retained_versions[&version];
+                let output = app.notebook.cells[0].output.as_mut().unwrap();
+                output.grid.rows.clear();
+                if let RefinementAvailability::Available(result) = &mut output.refinement {
+                    result.rows = 0;
+                }
+                output.retained.as_mut().unwrap().rows = 0;
+                app.pg_snapshots.get_mut(&handle).unwrap().row_count = 0;
+            } else {
+                app.notebook.cells[0].output = Some(notebook_test_output(0));
+            }
+
+            for (format, expected) in [
+                ("csv", "value"),
+                ("tsv", "value"),
+                ("json", "[\n\n]"),
+                ("sql", ""),
+            ] {
+                let path = dir.path().join(format!("{retained}.{format}"));
+                app.last_error = None;
+
+                app.handle_export_command(&format!("{format} {}", path.display()));
+
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+                assert!(app.last_error.is_none());
+                assert!(app
+                    .last_status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("Exported 0 rows")));
+            }
+        }
+    }
+
+    #[test]
+    fn notebook_zero_row_export_still_rejects_missing_or_incomplete_results() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing.csv");
+
+        app.handle_export_command(&format!("csv {}", missing_path.display()));
+
+        assert_eq!(app.last_error.as_deref(), Some("No data to export"));
+        assert!(!missing_path.exists());
+
+        let mut output = notebook_test_output(0);
+        output.truncated = true;
+        output.refinement =
+            RefinementAvailability::Unavailable(RefinementUnavailableReason::SnapshotDisabled);
+        app.notebook.cells[0].output = Some(output);
+        app.last_error = None;
+        let incomplete_path = dir.path().join("incomplete.csv");
+
+        app.handle_export_command(&format!("csv {}", incomplete_path.display()));
+
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("truncated") && error.contains("snapshot")));
+        assert!(!incomplete_path.exists());
+    }
+
+    #[test]
+    fn notebook_zero_row_palette_keeps_result_actions_available() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].output = Some(notebook_test_output(0));
+
+        app.open_action_palette();
+
+        let picker = app.action_palette.as_mut().unwrap();
+        for action in [
+            "Export CSV",
+            "Export JSON",
+            "Export TSV",
+            "Export SQL inserts",
+            "Expand or collapse result",
+            "Explain cell query",
+        ] {
+            picker.set_query(action.to_string());
+            assert!(
+                picker.filtered_count() > 0,
+                "missing zero-row action: {action}"
+            );
+        }
+        picker.set_query("Refine result in new cell".to_string());
+        assert_eq!(picker.filtered_count(), 0);
+        for action in [
+            "Generate INSERT template",
+            "Generate UPDATE template",
+            "Generate DELETE template",
+        ] {
+            picker.set_query(action.to_string());
+            assert_eq!(
+                picker.filtered_count(),
+                0,
+                "unexpected zero-row action: {action}"
+            );
+        }
+
+        app.action_palette = None;
+        app.notebook.cells[0].output = None;
+        app.open_action_palette();
+        let picker = app.action_palette.as_mut().unwrap();
+        for action in [
+            "Export CSV",
+            "Export JSON",
+            "Export TSV",
+            "Export SQL inserts",
+            "Expand or collapse result",
+            "Explain cell query",
+        ] {
+            picker.set_query(action.to_string());
+            assert_eq!(
+                picker.filtered_count(),
+                0,
+                "unexpected no-output action: {action}"
+            );
+        }
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub struct ActionContext {
     pub notebook: bool,
     pub has_query: bool,
     pub has_result: bool,
+    pub has_rows: bool,
     pub has_refinable_result: bool,
     pub has_selection: bool,
     pub has_column: bool,
@@ -134,6 +135,11 @@ pub fn action_entries(context: ActionContext) -> Vec<ActionEntry> {
             ActionEntry::new(PaletteAction::ExportJson, "Export JSON", detail),
             ActionEntry::new(PaletteAction::ExportTsv, "Export TSV", detail),
             ActionEntry::new(PaletteAction::ExportSql, "Export SQL inserts", detail),
+        ]);
+    }
+
+    if context.has_rows {
+        entries.extend([
             ActionEntry::new(
                 PaletteAction::GenerateInsert,
                 "Generate INSERT template",
@@ -379,6 +385,7 @@ mod tests {
             notebook: true,
             has_query: true,
             has_result: true,
+            has_rows: true,
             has_refinable_result: true,
             has_selection: true,
             has_error: true,
@@ -389,6 +396,9 @@ mod tests {
         let actions = entries.iter().map(|entry| entry.action).collect::<Vec<_>>();
 
         assert!(actions.contains(&PaletteAction::ExportSql));
+        assert!(actions.contains(&PaletteAction::GenerateInsert));
+        assert!(actions.contains(&PaletteAction::GenerateUpdate));
+        assert!(actions.contains(&PaletteAction::GenerateDelete));
         assert!(actions.contains(&PaletteAction::RefineCell));
         assert!(actions.contains(&PaletteAction::RunDependents));
         assert!(actions.contains(&PaletteAction::CellHistory));
@@ -434,6 +444,9 @@ mod tests {
         assert!(actions.contains(&PaletteAction::ExportCsv));
         assert!(actions.contains(&PaletteAction::ExplainCell));
         assert!(!actions.contains(&PaletteAction::RefineCell));
+        assert!(!actions.contains(&PaletteAction::GenerateInsert));
+        assert!(!actions.contains(&PaletteAction::GenerateUpdate));
+        assert!(!actions.contains(&PaletteAction::GenerateDelete));
     }
 
     #[test]
@@ -441,6 +454,7 @@ mod tests {
         let actions = action_entries(ActionContext {
             has_query: true,
             has_result: true,
+            has_rows: true,
             has_column: true,
             has_cell: true,
             has_transform: true,
@@ -502,6 +516,9 @@ mod tests {
         assert!(!actions.contains(&PaletteAction::ResetResult));
         assert!(!actions.contains(&PaletteAction::CopyTransformedSql));
         assert!(!actions.contains(&PaletteAction::OpenTransformedSql));
+        assert!(!actions.contains(&PaletteAction::GenerateInsert));
+        assert!(!actions.contains(&PaletteAction::GenerateUpdate));
+        assert!(!actions.contains(&PaletteAction::GenerateDelete));
     }
 
     #[test]
