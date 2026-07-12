@@ -2512,6 +2512,7 @@ pub enum DbEvent {
         row: usize,
         col: usize,
         value: String,
+        is_null: bool,
     },
     /// Result of a connection test (from connection form).
     TestConnectionResult {
@@ -6590,14 +6591,13 @@ impl App {
             .col_types
             .get(col)
             .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
-        set_doc.insert(
-            field_name,
-            parse_grid_cell_to_bson(&new_value, field_type_hint, true),
-        );
+        let bson_value = parse_grid_cell_to_bson(&new_value, field_type_hint, true);
+        let is_null = matches!(&bson_value, Bson::Null);
+        set_doc.insert(field_name, bson_value);
         let mut update = Document::new();
         update.insert("$set", Bson::Document(set_doc));
 
-        self.execute_mongo_cell_update(collection, filter, update, row, col, new_value);
+        self.execute_mongo_cell_update(collection, filter, update, row, col, (new_value, is_null));
     }
 
     fn build_mongo_update_filter(
@@ -6654,7 +6654,7 @@ impl App {
         update: Document,
         row: usize,
         col: usize,
-        new_value: String,
+        updated_value: (String, bool),
     ) {
         let Some(client) = self.db.mongo_client.clone() else {
             self.last_error = Some("Not connected".to_string());
@@ -6674,6 +6674,7 @@ impl App {
         self.last_status = Some("Updating...".to_string());
         self.query_ui.start();
 
+        let (new_value, is_null) = updated_value;
         let tx = self.db_events_tx.clone();
         self.rt.spawn(async move {
             let db = client.database(&db_name);
@@ -6685,6 +6686,7 @@ impl App {
                             row,
                             col,
                             value: new_value,
+                            is_null,
                         });
                     } else if res.matched_count == 0 {
                         let _ = tx.send(DbEvent::QueryError {
@@ -6729,6 +6731,7 @@ impl App {
         // Store row/col/value for updating grid on success
         let update_row = row;
         let update_col = col;
+        let update_is_null = new_value.is_empty() || new_value.eq_ignore_ascii_case("null");
         let update_value = new_value;
 
         self.rt.spawn(async move {
@@ -6750,6 +6753,7 @@ impl App {
                             row: update_row,
                             col: update_col,
                             value: update_value,
+                            is_null: update_is_null,
                         });
                     } else if affected == 0 {
                         let _ = tx.send(DbEvent::QueryError {
@@ -8316,6 +8320,20 @@ impl App {
 
         let expanded_path = expand_user_path(path);
         if notebook && !exporting_selection {
+            if retained.is_none()
+                && self
+                    .notebook
+                    .selected_cell()
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.truncated)
+            {
+                self.last_error = Some(
+                    "Notebook result is truncated and no retained session snapshot is available for full export"
+                        .to_string(),
+                );
+                return;
+            }
             if let Some(retained) = retained {
                 let loaded = grid.rows.len();
                 if loaded < retained.rows
@@ -10935,7 +10953,7 @@ impl App {
                 .notebook
                 .cells
                 .iter()
-                .any(|cell| cell.is_dirty() || cell.editor.is_modified())
+                .any(|cell| cell.editor.is_modified())
     }
 
     fn handle_notebook_key(&mut self, key: KeyEvent) {
@@ -14858,13 +14876,23 @@ impl App {
                 self.last_status = Some("Schema refresh failed (see error)".to_string());
                 self.last_error = Some(error);
             }
-            DbEvent::CellUpdated { row, col, value } => {
+            DbEvent::CellUpdated {
+                row,
+                col,
+                value,
+                is_null,
+            } => {
                 self.db.running = false;
                 self.query_ui.clear();
                 // Update the grid cell
                 if let Some(grid_row) = self.grid.rows.get_mut(row) {
                     if let Some(cell) = grid_row.get_mut(col) {
                         *cell = value;
+                    }
+                }
+                if let Some(null_row) = self.grid.null_cells.get_mut(row) {
+                    if let Some(null_cell) = null_row.get_mut(col) {
+                        *null_cell = is_null;
                     }
                 }
                 self.last_status = Some("Cell updated successfully".to_string());
@@ -19421,6 +19449,47 @@ mod tests {
     }
 
     #[test]
+    fn notebook_full_export_refuses_truncated_output_without_retention_but_allows_selection() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        let mut output = notebook_test_output(2);
+        output.truncated = true;
+        output.refinement =
+            RefinementAvailability::Unavailable(RefinementUnavailableReason::SnapshotDisabled);
+        app.notebook.cells[0].output = Some(output);
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("partial.csv");
+        let selected_path = dir.path().join("selected.csv");
+
+        app.handle_export_command(&format!("csv {}", full_path.display()));
+
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("truncated") && error.contains("snapshot")));
+        assert!(!full_path.exists());
+
+        app.last_error = None;
+        app.notebook.cells[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .grid_state
+            .selected_rows
+            .insert(1);
+        app.handle_export_command(&format!("csv {}", selected_path.display()));
+
+        assert_eq!(std::fs::read_to_string(selected_path).unwrap(), "value\n2");
+        assert!(app
+            .last_status
+            .as_deref()
+            .is_some_and(|status| status.contains("Exported 1 selected row")));
+    }
+
+    #[test]
     fn notebook_action_palette_opens_filters_switches_workspace_and_esc_closes() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -20171,6 +20240,32 @@ mod tests {
 
         app.notebook.cells[0].replace_source("SELECT 2".to_string());
         assert!(app.workspace_has_unsaved_changes());
+    }
+
+    #[test]
+    fn saved_notebook_with_stale_output_is_not_reported_as_unsaved() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.notebook.cells[0].output = Some(notebook_test_output(1));
+        app.notebook.cells[0].execution = CellExecutionState::Succeeded;
+        app.notebook.cells[0].replace_source("SELECT 2".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved.json");
+
+        assert!(app.notebook.cells[0].is_dirty());
+        assert!(app.workspace_has_unsaved_changes());
+        assert!(!app.execute_command(&format!("save-notebook {}", path.display())));
+
+        assert!(!app.notebook.cells[0].editor.is_modified());
+        assert!(app.notebook.cells[0].is_dirty());
+        assert!(app.notebook.cells[0].output_is_stale());
+        assert!(!app.notebook_has_unsaved_changes());
+        assert!(!app.workspace_has_unsaved_changes());
+        assert!(!app.execute_command(&format!("open-notebook {}", path.display())));
+        assert!(app.confirm_prompt.is_none());
     }
 
     #[test]
@@ -22565,6 +22660,50 @@ mod tests {
     }
 
     #[test]
+    fn cell_update_refreshes_null_identity_for_filters_and_exports() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = classic_result_transform_test_app(&runtime);
+        app.grid = GridModel::new(
+            vec!["left".to_string(), "right".to_string()],
+            vec![vec!["NULL".to_string(), "before".to_string()]],
+        )
+        .with_null_cells(vec![vec![true, false]]);
+
+        app.apply_db_event(DbEvent::CellUpdated {
+            row: 0,
+            col: 0,
+            value: "after".to_string(),
+            is_null: false,
+        });
+        app.apply_db_event(DbEvent::CellUpdated {
+            row: 0,
+            col: 1,
+            value: "NULL".to_string(),
+            is_null: true,
+        });
+
+        assert_eq!(app.grid.rows[0], ["after", "NULL"]);
+        assert_eq!(app.grid.null_cells[0], [false, true]);
+        app.grid_state.cursor_col = 0;
+        assert_eq!(
+            app.current_classic_filter_value(),
+            Some(FilterValue::Text("after".to_string()))
+        );
+        app.grid_state.cursor_col = 1;
+        assert_eq!(app.current_classic_filter_value(), Some(FilterValue::Null));
+        let json: serde_json::Value = serde_json::from_str(&app.grid.rows_as_json(&[0])).unwrap();
+        assert_eq!(json[0]["left"], "after");
+        assert!(json[0]["right"].is_null());
+        assert_eq!(
+            app.grid.rows_as_sql_inserts(&[0], "result"),
+            "INSERT INTO result (left, right) VALUES ('after', NULL);"
+        );
+    }
+
+    #[test]
     fn test_cell_editor_open_sets_cursor_at_end() {
         let mut editor = CellEditor::new();
         editor.open(0, 0, "hello".to_string());
@@ -24015,6 +24154,11 @@ mod tests {
             matches!(oid_like, Bson::String(ref s) if s == "507f1f77bcf86cd799439011"),
             "string-typed cells should not be coerced to ObjectId"
         );
+
+        let literal_null = parse_grid_cell_to_bson("NULL", Some("string"), true);
+        assert!(matches!(literal_null, Bson::String(ref s) if s == "NULL"));
+        let actual_null = parse_grid_cell_to_bson("NULL", Some("null"), true);
+        assert!(matches!(actual_null, Bson::Null));
     }
 
     #[test]
