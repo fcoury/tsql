@@ -9,9 +9,11 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
+
+use super::{overlay_block, UiTheme};
 use ratatui::Frame;
 use url::Url;
 
@@ -1180,7 +1182,7 @@ impl ConnectionFormModal {
     }
 
     /// Render the connection form modal.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate modal size. Taller now that we have metadata fields
         // below the core form.
         let modal_width = 72u16.min(area.width.saturating_sub(4));
@@ -1198,15 +1200,7 @@ impl ConnectionFormModal {
         // Clear the background
         frame.render_widget(Clear, modal_area);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", self.title))
-            .title_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block(&self.title, theme);
 
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
@@ -1251,11 +1245,12 @@ impl ConnectionFormModal {
             &self.name,
             self.name_cursor,
             FormField::Name,
+            theme,
         );
         i += 1;
-        self.render_kind_field(frame, chunks[i]);
+        self.render_kind_field(frame, chunks[i], theme);
         i += 1;
-        self.render_separator(frame, chunks[i]);
+        self.render_separator(frame, chunks[i], theme);
         i += 1;
         self.render_text_field(
             frame,
@@ -1264,9 +1259,10 @@ impl ConnectionFormModal {
             &self.user,
             self.user_cursor,
             FormField::User,
+            theme,
         );
         i += 1;
-        self.render_password_field(frame, chunks[i]);
+        self.render_password_field(frame, chunks[i], theme);
         i += 1;
         if self.onepassword_enabled {
             self.render_text_field(
@@ -1276,6 +1272,7 @@ impl ConnectionFormModal {
                 &self.op_ref,
                 self.op_ref_cursor,
                 FormField::OnePasswordRef,
+                theme,
             );
             i += 1;
         }
@@ -1285,11 +1282,12 @@ impl ConnectionFormModal {
             "Save to keychain",
             self.save_password,
             FormField::SavePassword,
+            theme,
         );
         i += 1;
-        self.render_ssl_mode_field(frame, chunks[i]);
+        self.render_ssl_mode_field(frame, chunks[i], theme);
         i += 1;
-        self.render_separator(frame, chunks[i]);
+        self.render_separator(frame, chunks[i], theme);
         i += 1;
         self.render_text_field(
             frame,
@@ -1298,6 +1296,7 @@ impl ConnectionFormModal {
             &self.host,
             self.host_cursor,
             FormField::Host,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1307,6 +1306,7 @@ impl ConnectionFormModal {
             &self.port,
             self.port_cursor,
             FormField::Port,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1316,11 +1316,12 @@ impl ConnectionFormModal {
             &self.database,
             self.database_cursor,
             FormField::Database,
+            theme,
         );
         i += 1;
-        self.render_separator(frame, chunks[i]);
+        self.render_separator(frame, chunks[i], theme);
         i += 1;
-        self.render_color_field(frame, chunks[i]);
+        self.render_color_field(frame, chunks[i], theme);
         i += 1;
         self.render_text_field(
             frame,
@@ -1329,6 +1330,7 @@ impl ConnectionFormModal {
             &self.folder,
             self.folder_cursor,
             FormField::Folder,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1338,6 +1340,7 @@ impl ConnectionFormModal {
             &self.tags_input,
             self.tags_input_cursor,
             FormField::Tags,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1347,6 +1350,7 @@ impl ConnectionFormModal {
             &self.description,
             self.description_cursor,
             FormField::Description,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1356,6 +1360,7 @@ impl ConnectionFormModal {
             &self.application_name,
             self.application_name_cursor,
             FormField::AppName,
+            theme,
         );
         i += 1;
         self.render_text_field(
@@ -1365,15 +1370,17 @@ impl ConnectionFormModal {
             &self.connect_timeout_secs,
             self.connect_timeout_cursor,
             FormField::ConnectTimeout,
+            theme,
         );
         i += 1;
-        self.render_url_paste_field(frame, chunks[i]);
+        self.render_url_paste_field(frame, chunks[i], theme);
         i += 1;
-        self.render_separator(frame, chunks[i]);
+        self.render_separator(frame, chunks[i], theme);
         i += 1;
-        self.render_help(frame, chunks[i]);
+        self.render_help(frame, chunks[i], theme);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_text_field(
         &self,
         frame: &mut Frame,
@@ -1382,6 +1389,7 @@ impl ConnectionFormModal {
         value: &str,
         cursor: usize,
         field: FormField,
+        theme: &UiTheme,
     ) {
         let is_focused = self.focused == field;
         let label_width = 10;
@@ -1391,31 +1399,31 @@ impl ConnectionFormModal {
 
         // Label
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new(label).style(label_style);
         frame.render_widget(label_widget, chunks[0]);
 
         // Value with cursor
         let value_spans = if is_focused {
-            self.render_text_with_cursor(value, cursor)
+            self.render_text_with_cursor(value, cursor, theme)
         } else {
             vec![Span::raw(value)]
         };
 
         let value_style = if is_focused {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.text)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
 
         let value_widget = Paragraph::new(Line::from(value_spans)).style(value_style);
         frame.render_widget(value_widget, chunks[1]);
     }
 
-    fn render_password_field(&self, frame: &mut Frame, area: Rect) {
+    fn render_password_field(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let is_focused = self.focused == FormField::Password;
         let label_width = 10;
 
@@ -1424,9 +1432,9 @@ impl ConnectionFormModal {
 
         // Label
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new("Password:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
@@ -1434,15 +1442,15 @@ impl ConnectionFormModal {
         // Masked value with cursor
         let masked: String = "•".repeat(self.password.chars().count());
         let value_spans = if is_focused {
-            self.render_text_with_cursor(&masked, self.password_cursor)
+            self.render_text_with_cursor(&masked, self.password_cursor, theme)
         } else {
             vec![Span::raw(masked)]
         };
 
         let value_style = if is_focused {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.text)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
 
         let value_widget = Paragraph::new(Line::from(value_spans)).style(value_style);
@@ -1456,6 +1464,7 @@ impl ConnectionFormModal {
         label: &str,
         checked: bool,
         field: FormField,
+        theme: &UiTheme,
     ) {
         let is_focused = self.focused == field;
         let label_width = 10;
@@ -1469,16 +1478,16 @@ impl ConnectionFormModal {
         // Checkbox
         let checkbox = if checked { "[x]" } else { "[ ]" };
         let style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
 
         let widget = Paragraph::new(format!("{} {}", checkbox, label)).style(style);
         frame.render_widget(widget, chunks[1]);
     }
 
-    fn render_kind_field(&self, frame: &mut Frame, area: Rect) {
+    fn render_kind_field(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let is_focused = self.focused == FormField::Kind;
         let label_width = 10;
 
@@ -1486,9 +1495,9 @@ impl ConnectionFormModal {
             Layout::horizontal([Constraint::Length(label_width), Constraint::Min(1)]).split(area);
 
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new("Type:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
@@ -1499,23 +1508,21 @@ impl ConnectionFormModal {
         };
         let mut spans = vec![];
         if is_focused {
-            spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("◀ ", Style::default().fg(theme.text_muted)));
         }
         spans.push(Span::styled(
             format!("{:<11}", kind_name),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ));
         if is_focused {
-            spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" ▶", Style::default().fg(theme.text_muted)));
         }
 
         let widget = Paragraph::new(Line::from(spans));
         frame.render_widget(widget, chunks[1]);
     }
 
-    fn render_color_field(&self, frame: &mut Frame, area: Rect) {
+    fn render_color_field(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let is_focused = self.focused == FormField::Color;
         let label_width = 10;
 
@@ -1524,34 +1531,34 @@ impl ConnectionFormModal {
 
         // Label
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new("Color:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
 
         // Color value with preview
         let color_name = self.color.to_string();
-        let color_fg = self.color.to_ratatui_color().unwrap_or(Color::White);
+        let color_fg = self.color.to_ratatui_color().unwrap_or(theme.text);
 
         let mut spans = vec![];
         if is_focused {
-            spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("◀ ", Style::default().fg(theme.text_muted)));
         }
         spans.push(Span::styled(
             format!("{:<8}", color_name),
             Style::default().fg(color_fg).add_modifier(Modifier::BOLD),
         ));
         if is_focused {
-            spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" ▶", Style::default().fg(theme.text_muted)));
         }
 
         let widget = Paragraph::new(Line::from(spans));
         frame.render_widget(widget, chunks[1]);
     }
 
-    fn render_ssl_mode_field(&self, frame: &mut Frame, area: Rect) {
+    fn render_ssl_mode_field(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let is_focused = self.focused == FormField::SslMode;
         let label_width = 10;
 
@@ -1560,9 +1567,9 @@ impl ConnectionFormModal {
 
         // Label
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new("SSL:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
@@ -1574,15 +1581,15 @@ impl ConnectionFormModal {
         };
         let mut spans = vec![];
         if is_focused && self.kind == DbKind::Postgres {
-            spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("◀ ", Style::default().fg(theme.text_muted)));
         }
         spans.push(Span::styled(
             format!("{:<11}", mode_name), // 11 chars to fit "verify-full"
             Style::default()
                 .fg(if self.kind == DbKind::Mongo {
-                    Color::DarkGray
+                    theme.text_muted
                 } else {
-                    Color::White
+                    theme.text
                 })
                 .add_modifier(if self.kind == DbKind::Mongo {
                     Modifier::empty()
@@ -1591,14 +1598,14 @@ impl ConnectionFormModal {
                 }),
         ));
         if is_focused && self.kind == DbKind::Postgres {
-            spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" ▶", Style::default().fg(theme.text_muted)));
         }
 
         let widget = Paragraph::new(Line::from(spans));
         frame.render_widget(widget, chunks[1]);
     }
 
-    fn render_url_paste_field(&self, frame: &mut Frame, area: Rect) {
+    fn render_url_paste_field(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let is_focused = self.focused == FormField::UrlPaste;
         let label_width = 10;
 
@@ -1607,9 +1614,9 @@ impl ConnectionFormModal {
 
         // Label
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_muted)
         };
         let label_widget = Paragraph::new("Paste URL:").style(label_style);
         frame.render_widget(label_widget, chunks[0]);
@@ -1618,17 +1625,17 @@ impl ConnectionFormModal {
         let (value_spans, style) = if self.url_paste.is_empty() && !is_focused {
             (
                 vec![Span::raw("postgres://... or mongodb://...")],
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_muted),
             )
         } else if is_focused {
             (
-                self.render_text_with_cursor(&self.url_paste, self.url_paste_cursor),
-                Style::default().fg(Color::White),
+                self.render_text_with_cursor(&self.url_paste, self.url_paste_cursor, theme),
+                Style::default().fg(theme.text),
             )
         } else {
             (
                 vec![Span::raw(&self.url_paste)],
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme.text_muted),
             )
         };
 
@@ -1636,39 +1643,40 @@ impl ConnectionFormModal {
         frame.render_widget(value_widget, chunks[1]);
     }
 
-    fn render_text_with_cursor(&self, text: &str, cursor: usize) -> Vec<Span<'static>> {
+    fn render_text_with_cursor(
+        &self,
+        text: &str,
+        cursor: usize,
+        theme: &UiTheme,
+    ) -> Vec<Span<'static>> {
         let before: String = text.chars().take(cursor).collect();
         let cursor_char = text.chars().nth(cursor).unwrap_or(' ');
         let after: String = text.chars().skip(cursor + 1).collect();
 
         vec![
             Span::raw(before),
-            Span::styled(
-                cursor_char.to_string(),
-                Style::default().bg(Color::White).fg(Color::Black),
-            ),
+            Span::styled(cursor_char.to_string(), theme.editor_cursor),
             Span::raw(after),
         ]
     }
 
-    fn render_separator(&self, frame: &mut Frame, area: Rect) {
-        let sep = Paragraph::new("─".repeat(area.width as usize))
-            .style(Style::default().fg(Color::DarkGray));
+    fn render_separator(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        let sep = Paragraph::new("─".repeat(area.width as usize)).style(theme.overlay_border);
         frame.render_widget(sep, area);
     }
 
-    fn render_help(&self, frame: &mut Frame, area: Rect) {
+    fn render_help(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let save_key = self.save_key_display();
         let test_key = self.test_key_display();
 
         let help_spans = vec![
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::styled("Tab", Style::default().fg(theme.warning)),
             Span::raw(" next  "),
-            Span::styled(save_key, Style::default().fg(Color::Yellow)),
+            Span::styled(save_key, Style::default().fg(theme.warning)),
             Span::raw(" save  "),
-            Span::styled(test_key, Style::default().fg(Color::Yellow)),
+            Span::styled(test_key, Style::default().fg(theme.warning)),
             Span::raw(" test  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.warning)),
             Span::raw(" cancel"),
         ];
 

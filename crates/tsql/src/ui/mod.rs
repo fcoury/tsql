@@ -1,3 +1,4 @@
+mod action_palette;
 mod ai_query_modal;
 mod completion;
 mod confirm_prompt;
@@ -18,7 +19,9 @@ mod row_detail;
 pub mod sidebar;
 mod status_line;
 mod style;
+mod theme;
 
+pub use action_palette::{action_entries, ActionContext, ActionEntry, PaletteAction};
 pub use ai_query_modal::{AiQueryModal, AiQueryModalAction};
 pub use completion::{
     determine_context, get_word_before_cursor, ColumnInfo, CompletionContext, CompletionItem,
@@ -31,7 +34,7 @@ pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
 pub use fuzzy_picker::{FilteredItem, FuzzyPicker, PickerAction};
 pub use grid::{
     escape_sql_value, quote_identifier, DataGrid, GridKeyResult, GridModel, GridSearch, GridState,
-    ResizeAction,
+    GridViewport, ResizeAction,
 };
 pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, CursorShape, HighlightedTextArea};
@@ -45,3 +48,6 @@ pub use password_prompt::{PasswordPrompt, PasswordPromptResult};
 pub use row_detail::{RowDetailAction, RowDetailModal, YankFormat};
 pub use sidebar::{Sidebar, SidebarAction};
 pub use status_line::{ConnectionInfo, Priority, StatusLineBuilder, StatusSegment};
+pub use theme::{
+    load_theme, overlay_block, zone_block, zone_inner, zone_label, zone_scrollbar_area, UiTheme,
+};

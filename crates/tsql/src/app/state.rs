@@ -10,6 +10,7 @@ pub enum SidebarSection {
 pub enum Focus {
     Query,
     Grid,
+    Notebook,
     Sidebar(SidebarSection),
 }
 
@@ -18,10 +19,19 @@ impl Focus {
         match self {
             Focus::Query => "QUERY",
             Focus::Grid => "RESULTS",
+            Focus::Notebook => "NOTEBOOK",
             Focus::Sidebar(SidebarSection::Connections) => "CONNECTIONS",
             Focus::Sidebar(SidebarSection::Schema) => "SCHEMA",
         }
     }
+}
+
+/// Which main workspace is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceMode {
+    #[default]
+    Classic,
+    Notebook,
 }
 
 /// Direction for spatial pane navigation.

@@ -286,6 +286,15 @@ impl Theme {
         RatatuiStyle::default()
     }
 
+    /// Get the ratatui style defined for an exact capture name.
+    ///
+    /// Unlike [`Theme::style_for`], this does not fall back to parent captures.
+    /// It is useful when callers need to merge parent and child style fields
+    /// themselves.
+    pub fn style_for_exact(&self, capture: &str) -> Option<RatatuiStyle> {
+        self.cached_styles.get(capture).copied()
+    }
+
     /// Cache all styles as ratatui styles.
     fn cache_styles(&mut self) {
         self.cached_styles.clear();
@@ -356,6 +365,29 @@ mod tests {
         // "keyword.control" should fall back to "keyword"
         let style = theme.style_for("keyword.control");
         assert_eq!(style.fg, Some(Color::Rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn test_exact_style_lookup_does_not_fall_back() {
+        let toml = r##"
+            ["ui.selection"]
+            fg = "#FFFFFF"
+
+            ["ui.selection.editor"]
+            bg = "#333333"
+        "##;
+
+        let theme = Theme::from_toml(toml).unwrap();
+
+        let selection = theme.style_for_exact("ui.selection").unwrap();
+        assert_eq!(selection.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(selection.bg, None);
+
+        let editor = theme.style_for_exact("ui.selection.editor").unwrap();
+        assert_eq!(editor.fg, None);
+        assert_eq!(editor.bg, Some(Color::Rgb(51, 51, 51)));
+
+        assert_eq!(theme.style_for_exact("ui.selection.missing"), None);
     }
 
     #[test]

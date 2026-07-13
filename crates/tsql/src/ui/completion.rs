@@ -3,6 +3,7 @@ pub enum CompletionKind {
     Keyword,
     Table,
     Column,
+    Result,
     #[allow(dead_code)]
     Schema,
     #[allow(dead_code)]
@@ -39,6 +40,14 @@ impl CompletionItem {
             label: name,
             kind: CompletionKind::Column,
             detail: table,
+        }
+    }
+
+    pub fn result(label: String, detail: String) -> Self {
+        Self {
+            label,
+            kind: CompletionKind::Result,
+            detail: Some(detail),
         }
     }
 }
@@ -458,17 +467,17 @@ pub fn sql_keywords() -> Vec<&'static str> {
 
 /// Get the word being typed before the cursor position
 pub fn get_word_before_cursor(line: &str, col: usize) -> (String, usize) {
-    let before: String = line.chars().take(col).collect();
+    let before = line.chars().take(col).collect::<Vec<_>>();
 
-    // Find the start of the current word (alphanumeric + underscore)
-    let start = before
-        .char_indices()
-        .rev()
-        .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
-        .map(|(i, _)| i + 1)
-        .unwrap_or(0);
+    let mut start = before
+        .iter()
+        .rposition(|c| !c.is_alphanumeric() && *c != '_')
+        .map_or(0, |index| index + 1);
+    if start > 0 && before[start - 1] == '@' {
+        start -= 1;
+    }
 
-    let prefix: String = before.chars().skip(start).collect();
+    let prefix = before[start..].iter().collect();
     (prefix, start)
 }
 
@@ -497,14 +506,52 @@ pub fn determine_context(text: &str, cursor_col: usize) -> CompletionContext {
         let second_last = tokens[tokens.len() - 2];
         match second_last {
             "ORDER" | "GROUP" => return CompletionContext::General,
-            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" => {
-                if tokens.last() == Some(&"JOIN") {
-                    return CompletionContext::AfterFrom;
-                }
+            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" if tokens.last() == Some(&"JOIN") => {
+                return CompletionContext::AfterFrom;
             }
             _ => {}
         }
     }
 
     CompletionContext::General
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_prefix_includes_the_at_sign_and_uses_character_columns() {
+        assert_eq!(
+            get_word_before_cursor("SELECT * FROM @res", 18),
+            ("@res".to_string(), 14)
+        );
+        assert_eq!(
+            get_word_before_cursor("SELECT 'é' FROM @result_rec", 27),
+            ("@result_rec".to_string(), 16)
+        );
+    }
+
+    #[test]
+    fn result_completion_filters_case_insensitively() {
+        let mut popup = CompletionPopup::new();
+        popup.open(
+            vec![
+                CompletionItem::result("@result_1".to_string(), "cell 1 · 2 rows".to_string()),
+                CompletionItem::result(
+                    "@result_recent_users".to_string(),
+                    "cell 1 · 2 rows".to_string(),
+                ),
+            ],
+            "@RESULT_REC".to_string(),
+            0,
+        );
+
+        assert!(popup.active);
+        assert_eq!(popup.filtered_count(), 1);
+        assert_eq!(
+            popup.selected_item().map(|item| item.label.as_str()),
+            Some("@result_recent_users")
+        );
+    }
 }

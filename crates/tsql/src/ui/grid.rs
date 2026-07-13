@@ -4,18 +4,18 @@ use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
-    Widget,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Action;
 use crate::util::{is_uuid, looks_like_json};
 
-use super::style::selected_row_style;
+use super::{zone_block, zone_scrollbar_area, UiTheme};
 
 /// Minimum column width for display.
 const MIN_COLUMN_WIDTH: u16 = 3;
@@ -441,12 +441,10 @@ impl GridState {
             }
 
             // o to open row detail view
-            (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                if row_count > 0 {
-                    return GridKeyResult::OpenRowDetail {
-                        row: self.cursor_row,
-                    };
-                }
+            (KeyCode::Char('o'), KeyModifiers::NONE) if row_count > 0 => {
+                return GridKeyResult::OpenRowDetail {
+                    row: self.cursor_row,
+                };
             }
 
             _ => {}
@@ -815,6 +813,8 @@ impl GridState {
 pub struct GridModel {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Per-cell SQL NULL identity, separate from the rendered cell text.
+    pub null_cells: Vec<Vec<bool>>,
     pub col_widths: Vec<u16>,
     /// The source table name, if known (extracted from simple SELECT queries).
     pub source_table: Option<String>,
@@ -828,9 +828,11 @@ impl GridModel {
     pub fn new(headers: Vec<String>, rows: Vec<Vec<String>>) -> Self {
         let col_widths = compute_column_widths(&headers, &rows);
         let col_count = headers.len();
+        let null_cells = rows.iter().map(|row| vec![false; row.len()]).collect();
         Self {
             headers,
             rows,
+            null_cells,
             col_widths,
             source_table: None,
             primary_keys: Vec::new(),
@@ -853,10 +855,32 @@ impl GridModel {
         self
     }
 
+    /// Attach SQL NULL identity captured while decoding database rows.
+    pub fn with_null_cells(mut self, mut null_cells: Vec<Vec<bool>>) -> Self {
+        null_cells.resize_with(self.rows.len(), Vec::new);
+        null_cells.truncate(self.rows.len());
+        for (row, mask) in self.rows.iter().zip(&mut null_cells) {
+            mask.resize(row.len(), false);
+            mask.truncate(row.len());
+        }
+        self.null_cells = null_cells;
+        self
+    }
+
+    /// Return whether the cell was decoded from an actual SQL NULL.
+    pub fn cell_is_null(&self, row: usize, col: usize) -> bool {
+        self.null_cells
+            .get(row)
+            .and_then(|mask| mask.get(col))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn empty() -> Self {
         Self {
             headers: Vec::new(),
             rows: Vec::new(),
+            null_cells: Vec::new(),
             col_widths: Vec::new(),
             source_table: None,
             primary_keys: Vec::new(),
@@ -872,6 +896,15 @@ impl GridModel {
     /// Note: If new rows have more columns than the existing model, extra columns
     /// are ignored. If new rows have fewer columns, missing columns are not processed.
     pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
+        self.append_rows_with_nulls(new_rows, Vec::new());
+    }
+
+    /// Append rows together with the SQL NULL identity captured for each cell.
+    pub fn append_rows_with_nulls(
+        &mut self,
+        new_rows: Vec<Vec<String>>,
+        mut null_cells: Vec<Vec<bool>>,
+    ) {
         // Update column widths for any cells that are wider than current widths
         for row in &new_rows {
             for (i, cell) in row.iter().enumerate() {
@@ -891,7 +924,14 @@ impl GridModel {
             }
         }
 
+        null_cells.resize_with(new_rows.len(), Vec::new);
+        null_cells.truncate(new_rows.len());
+        for (row, mask) in new_rows.iter().zip(&mut null_cells) {
+            mask.resize(row.len(), false);
+            mask.truncate(row.len());
+        }
         self.rows.extend(new_rows);
+        self.null_cells.extend(null_cells);
     }
 
     /// Get the column type for a given column index.
@@ -991,7 +1031,14 @@ impl GridModel {
                 .headers
                 .iter()
                 .zip(row.iter())
-                .map(|(h, v)| format!("  \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                .enumerate()
+                .map(|(col, (header, value))| {
+                    if self.cell_is_null(row_idx, col) {
+                        format!("  \"{}\": null", escape_json(header))
+                    } else {
+                        format!("  \"{}\": \"{}\"", escape_json(header), escape_json(value))
+                    }
+                })
                 .collect();
             format!("{{\n{}\n}}", pairs.join(",\n"))
         })
@@ -1007,7 +1054,18 @@ impl GridModel {
                         .headers
                         .iter()
                         .zip(row.iter())
-                        .map(|(h, v)| format!("    \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                        .enumerate()
+                        .map(|(col, (header, value))| {
+                            if self.cell_is_null(idx, col) {
+                                format!("    \"{}\": null", escape_json(header))
+                            } else {
+                                format!(
+                                    "    \"{}\": \"{}\"",
+                                    escape_json(header),
+                                    escape_json(value)
+                                )
+                            }
+                        })
                         .collect();
                     format!("  {{\n{}\n  }}", pairs.join(",\n"))
                 })
@@ -1015,6 +1073,45 @@ impl GridModel {
             .collect();
 
         format!("[\n{}\n]", objects.join(",\n"))
+    }
+
+    /// Format rows as one SQL INSERT statement per row.
+    pub fn rows_as_sql_inserts(&self, row_indices: &[usize], table: &str) -> String {
+        if self.headers.is_empty() {
+            return String::new();
+        }
+
+        let table = table
+            .split('.')
+            .map(quote_identifier)
+            .collect::<Vec<_>>()
+            .join(".");
+        let columns = self
+            .headers
+            .iter()
+            .map(|header| quote_identifier(header))
+            .collect::<Vec<_>>()
+            .join(", ");
+        row_indices
+            .iter()
+            .filter_map(|&row_index| self.rows.get(row_index).map(|row| (row_index, row)))
+            .map(|(row_index, row)| {
+                let values = row
+                    .iter()
+                    .enumerate()
+                    .map(|(col_index, value)| {
+                        if self.cell_is_null(row_index, col_index) {
+                            "NULL".to_string()
+                        } else {
+                            format!("'{}'", value.replace('\'', "''"))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("INSERT INTO {table} ({columns}) VALUES ({values});")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Format rows as a GitHub-flavored markdown table (always includes headers).
@@ -1381,16 +1478,28 @@ fn escape_csv(s: &str) -> String {
 
 /// Escape a string for JSON output.
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            control if control < ' ' => escaped.push_str(&format!("\\u{:04x}", control as u32)),
+            printable => escaped.push(printable),
+        }
+    }
+    escaped
 }
 
 pub struct DataGrid<'a> {
     pub model: &'a GridModel,
     pub state: &'a GridState,
+    pub label: Line<'a>,
+    pub theme: &'a UiTheme,
     pub focused: bool,
     pub show_row_numbers: bool,
     pub show_scrollbar: bool,
@@ -1398,54 +1507,84 @@ pub struct DataGrid<'a> {
 
 impl<'a> Widget for DataGrid<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Build a concise title with search info if active.
-        let base_title = if self.focused {
-            " ● Results "
-        } else {
-            " Results "
-        };
-        let title = if let Some(search_info) = self.state.search.match_info() {
-            format!("{} {}", base_title, search_info)
-        } else {
-            base_title.to_string()
-        };
-
-        let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        let block = Block::default()
-            .title(title)
-            .title_style(if self.focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            })
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let block = zone_block(
+            self.label,
+            self.theme.bg_base,
+            self.theme.text,
+            self.focused,
+            self.theme.accent,
+        );
 
         let inner = block.inner(area);
         block.render(area, buf);
+
+        GridViewport {
+            model: self.model,
+            state: self.state,
+            theme: self.theme,
+            focused: true,
+            show_row_numbers: self.show_row_numbers,
+            show_scrollbar: self.show_scrollbar,
+        }
+        .render_with_scrollbar_area(inner, buf, zone_scrollbar_area(area));
+    }
+}
+
+/// A navigable grid viewport without the surrounding results-zone chrome.
+pub struct GridViewport<'a> {
+    pub model: &'a GridModel,
+    pub state: &'a GridState,
+    pub theme: &'a UiTheme,
+    pub focused: bool,
+    pub show_row_numbers: bool,
+    pub show_scrollbar: bool,
+}
+
+impl Widget for GridViewport<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let has_scrollbar =
+            self.show_scrollbar && self.model.rows.len() > area.height.saturating_sub(1) as usize;
+        let viewport = Rect {
+            width: area.width.saturating_sub(u16::from(has_scrollbar)),
+            ..area
+        };
+        let scrollbar_area = Rect {
+            x: area.right().saturating_sub(1),
+            y: area.y,
+            width: u16::from(area.width > 0),
+            height: area.height,
+        };
+        self.render_with_scrollbar_area(viewport, buf, scrollbar_area);
+    }
+}
+
+impl GridViewport<'_> {
+    fn render_with_scrollbar_area(self, area: Rect, buf: &mut Buffer, scrollbar_area: Rect) {
+        let inner = area;
 
         if inner.width == 0 || inner.height == 0 {
             return;
         }
 
         if self.model.headers.is_empty() {
-            Paragraph::new("No columns")
-                .style(Style::default().fg(Color::Gray))
-                .render(inner, buf);
+            // Center the empty-state hint so the blank zone reads as intentional.
+            let message_area = Rect {
+                x: inner.x,
+                y: inner.y + inner.height / 2,
+                width: inner.width,
+                height: 1,
+            };
+            Paragraph::new("No results · press Enter in the Query pane to run")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(self.theme.text_muted))
+                .render(message_area, buf);
             return;
         }
 
         // Reserve one line for header.
         if inner.height < 2 {
             Paragraph::new("Window too small")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(self.theme.text_muted))
                 .render(inner, buf);
             return;
         }
@@ -1492,6 +1631,7 @@ impl<'a> Widget for DataGrid<'a> {
             marker_w,
             self.show_row_numbers,
             row_number_width,
+            self.theme,
         );
         render_row_cells(
             data_x,
@@ -1500,9 +1640,7 @@ impl<'a> Widget for DataGrid<'a> {
             &self.model.headers,
             &self.model.col_widths,
             self.state.col_offset,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            self.theme.grid_header,
             None,  // No search highlighting for headers
             false, // Headers never have UUID expansion
             buf,
@@ -1511,7 +1649,7 @@ impl<'a> Widget for DataGrid<'a> {
         // Body rows.
         if self.model.rows.is_empty() {
             Paragraph::new("(no rows)")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(self.theme.text_muted))
                 .render(body_area, buf);
             return;
         }
@@ -1523,11 +1661,11 @@ impl<'a> Widget for DataGrid<'a> {
             }
             let y = body_area.y + i as u16;
 
-            let is_cursor = row_idx == self.state.cursor_row;
+            let is_cursor = self.focused && row_idx == self.state.cursor_row;
             let is_selected = self.state.selected_rows.contains(&row_idx);
 
             let row_style = if is_cursor {
-                selected_row_style()
+                self.theme.selection
             } else {
                 Style::default()
             };
@@ -1543,6 +1681,7 @@ impl<'a> Widget for DataGrid<'a> {
                 self.show_row_numbers,
                 row_number_width,
                 row_idx + 1, // 1-based row number
+                self.theme,
             );
 
             // Determine cursor column for this row (only if this is the cursor row)
@@ -1564,6 +1703,7 @@ impl<'a> Widget for DataGrid<'a> {
                 cursor_col,
                 &self.state.search,
                 self.state.uuid_expanded,
+                self.theme,
                 buf,
             );
         }
@@ -1574,19 +1714,12 @@ impl<'a> Widget for DataGrid<'a> {
                 .begin_symbol(Some("▲"))
                 .end_symbol(Some("▼"))
                 .thumb_symbol("█")
-                .track_symbol(Some("░"));
+                .track_symbol(Some("░"))
+                .style(self.theme.scrollbar);
 
             let mut scrollbar_state = ScrollbarState::new(self.model.rows.len())
                 .position(self.state.cursor_row)
                 .viewport_content_length(body_area.height as usize);
-
-            // Render scrollbar on the right edge of the body area
-            let scrollbar_area = Rect {
-                x: body_area.x + body_area.width.saturating_sub(1),
-                y: body_area.y,
-                width: 1,
-                height: body_area.height,
-            };
 
             scrollbar.render(scrollbar_area, buf, &mut scrollbar_state);
         }
@@ -1599,27 +1732,21 @@ fn render_marker_header(
     marker_w: u16,
     show_row_numbers: bool,
     row_number_width: u16,
+    theme: &UiTheme,
 ) {
     let mut x = area.x;
 
     // Render row number header (e.g., "#" or empty)
     if show_row_numbers && row_number_width > 0 {
         let header = format!("{:>width$}", "#", width = (row_number_width - 1) as usize);
-        buf.set_string(
-            x,
-            area.y,
-            &header,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+        buf.set_string(x, area.y, &header, theme.grid_header);
         x += row_number_width;
     }
 
     // Fill remaining marker area with spaces
     let remaining = marker_w.saturating_sub(row_number_width);
     for _ in 0..remaining {
-        buf.set_string(x, area.y, " ", Style::default());
+        buf.set_string(x, area.y, " ", theme.grid_header);
         x += 1;
     }
 }
@@ -1636,6 +1763,7 @@ fn render_marker_cell(
     show_row_numbers: bool,
     row_number_width: u16,
     row_number: usize,
+    theme: &UiTheme,
 ) {
     let mut current_x = x;
 
@@ -1646,11 +1774,11 @@ fn render_marker_cell(
             row_number,
             width = (row_number_width - 1) as usize
         );
-        // Use lighter color for cursor row (DarkGray bg) to ensure visibility
+        // Use primary text on the selected row and muted text otherwise.
         let row_num_style = if is_cursor {
-            style.fg(Color::Gray)
+            style.fg(theme.text)
         } else {
-            style.fg(Color::DarkGray)
+            style.fg(theme.text_muted)
         };
         buf.set_string(current_x, y, &row_num_str, row_num_style);
         current_x += row_number_width;
@@ -1731,6 +1859,7 @@ fn render_row_cells_with_search(
     cursor_col: Option<usize>,
     search: &GridSearch,
     uuid_expanded: bool,
+    theme: &UiTheme,
     buf: &mut Buffer,
 ) {
     if available_w == 0 {
@@ -1739,13 +1868,6 @@ fn render_row_cells_with_search(
 
     let padding: u16 = 1;
     let max_x = x.saturating_add(available_w);
-
-    // Styles for search matches and cursor
-    let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
-    let current_match_style = Style::default()
-        .bg(Color::Rgb(255, 165, 0))
-        .fg(Color::Black); // Orange
-    let cursor_cell_style = Style::default().bg(Color::Cyan).fg(Color::Black);
 
     let mut col = col_offset;
     while col < cells.len() && col < col_widths.len() && x < max_x {
@@ -1763,11 +1885,11 @@ fn render_row_cells_with_search(
         // Determine cell style based on cursor position and search state
         let is_cursor_cell = cursor_col == Some(col);
         let cell_style = if is_cursor_cell {
-            cursor_cell_style
+            theme.cursor_cell
         } else if search.is_current_match(row_idx, col) {
-            current_match_style
+            theme.search_match_current
         } else if search.is_match(row_idx, col) {
-            match_style
+            theme.search_match
         } else {
             base_style
         };
@@ -1927,7 +2049,7 @@ fn truncate_by_display_width(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::assert_selected_bg_has_visible_fg;
+    use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
 
     fn create_test_model() -> GridModel {
         GridModel::new(
@@ -1980,6 +2102,100 @@ mod tests {
         // Test without headers
         let result = model.rows_as_tsv(&[0], false);
         assert_eq!(result, "1\tAlice", "Should not include header row");
+    }
+
+    #[test]
+    fn rows_as_json_escapes_all_control_characters() {
+        let model = GridModel::new(
+            vec!["odd\u{0001}header".to_string()],
+            vec![vec!["back\u{0008} form\u{000c} line\nend".to_string()]],
+        );
+
+        let encoded = model.rows_as_json(&[0]);
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            decoded[0]["odd\u{0001}header"],
+            "back\u{0008} form\u{000c} line\nend"
+        );
+    }
+
+    #[test]
+    fn rows_as_json_preserves_sql_null_identity() {
+        let model = GridModel::new(
+            vec![
+                "actual_null".to_string(),
+                "literal_null".to_string(),
+                "empty".to_string(),
+            ],
+            vec![vec!["NULL".to_string(), "NULL".to_string(), String::new()]],
+        )
+        .with_null_cells(vec![vec![true, false, false]]);
+
+        let row: serde_json::Value = serde_json::from_str(&model.row_as_json(0).unwrap()).unwrap();
+        assert!(row["actual_null"].is_null());
+        assert_eq!(row["literal_null"], "NULL");
+        assert_eq!(row["empty"], "");
+
+        let rows: serde_json::Value = serde_json::from_str(&model.rows_as_json(&[0])).unwrap();
+        assert!(rows[0]["actual_null"].is_null());
+        assert_eq!(rows[0]["literal_null"], "NULL");
+        assert_eq!(rows[0]["empty"], "");
+    }
+
+    #[test]
+    fn rows_as_sql_inserts_quotes_identifiers_escapes_values_and_skips_missing_rows() {
+        let model = GridModel::new(
+            vec![
+                "id".to_string(),
+                "display \"name\"".to_string(),
+                "enabled".to_string(),
+                "missing".to_string(),
+                "empty".to_string(),
+            ],
+            vec![
+                vec![
+                    "1".to_string(),
+                    "O'Reilly".to_string(),
+                    "true".to_string(),
+                    "NULL".to_string(),
+                    String::new(),
+                ],
+                vec![
+                    "2".to_string(),
+                    "line one\nline two".to_string(),
+                    "false".to_string(),
+                    "NULL".to_string(),
+                    String::new(),
+                ],
+            ],
+        )
+        .with_null_cells(vec![
+            vec![false, false, false, true, false],
+            vec![false, false, false, false, false],
+        ]);
+
+        assert_eq!(
+            model.rows_as_sql_inserts(&[1, 99, 0], "reporting.user \"copy\""),
+            concat!(
+                "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
+                "(id, \"display \"\"name\"\"\", enabled, missing, empty) ",
+                "VALUES ('2', 'line one\nline two', 'false', 'NULL', '');\n",
+                "INSERT INTO reporting.\"user \"\"copy\"\"\" ",
+                "(id, \"display \"\"name\"\"\", enabled, missing, empty) ",
+                "VALUES ('1', 'O''Reilly', 'true', NULL, '');"
+            )
+        );
+    }
+
+    #[test]
+    fn rows_as_sql_inserts_returns_empty_when_there_is_nothing_to_export() {
+        let model = create_test_model();
+        assert!(model.rows_as_sql_inserts(&[], "result").is_empty());
+        assert!(model.rows_as_sql_inserts(&[99], "result").is_empty());
+
+        let no_headers = GridModel::new(Vec::new(), vec![vec!["value".to_string()]]);
+        assert!(no_headers.rows_as_sql_inserts(&[0], "result").is_empty());
     }
 
     #[test]
@@ -2045,6 +2261,7 @@ mod tests {
     #[test]
     fn test_cursor_row_uses_visible_foreground_on_dark_background() {
         let model = create_test_model();
+        let theme = UiTheme::fallback();
         let state = GridState {
             cursor_row: 1,
             cursor_col: 1,
@@ -2053,6 +2270,8 @@ mod tests {
         let grid = DataGrid {
             model: &model,
             state: &state,
+            label: Line::from(" RESULTS"),
+            theme: &theme,
             focused: true,
             show_row_numbers: true,
             show_scrollbar: false,
@@ -2062,7 +2281,139 @@ mod tests {
 
         grid.render(area, &mut buf);
 
-        assert_selected_bg_has_visible_fg(&buf);
+        assert_nonblank_cells_have_explicit_fg(&buf);
+    }
+
+    #[test]
+    fn test_grid_viewport_renders_header_cursor_selection_search_and_scrollbar() {
+        let model = GridModel::new(
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+                vec!["3".to_string(), "Carol".to_string()],
+                vec!["4".to_string(), "Diana".to_string()],
+            ],
+        );
+        let theme = UiTheme::fallback();
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        state.selected_rows.insert(0);
+        state.search.search("Alice", &model);
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buffer = Buffer::empty(area);
+
+        GridViewport {
+            model: &model,
+            state: &state,
+            theme: &theme,
+            focused: true,
+            show_row_numbers: true,
+            show_scrollbar: true,
+        }
+        .render(area, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "#");
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "i");
+        assert_eq!(buffer.cell((9, 0)).unwrap().symbol(), "n");
+        assert_eq!(
+            buffer.cell((9, 0)).unwrap().fg,
+            theme.grid_header.fg.unwrap()
+        );
+        assert_eq!(
+            buffer.cell((9, 0)).unwrap().bg,
+            theme.grid_header.bg.unwrap()
+        );
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "*");
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), ">");
+        assert_eq!(
+            buffer.cell((9, 1)).unwrap().bg,
+            theme.search_match_current.bg.unwrap()
+        );
+        assert_eq!(
+            buffer.cell((9, 2)).unwrap().bg,
+            theme.cursor_cell.bg.unwrap()
+        );
+        assert_eq!(buffer.cell((19, 0)).unwrap().symbol(), "▲");
+        assert_eq!(buffer.cell((19, 2)).unwrap().symbol(), "▼");
+    }
+
+    #[test]
+    fn test_unfocused_grid_viewport_hides_cursor_and_keeps_selection_and_search() {
+        let model = create_test_model();
+        let theme = UiTheme::fallback();
+        let mut state = GridState {
+            cursor_row: 1,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        state.selected_rows.insert(0);
+        state.search.search("Alice", &model);
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+
+        GridViewport {
+            model: &model,
+            state: &state,
+            theme: &theme,
+            focused: false,
+            show_row_numbers: true,
+            show_scrollbar: false,
+        }
+        .render(area, &mut buffer);
+
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "*");
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), " ");
+        assert_eq!(
+            buffer.cell((9, 1)).unwrap().bg,
+            theme.search_match_current.bg.unwrap()
+        );
+        assert_ne!(
+            buffer.cell((9, 2)).unwrap().bg,
+            theme.cursor_cell.bg.unwrap()
+        );
+        assert_ne!(buffer.cell((9, 2)).unwrap().bg, theme.selection.bg.unwrap());
+    }
+
+    #[test]
+    fn test_built_in_themes_style_labels_and_ordinary_cells() {
+        let model = create_test_model();
+        let state = GridState {
+            cursor_row: 1,
+            ..Default::default()
+        };
+
+        for syntax_theme in [
+            tui_syntax::themes::one_dark(),
+            tui_syntax::themes::github_light(),
+        ] {
+            let theme = UiTheme::from_theme(&syntax_theme);
+            let grid = DataGrid {
+                model: &model,
+                state: &state,
+                label: Line::from(" RESULTS · 2 rows"),
+                theme: &theme,
+                focused: false,
+                show_row_numbers: false,
+                show_scrollbar: false,
+            };
+            let area = Rect::new(0, 0, 40, 6);
+            let mut buffer = Buffer::empty(area);
+
+            grid.render(area, &mut buffer);
+
+            assert_nonblank_cells_have_explicit_fg(&buffer);
+            let alice = buffer
+                .content
+                .iter()
+                .find(|cell| cell.symbol() == "A")
+                .expect("Alice should be rendered");
+            assert_eq!(alice.fg, theme.text);
+            assert_eq!(alice.bg, theme.bg_base);
+        }
     }
 
     #[test]
@@ -2145,6 +2496,7 @@ mod tests {
 
         // Create a model with several columns
         let model = create_wide_test_model();
+        let theme = UiTheme::fallback();
 
         // Create state with cursor at rightmost column but col_offset at 0
         // This simulates the bug: cursor moved right but header hasn't scrolled
@@ -2157,21 +2509,23 @@ mod tests {
         let grid = DataGrid {
             model: &model,
             state: &state,
+            label: Line::from(" RESULTS"),
+            theme: &theme,
             focused: true,
             show_row_numbers: false,
             show_scrollbar: false,
         };
 
         // Render to a small buffer (narrow viewport)
-        // Width of 20 should only fit ~2-3 columns with border + marker
+        // Width of 20 should only fit ~2-3 columns with zone chrome + marker
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = Buffer::empty(area);
         grid.render(area, &mut buf);
 
-        // The header row is at y=1 (after border)
-        // After marker column (3 chars), data starts at x=4
+        // The header row is at y=1 (after the label)
+        // After the left edge, padding, and marker column, data starts at x=5
         // Check that the header shows same columns as body
-        let header_row: String = (4..area.width - 1)
+        let header_row: String = (5..area.width - 1)
             .map(|x| {
                 buf.cell((x, 1))
                     .map(|c| c.symbol().chars().next().unwrap_or(' '))
@@ -2180,7 +2534,7 @@ mod tests {
             .collect();
 
         // Body row is at y=2
-        let body_row: String = (4..area.width - 1)
+        let body_row: String = (5..area.width - 1)
             .map(|x| {
                 buf.cell((x, 2))
                     .map(|c| c.symbol().chars().next().unwrap_or(' '))
@@ -2819,48 +3173,21 @@ mod tests {
     }
 
     #[test]
-    fn test_row_number_cursor_row_uses_visible_color() {
-        // When is_cursor is true, the row number should use Color::Gray (lighter)
-        // to be visible against the DarkGray background of the cursor row.
-        // This is a unit test for the logic, not the actual rendering.
-        let is_cursor = true;
-        let base_style = Style::default().bg(Color::DarkGray);
+    fn test_row_number_cursor_row_uses_theme_text_on_selection() {
+        let theme = UiTheme::fallback();
+        let row_num_style = theme.selection.fg(theme.text);
 
-        // Simulate the logic from render_marker_cell
-        let row_num_style = if is_cursor {
-            base_style.fg(Color::Gray)
-        } else {
-            base_style.fg(Color::DarkGray)
-        };
-
-        // Verify foreground is Gray (not DarkGray which would be invisible)
-        assert_eq!(
-            row_num_style.fg,
-            Some(Color::Gray),
-            "Cursor row should use Gray foreground for visibility"
-        );
+        assert_eq!(row_num_style.fg, Some(theme.text));
+        assert_eq!(row_num_style.bg, theme.selection.bg);
     }
 
     #[test]
-    fn test_row_number_non_cursor_row_uses_dark_gray() {
-        // When is_cursor is false, the row number should use DarkGray
-        // (subdued color since background is default/transparent).
-        let is_cursor = false;
-        let base_style = Style::default();
+    fn test_row_number_non_cursor_row_uses_theme_muted_text() {
+        let theme = UiTheme::fallback();
+        let row_num_style = Style::default().fg(theme.text_muted);
 
-        // Simulate the logic from render_marker_cell
-        let row_num_style = if is_cursor {
-            base_style.fg(Color::Gray)
-        } else {
-            base_style.fg(Color::DarkGray)
-        };
-
-        // Verify foreground is DarkGray for non-cursor rows
-        assert_eq!(
-            row_num_style.fg,
-            Some(Color::DarkGray),
-            "Non-cursor row should use DarkGray foreground"
-        );
+        assert_eq!(row_num_style.fg, Some(theme.text_muted));
+        assert_eq!(row_num_style.bg, None);
     }
 
     // =========================================================================
@@ -2902,6 +3229,46 @@ mod tests {
         // Width should increase for the name column
         assert_eq!(model.col_widths[0], 3); // unchanged
         assert_eq!(model.col_widths[1], 11); // "Christopher"
+    }
+
+    #[test]
+    fn null_metadata_distinguishes_sql_null_from_literal_null_text() {
+        let model = GridModel::new(
+            vec!["actual_null".to_string(), "literal_null".to_string()],
+            vec![vec!["NULL".to_string(), "NULL".to_string()]],
+        )
+        .with_null_cells(vec![vec![true, false]]);
+
+        assert!(model.cell_is_null(0, 0));
+        assert!(!model.cell_is_null(0, 1));
+        assert!(!model.cell_is_null(1, 0));
+        assert!(!model.cell_is_null(0, 2));
+    }
+
+    #[test]
+    fn append_rows_with_nulls_preserves_and_normalizes_null_metadata() {
+        let mut model = GridModel::new(
+            vec!["left".to_string(), "right".to_string()],
+            vec![vec!["NULL".to_string(), "value".to_string()]],
+        )
+        .with_null_cells(vec![vec![true]]);
+
+        model.append_rows_with_nulls(
+            vec![
+                vec!["NULL".to_string(), "NULL".to_string()],
+                vec!["value".to_string(), "NULL".to_string()],
+            ],
+            vec![vec![false, true, true]],
+        );
+
+        assert_eq!(
+            model.null_cells,
+            vec![vec![true, false], vec![false, true], vec![false, false]]
+        );
+        assert!(model.cell_is_null(0, 0));
+        assert!(!model.cell_is_null(1, 0));
+        assert!(model.cell_is_null(1, 1));
+        assert!(!model.cell_is_null(2, 1));
     }
 
     #[test]

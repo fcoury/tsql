@@ -2,7 +2,10 @@ use std::env;
 use std::io::{self, Stdout, Write};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -13,7 +16,7 @@ use ratatui::Terminal;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use tsql::app::App;
+use tsql::app::{App, WorkspaceMode};
 use tsql::config;
 use tsql::session::load_session;
 use tsql::ui::GridModel;
@@ -155,6 +158,7 @@ fn print_usage() {
     eprintln!("      --debug-keys  Print detected key/mouse events (for troubleshooting)");
     eprintln!("      --mouse       (with --debug-keys) Also print mouse events");
     eprintln!("      --safe-mode   Skip session reconnect and startup side effects");
+    eprintln!("      --notebook    Start in the notebook workspace");
     eprintln!("      --no-auto-connect");
     eprintln!("                    Alias for --safe-mode");
     eprintln!();
@@ -303,6 +307,7 @@ fn main() -> Result<()> {
     }
 
     let safe_mode = has_any_startup_option(&args, &["--safe-mode", "--no-auto-connect"]);
+    let notebook_mode = has_any_startup_option(&args, &["--notebook"]);
     let mut startup_warnings: Vec<String> = Vec::new();
 
     if let Err(err) = config::migrate_legacy_config_dir_on_startup() {
@@ -349,6 +354,7 @@ fn main() -> Result<()> {
         cfg,
     );
     app.set_safe_mode(safe_mode);
+    startup_warnings.extend(app.take_startup_warnings());
 
     // Display startup warnings.
     if let Some(warning) = libpq_warning {
@@ -370,6 +376,9 @@ fn main() -> Result<()> {
 
     // Apply session state (editor content, sidebar visibility, pending schema expanded)
     let session_connection = app.apply_session_state(session);
+    if notebook_mode {
+        app.switch_workspace(WorkspaceMode::Notebook);
+    }
 
     // Auto-connect from session if no CLI/env connection was specified. Queue
     // it for after the first draw so keychain/1Password cannot black-screen
@@ -514,7 +523,12 @@ fn run_debug_keys(with_mouse: bool) -> Result<()> {
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -526,7 +540,8 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     Ok(())

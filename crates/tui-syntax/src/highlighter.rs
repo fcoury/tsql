@@ -271,7 +271,7 @@ impl Highlighter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::languages::{html, sql};
+    use crate::languages::{html, javascript, sql};
     use crate::themes;
 
     #[test]
@@ -350,5 +350,20 @@ mod tests {
 </html>"#;
         let lines = highlighter.highlight("html", html_content).unwrap();
         assert_eq!(lines.len(), 8);
+    }
+
+    #[test]
+    fn test_highlight_mongo_shell_javascript() {
+        let theme = themes::one_dark();
+        let mut highlighter = Highlighter::new(theme);
+        highlighter.register_language(javascript()).unwrap();
+
+        let source =
+            "// recent users\ndb.users.find({ active: true, score: { $gte: 10 } }).limit(5)";
+        let lines = highlighter.highlight("javascript", source).unwrap();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| !line.spans.is_empty()));
+        assert!(lines[1].spans.len() > 1);
     }
 }

@@ -3,13 +3,14 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
+use super::{overlay_block, UiTheme};
 
 /// Result of handling a key event in the help popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,7 @@ const GLOBAL: HelpSection = HelpSection::new(
         KeyBinding::new("Ctrl-h/j/k/l", "Move between panes in Normal mode"),
         KeyBinding::new("Alt-h/j/k/l", "Move between panes in any mode"),
         KeyBinding::new("Alt+M", "Toggle maximized results view"),
+        KeyBinding::new("Ctrl+Shift+P / Cmd+K", "Open contextual Actions palette"),
         KeyBinding::new("Esc", "Return to normal mode / close popup"),
         KeyBinding::new("q", "Quit application"),
         KeyBinding::new("?", "Toggle this help  (/ to filter inside)"),
@@ -149,6 +151,51 @@ const SIDEBAR_SCHEMA: HelpSection = HelpSection::new(
         KeyBinding::new("Enter (table) then d", "Replace with DELETE template"),
         KeyBinding::new("Enter (table) then n", "Insert table name"),
         KeyBinding::new("r / Ctrl-r", "Refresh schema"),
+    ],
+);
+
+const NOTEBOOK: HelpSection = HelpSection::new(
+    "Notebook - Cell Focus",
+    &[
+        KeyBinding::new("j/k or arrows", "Select next/previous cell"),
+        KeyBinding::new("gg / G, Home / End", "Select first/last cell"),
+        KeyBinding::new("PageUp/Down, Ctrl-u/d", "Move between cells by page"),
+        KeyBinding::new("Enter / e", "Focus the selected cell editor"),
+        KeyBinding::new("o", "Expand and inspect the selected result"),
+        KeyBinding::new("Ctrl+E", "Execute the selected cell"),
+        KeyBinding::new("E", "Execute cell and advance"),
+        KeyBinding::new("n", "Select or create the trailing draft"),
+        KeyBinding::new("r", "Refine a retained result snapshot"),
+        KeyBinding::new(
+            "@result / @result_N",
+            "Reference the latest result or cell N",
+        ),
+        KeyBinding::new("h / l", "Collapse / expand the selected result"),
+        KeyBinding::new("z", "Collapse/expand cell output"),
+        KeyBinding::new("x", "Clear cell and dependent executions"),
+        KeyBinding::new("dd / Delete", "Delete the selected cell"),
+        KeyBinding::new(":", "Open command prompt"),
+        KeyBinding::new("Esc", "Return from editor/result to cell focus"),
+    ],
+);
+
+const NOTEBOOK_RESULT: HelpSection = HelpSection::new(
+    "Notebook - Result Focus (read-only)",
+    &[
+        KeyBinding::new("o / click result", "Expand result and compact other cells"),
+        KeyBinding::new("h/j/k/l or arrows", "Navigate result cells"),
+        KeyBinding::new("gg / G, 0 / $", "First/last row or column"),
+        KeyBinding::new("PageUp/Down, Ctrl-u/d", "Move between rows by page"),
+        KeyBinding::new(
+            "Space / a / A",
+            "Toggle, select all, or invert row selection",
+        ),
+        KeyBinding::new("c, yy / yY", "Copy cell or yank row(s) as TSV"),
+        KeyBinding::new("yj, yc / yC, ym", "Yank row(s) as JSON, CSV, or Markdown"),
+        KeyBinding::new("/ then n / N", "Search and move between matches"),
+        KeyBinding::new("+ / -, =", "Resize or fit/collapse the current column"),
+        KeyBinding::new("o", "Open row detail"),
+        KeyBinding::new("Esc", "Restore notebook flow and cell focus"),
     ],
 );
 
@@ -248,6 +295,10 @@ const GRID_ACTIONS: HelpSection = HelpSection::new(
         KeyBinding::new("o", "Open row detail view"),
         KeyBinding::new("/", "Search in results"),
         KeyBinding::new("n/N", "Next/previous match"),
+        KeyBinding::new(
+            "Ctrl+Shift+P / Cmd+K",
+            "Sort, filter, project, or group the focused Classic/PostgreSQL result",
+        ),
         KeyBinding::new("Ctrl-r", "Rerun last query"),
     ],
 );
@@ -280,9 +331,100 @@ const COMMANDS: HelpSection = HelpSection::new(
     &[
         KeyBinding::new(":connect <url>", "Connect to database"),
         KeyBinding::new(":disconnect", "Disconnect from database"),
-        KeyBinding::new(":export <fmt> <path>", "Export results (csv/json/tsv)"),
+        KeyBinding::new(
+            ":export <fmt> <path>",
+            "Export result or selected rows (csv/json/tsv/sql); retained results stream",
+        ),
         KeyBinding::new(":gen <type>", "Generate SQL (update/delete/insert)"),
         KeyBinding::new(":history", "Open history picker"),
+        KeyBinding::new(":actions / :palette", "Open contextual Actions palette"),
+        KeyBinding::new(
+            ":sort asc|desc|add-asc|add-desc|toggle",
+            "Sort the focused Classic/PostgreSQL result",
+        ),
+        KeyBinding::new(
+            ":filter [#column|name] eq|ne|<|<=|>|>=|contains|not-contains|null|not-null [value]",
+            "Filter the focused Classic/PostgreSQL result",
+        ),
+        KeyBinding::new(
+            ":columns / :group-count",
+            "Choose result columns or group and count the current column",
+        ),
+        KeyBinding::new(
+            ":clear-filters / :clear-sort / :reset-result",
+            "Clear or reset Classic result transformations",
+        ),
+        KeyBinding::new(
+            ":result-sql copy|open",
+            "Copy transformed SQL or open it in the editor",
+        ),
+        KeyBinding::new(
+            ":snippets / :snippet-save <name>",
+            "Load or save reusable named query snippets",
+        ),
+        KeyBinding::new(
+            ":snippet <name> / :snippet-delete <name>",
+            "Load or delete a named query snippet",
+        ),
+        KeyBinding::new(":notebook / :mode notebook", "Switch to Notebook mode"),
+        KeyBinding::new(":mode classic", "Switch to Classic mode"),
+        KeyBinding::new(
+            ":rebase / :rebind",
+            "Rebind a cell to the latest source result",
+        ),
+        KeyBinding::new(":detach", "Remove a cell's result dependency"),
+        KeyBinding::new(
+            ":run-without-snapshot",
+            "Run the selected cell without retaining a snapshot",
+        ),
+        KeyBinding::new(
+            ":run-all / :run-above / :run-below",
+            "Run notebook cells in dependency order",
+        ),
+        KeyBinding::new(
+            ":run-dependents",
+            "Rerun the selected cell and its dependents",
+        ),
+        KeyBinding::new(
+            ":open-notebook / :save-notebook <path>",
+            "Open or save a portable notebook document",
+        ),
+        KeyBinding::new(
+            ":insert-above / :insert-below / :duplicate-cell",
+            "Insert or duplicate a notebook cell",
+        ),
+        KeyBinding::new(
+            ":move-cell-up / :move-cell-down",
+            "Reorder the selected notebook cell",
+        ),
+        KeyBinding::new(
+            ":name <identifier> / :name clear",
+            "Set or clear a stable notebook result name",
+        ),
+        KeyBinding::new(
+            ":outline / :cell <id-or-name>",
+            "List notebook cells or jump to one",
+        ),
+        KeyBinding::new(
+            ":error / :copy-error",
+            "Inspect or copy the selected notebook cell error",
+        ),
+        KeyBinding::new(
+            ":error-jump / :activity",
+            "Go to a mapped error or the latest off-screen cell update",
+        ),
+        KeyBinding::new(
+            ":cell-history / :cell-run <id>",
+            "Browse completed cell runs or restore a previous source",
+        ),
+        KeyBinding::new(
+            ":explain-cell",
+            "Run EXPLAIN for the selected PostgreSQL notebook cell",
+        ),
+        KeyBinding::new(
+            ":collapse-source / :expand-source / :toggle-source",
+            "Compact or reveal the selected notebook source",
+        ),
         KeyBinding::new(":ai [prompt]", "Open AI query assistant"),
         KeyBinding::new(":export-connections <path>", "Export saved connections"),
         KeyBinding::new(
@@ -322,6 +464,8 @@ const ALL_SECTIONS: &[HelpSection] = &[
     SIDEBAR_CONNECTIONS,
     CONNECTION_MANAGER,
     SIDEBAR_SCHEMA,
+    NOTEBOOK,
+    NOTEBOOK_RESULT,
     QUERY_NAVIGATION,
     QUERY_EDITING,
     QUERY_VISUAL,
@@ -617,7 +761,7 @@ impl HelpPopup {
     }
 
     /// Render the help popup centered on the screen.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Calculate popup size (80% width, 80% height, with min/max)
         let width = (area.width * 80 / 100).clamp(60, 100);
         let height = (area.height * 85 / 100).clamp(20, 50);
@@ -630,16 +774,7 @@ impl HelpPopup {
         // Clear background
         frame.render_widget(Clear, popup);
 
-        // Create the outer block
-        let block = Block::default()
-            .title(" Help ")
-            .title_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block("Help", theme);
 
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -654,57 +789,56 @@ impl HelpPopup {
         .split(inner);
 
         // Render header
-        self.render_header(frame, chunks[0]);
+        self.render_header(frame, chunks[0], theme);
 
         // Render separator
-        let sep = Paragraph::new("─".repeat(chunks[1].width as usize))
-            .style(Style::default().fg(Color::DarkGray));
+        let sep = Paragraph::new("─".repeat(chunks[1].width as usize)).style(theme.overlay_border);
         frame.render_widget(sep, chunks[1]);
 
         // Update visible height for scrolling calculations
         self.visible_height = chunks[2].height as usize;
 
         // Render content with scrolling
-        self.render_content(frame, chunks[2]);
+        self.render_content(frame, chunks[2], theme);
 
         // Render footer with scroll indicator
-        self.render_footer(frame, chunks[3]);
+        self.render_footer(frame, chunks[3], theme);
 
         // Render scrollbar if content overflows
         if self.total_lines > self.visible_height {
-            self.render_scrollbar(frame, chunks[2]);
+            self.render_scrollbar(frame, chunks[2], theme);
         }
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
+    fn render_header(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let header = Line::from(vec![
             Span::styled(
                 "tsql",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" - PostgreSQL CLI  "),
-            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Press ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 "q",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" or ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" or ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 "Esc",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" to close", Style::default().fg(Color::DarkGray)),
+            Span::styled(" to close", Style::default().fg(theme.text_muted)),
         ]);
         frame.render_widget(Paragraph::new(header), area);
     }
 
-    fn render_content(&self, frame: &mut Frame, area: Rect) {
+    fn render_content(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let filtered = self.filtered_sections();
         let section_count = filtered.len();
         let mut lines: Vec<Line> = Vec::new();
@@ -712,7 +846,7 @@ impl HelpPopup {
         if filtered.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 format!("  No results for \"{}\"", self.filter),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_muted),
             )]));
         }
 
@@ -721,20 +855,20 @@ impl HelpPopup {
             lines.push(Line::from(vec![Span::styled(
                 format!(" {} ", title),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme.pill_fg)
+                    .bg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )]));
 
             // Separator under header
             lines.push(Line::from(Span::styled(
                 "─".repeat(area.width as usize),
-                Style::default().fg(Color::DarkGray),
+                theme.overlay_border,
             )));
 
             // Keybindings
             for binding in bindings.iter() {
-                lines.push(self.render_keybinding(binding, &self.filter, area.width as usize));
+                lines.push(self.render_keybinding(binding, &self.filter, theme));
             }
 
             // Blank line between sections (except last)
@@ -758,7 +892,7 @@ impl HelpPopup {
         &self,
         binding: &KeyBinding,
         filter: &str,
-        _width: usize,
+        theme: &UiTheme,
     ) -> Line<'static> {
         let keys = format!("{:20}", binding.keys);
         let desc = binding.description.to_string();
@@ -769,44 +903,30 @@ impl HelpPopup {
         let desc_highlighted = !filter.is_empty() && desc.to_lowercase().contains(&filter_lower);
 
         let key_span = if keys_highlighted {
-            Span::styled(
-                keys,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+            Span::styled(keys, theme.search_match.add_modifier(Modifier::BOLD))
         } else {
             Span::styled(
                 keys,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             )
         };
 
         let desc_span = if desc_highlighted {
-            Span::styled(
-                desc,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+            Span::styled(desc, theme.search_match.add_modifier(Modifier::BOLD))
         } else {
-            Span::styled(desc, Style::default().fg(Color::White))
+            Span::styled(desc, Style::default().fg(theme.text))
         };
 
         Line::from(vec![Span::raw("  "), key_span, desc_span])
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let scroll_info = if self.total_lines > self.visible_height {
-            let percent = if self.total_lines == 0 {
-                100
-            } else {
-                ((self.scroll_offset + self.visible_height) * 100 / self.total_lines).min(100)
-            };
+            let percent = ((self.scroll_offset + self.visible_height) * 100)
+                .checked_div(self.total_lines)
+                .map_or(100, |percent| percent.min(100));
             format!("{}%", percent)
         } else {
             "All".to_string()
@@ -823,12 +943,12 @@ impl HelpPopup {
                 Span::styled(
                     prompt,
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{}{}", hint, " ".repeat(padding as usize)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_muted),
                 ),
             ])
         } else if !self.filter.is_empty() {
@@ -842,35 +962,36 @@ impl HelpPopup {
                 Span::styled(
                     filter_info,
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(fixed, Style::default().fg(Color::DarkGray)),
+                Span::styled(fixed, Style::default().fg(theme.text_muted)),
                 Span::raw(" ".repeat(padding as usize)),
-                Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
+                Span::styled(scroll_info, Style::default().fg(theme.accent)),
             ])
         } else {
             // Normal footer
             Line::from(vec![
-                Span::styled(" j/k ", Style::default().fg(Color::Yellow)),
-                Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(" g/G ", Style::default().fg(Color::Yellow)),
-                Span::styled("top/bottom  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(" / ", Style::default().fg(Color::Yellow)),
-                Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" j/k ", Style::default().fg(theme.warning)),
+                Span::styled("scroll  ", Style::default().fg(theme.text_muted)),
+                Span::styled(" g/G ", Style::default().fg(theme.warning)),
+                Span::styled("top/bottom  ", Style::default().fg(theme.text_muted)),
+                Span::styled(" / ", Style::default().fg(theme.warning)),
+                Span::styled("filter  ", Style::default().fg(theme.text_muted)),
                 Span::raw(" ".repeat(area.width.saturating_sub(50) as usize)),
-                Span::styled(scroll_info, Style::default().fg(Color::Cyan)),
+                Span::styled(scroll_info, Style::default().fg(theme.accent)),
             ])
         };
         frame.render_widget(Paragraph::new(footer), area);
     }
 
-    fn render_scrollbar(&self, frame: &mut Frame, area: Rect) {
+    fn render_scrollbar(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"))
             .track_symbol(Some("│"))
-            .thumb_symbol("█");
+            .thumb_symbol("█")
+            .style(theme.scrollbar);
 
         // The scrollbar needs to know the max scroll position (total - visible)
         // and the current scroll position
@@ -937,12 +1058,124 @@ mod tests {
     fn key_span_is_highlighted_when_filter_matches_keys() {
         let popup = HelpPopup::new();
         let binding = KeyBinding::new("Ctrl+o", "Open connection picker");
+        let theme = UiTheme::fallback();
 
-        let line = popup.render_keybinding(&binding, "ctrl", 80);
+        let line = popup.render_keybinding(&binding, "ctrl", &theme);
         let key_span = &line.spans[1];
 
-        assert_eq!(key_span.style.fg, Some(Color::Black));
-        assert_eq!(key_span.style.bg, Some(Color::Yellow));
+        assert_eq!(key_span.style.fg, theme.search_match.fg);
+        assert_eq!(key_span.style.bg, theme.search_match.bg);
         assert!(key_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn notebook_section_lists_cell_bindings() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Notebook - Cell Focus")
+            .expect("notebook help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        assert_eq!(
+            keys,
+            [
+                "j/k or arrows",
+                "gg / G, Home / End",
+                "PageUp/Down, Ctrl-u/d",
+                "Enter / e",
+                "o",
+                "Ctrl+E",
+                "E",
+                "n",
+                "r",
+                "@result / @result_N",
+                "h / l",
+                "z",
+                "x",
+                "dd / Delete",
+                ":",
+                "Esc",
+            ]
+        );
+    }
+
+    #[test]
+    fn notebook_result_section_lists_table_bindings() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Notebook - Result Focus (read-only)")
+            .expect("notebook result help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        assert_eq!(
+            keys,
+            [
+                "o / click result",
+                "h/j/k/l or arrows",
+                "gg / G, 0 / $",
+                "PageUp/Down, Ctrl-u/d",
+                "Space / a / A",
+                "c, yy / yY",
+                "yj, yc / yC, ym",
+                "/ then n / N",
+                "+ / -, =",
+                "o",
+                "Esc",
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_section_lists_notebook_commands() {
+        let popup = HelpPopup::new();
+        let section = popup
+            .sections
+            .iter()
+            .find(|section| section.title == "Commands")
+            .expect("commands help section should be present");
+        let keys: Vec<_> = section
+            .bindings
+            .iter()
+            .map(|binding| binding.keys)
+            .collect();
+
+        for command in [
+            ":sort asc|desc|add-asc|add-desc|toggle",
+            ":filter [#column|name] eq|ne|<|<=|>|>=|contains|not-contains|null|not-null [value]",
+            ":columns / :group-count",
+            ":clear-filters / :clear-sort / :reset-result",
+            ":result-sql copy|open",
+            ":notebook / :mode notebook",
+            ":mode classic",
+            ":rebase / :rebind",
+            ":detach",
+            ":run-without-snapshot",
+            ":run-all / :run-above / :run-below",
+            ":run-dependents",
+            ":open-notebook / :save-notebook <path>",
+            ":insert-above / :insert-below / :duplicate-cell",
+            ":move-cell-up / :move-cell-down",
+            ":name <identifier> / :name clear",
+            ":outline / :cell <id-or-name>",
+            ":error / :copy-error",
+            ":error-jump / :activity",
+            ":cell-history / :cell-run <id>",
+            ":explain-cell",
+            ":collapse-source / :expand-source / :toggle-source",
+        ] {
+            assert!(keys.contains(&command), "missing {command}");
+        }
     }
 }

@@ -17,7 +17,7 @@ rig = { package = "rig-core", version = "0.31.0" }
 arboard = "3"
 crossterm = "0.28"
 ratatui = "0.29"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "io-util"] }
 tokio-postgres = "0.7"
 tokio-postgres-rustls-improved = "0.16"
 rustls = "0.23.35"
@@ -31,6 +31,7 @@ tree-sitter-highlight = "0.24"
 tree-sitter-sequel = "0.3"
 tree-sitter-json = "0.24"
 tree-sitter-html = "0.23"
+tree-sitter-javascript = "0.23"
 
 # Theme/config parsing
 serde = { version = "1", features = ["derive"] }

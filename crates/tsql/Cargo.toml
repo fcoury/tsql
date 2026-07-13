@@ -65,11 +65,13 @@ tui_confirm_dialog_with_mouse.workspace = true
 
 # Atomic file writes
 tempfile.workspace = true
+uuid.workspace = true
 
 # Internal crate
 tui-syntax = { path = "../tui-syntax", version = "0.6.0" }
+tree-sitter.workspace = true
+tree-sitter-sequel.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true
-uuid.workspace = true
 serial_test = "3"

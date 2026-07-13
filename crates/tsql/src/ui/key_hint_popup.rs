@@ -5,14 +5,15 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::key_sequence::PendingKey;
+use super::{overlay_block, UiTheme};
 
 /// A single hint entry showing a key and its description.
 #[derive(Debug, Clone)]
@@ -129,7 +130,7 @@ impl KeyHintPopup {
     }
 
     /// Renders the popup to the frame.
-    pub fn render(&self, frame: &mut Frame, frame_area: Rect) {
+    pub fn render(&self, frame: &mut Frame, frame_area: Rect, theme: &UiTheme) {
         let area = self.popup_area(frame_area);
 
         // Clear the background
@@ -144,28 +145,17 @@ impl KeyHintPopup {
                     Span::styled(
                         format!(" {}", hint.key),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled(hint.description, Style::default().fg(Color::Gray)),
+                    Span::styled(hint.description, Style::default().fg(theme.text_muted)),
                     Span::raw(" "),
                 ])
             })
             .collect();
 
-        // Create the paragraph with a titled border
-        let title = format!(" {} ", self.title_char());
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-
+        let block = overlay_block(&self.title_char().to_string(), theme);
         let paragraph = Paragraph::new(lines).block(block);
 
         frame.render_widget(paragraph, area);

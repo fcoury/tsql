@@ -188,6 +188,123 @@ fg = "cyan"
 # Escape sequences
 [escape]
 fg = "cyan"
+
+# UI chrome
+["ui.background"]
+fg = "#ABB2BF"
+bg = "#282C34"
+
+["ui.background.panel"]
+bg = "#21252B"
+
+["ui.background.elevated"]
+bg = "#2C313A"
+
+["ui.text"]
+fg = "#DCDFE4"
+
+["ui.text.muted"]
+fg = "#9DA5B4"
+
+["ui.label"]
+fg = "#9DA5B4"
+
+["ui.label.focused"]
+fg = "#56B6C2"
+modifiers = ["bold"]
+
+["ui.accent"]
+fg = "#56B6C2"
+
+["ui.accent.insert"]
+fg = "#98C379"
+
+["ui.accent.visual"]
+fg = "#E5C07B"
+
+["ui.selection"]
+fg = "#DCDFE4"
+bg = "#3E4451"
+
+["ui.selection.editor"]
+bg = "#3E4451"
+
+["ui.cursor"]
+fg = "#1D2025"
+bg = "#56B6C2"
+
+["ui.cursor.cell"]
+bg = "#56B6C2"
+
+["ui.search.match"]
+fg = "#1D2025"
+bg = "#E5C07B"
+
+["ui.search.match.current"]
+bg = "#D19A66"
+
+["ui.statusline"]
+fg = "#DCDFE4"
+bg = "#1D2025"
+
+["ui.statusline.mode"]
+fg = "#1D2025"
+
+["ui.success"]
+fg = "#98C379"
+
+["ui.warning"]
+fg = "#E5C07B"
+
+["ui.error"]
+fg = "#E06C75"
+
+["ui.transaction"]
+fg = "#C678DD"
+
+["ui.overlay"]
+fg = "#DCDFE4"
+bg = "#333B49"
+
+["ui.overlay.border"]
+fg = "#5C6673"
+
+["ui.overlay.title"]
+fg = "#56B6C2"
+modifiers = ["bold"]
+
+["ui.scrollbar"]
+fg = "#9DA5B4"
+
+["ui.grid.header"]
+fg = "#DCDFE4"
+bg = "#2C313A"
+modifiers = ["bold"]
+
+["ui.notebook.canvas"]
+fg = "#DCDFE4"
+bg = "#282C34"
+
+["ui.notebook.composer"]
+fg = "#DCDFE4"
+bg = "#2C313A"
+
+["ui.notebook.composer.focused"]
+fg = "#DCDFE4"
+bg = "#333B49"
+
+["ui.notebook.rail"]
+fg = "#56B6C2"
+
+["ui.notebook.output"]
+fg = "#DCDFE4"
+bg = "#282C34"
+
+["ui.notebook.meta"]
+fg = "#9DA5B4"
+
+["ui.notebook.stale"]
+fg = "#E5C07B"
 "##;
 
 /// GitHub Light theme TOML.
@@ -362,4 +479,121 @@ fg = "dark_gray"
 # Escape sequences
 [escape]
 fg = "cyan"
+
+# UI chrome
+["ui.background"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.background.panel"]
+bg = "#F6F8FA"
+
+["ui.background.elevated"]
+bg = "#EAEEF2"
+
+["ui.text"]
+fg = "#1F2328"
+
+["ui.text.muted"]
+fg = "#57606A"
+
+["ui.label"]
+fg = "#57606A"
+
+["ui.label.focused"]
+fg = "#0969DA"
+modifiers = ["bold"]
+
+["ui.accent"]
+fg = "#0969DA"
+
+["ui.accent.insert"]
+fg = "#1A7F37"
+
+["ui.accent.visual"]
+fg = "#9A6700"
+
+["ui.selection"]
+fg = "#1F2328"
+bg = "#DDE8F5"
+
+["ui.selection.editor"]
+bg = "#DDE8F5"
+
+["ui.cursor"]
+fg = "#FFFFFF"
+bg = "#0969DA"
+
+["ui.cursor.cell"]
+bg = "#0969DA"
+
+["ui.search.match"]
+fg = "#1F2328"
+bg = "#FFF8C5"
+
+["ui.search.match.current"]
+bg = "#FFD8A8"
+
+["ui.statusline"]
+fg = "#1F2328"
+bg = "#D8DEE4"
+
+["ui.statusline.mode"]
+fg = "#FFFFFF"
+
+["ui.success"]
+fg = "#1A7F37"
+
+["ui.warning"]
+fg = "#9A6700"
+
+["ui.error"]
+fg = "#CF222E"
+
+["ui.transaction"]
+fg = "#8250DF"
+
+["ui.overlay"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.overlay.border"]
+fg = "#AFB8C1"
+
+["ui.overlay.title"]
+fg = "#0969DA"
+modifiers = ["bold"]
+
+["ui.scrollbar"]
+fg = "#57606A"
+
+["ui.grid.header"]
+fg = "#1F2328"
+bg = "#EAEEF2"
+modifiers = ["bold"]
+
+["ui.notebook.canvas"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.notebook.composer"]
+fg = "#1F2328"
+bg = "#EAEEF2"
+
+["ui.notebook.composer.focused"]
+fg = "#1F2328"
+bg = "#DDE8F5"
+
+["ui.notebook.rail"]
+fg = "#0969DA"
+
+["ui.notebook.output"]
+fg = "#1F2328"
+bg = "#FFFFFF"
+
+["ui.notebook.meta"]
+fg = "#57606A"
+
+["ui.notebook.stale"]
+fg = "#9A6700"
 "##;

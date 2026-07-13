@@ -24,10 +24,8 @@ show_null_indicator = true
 # Text to display for NULL values
 null_indicator = "NULL"
 
-# Show borders around grid cells
-show_borders = true
-
-# Theme name (reserved for future use)
+# Theme name: "one_dark", "github_light", or a custom file name from
+# ~/.tsql/themes/<name>.toml (or $TSQL_CONFIG_DIR/themes/<name>.toml)
 theme = "default"
 
 # SQL generation settings (used by Schema panel templates, etc.)
@@ -172,6 +170,19 @@ max_columns_per_table = 20
 # system_prompt_postgres = "Return only PostgreSQL SQL."
 # system_prompt_mongo = "Return only db.collection.op(...) or JSON command syntax."
 
+# Notebook workspace and PostgreSQL session-snapshot settings
+[notebook]
+# Start in Notebook mode. Classic remains the default when false.
+startup = false
+# "auto" retains eligible complete PostgreSQL SELECT results; "off" only renders output.
+snapshot_mode = "auto"
+snapshot_max_rows = 2000
+snapshot_max_bytes = 67108864
+snapshot_total_bytes = 134217728
+max_retained_snapshots = 8
+composer_max_rows = 10
+output_preview_rows = 12
+
 # Clipboard settings
 [clipboard]
 # Clipboard backend:
@@ -215,6 +226,15 @@ vim_mode = true
 # key = "ctrl+x"
 # action = "export_csv"
 # description = "Export results to CSV"
+
+# Custom keybindings for Notebook Cell focus
+# [[keymap.notebook]]
+# key = "ctrl+n"
+# action = "new_notebook_cell"
+# description = "Create a notebook draft"
+#
+# Notebook output actions: collapse_cell_output (h), expand_cell_output (l),
+# toggle_cell_output (z), and clear_notebook_cell_execution (x).
 
 # Custom keybindings for sidebar navigation
 # [[keymap.sidebar]]

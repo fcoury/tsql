@@ -13,13 +13,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_textarea::{Input, TextArea};
 
 use crate::ai::{AiProposal, AiTurn};
+
+use super::{overlay_block, UiTheme};
 
 /// Result of handling a single key event inside the AI modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +169,7 @@ impl AiQueryModal {
         self.input.lines().join("\n")
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let width = modal_dimension(area.width, 90, 70);
         let height = modal_dimension(area.height, 80, 18);
 
@@ -179,11 +181,7 @@ impl AiQueryModal {
         };
 
         frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .title(" AI Query Assistant ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block("AI Query Assistant", theme);
         frame.render_widget(block, popup);
 
         let inner = popup.inner(ratatui::layout::Margin {
@@ -204,16 +202,20 @@ impl AiQueryModal {
             Span::raw("Esc close"),
         ]);
         frame.render_widget(
-            Paragraph::new(header).style(Style::default().fg(Color::Gray)),
+            Paragraph::new(header).style(Style::default().fg(theme.text_muted)),
             chunks[0],
         );
 
         self.input.set_block(
             Block::default()
-                .title(" Prompt / Follow-up ")
+                .title(Span::styled(
+                    " Prompt / Follow-up ",
+                    Style::default().fg(theme.accent),
+                ))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(theme.overlay_border),
         );
+        self.input.set_cursor_style(theme.editor_cursor);
         frame.render_widget(&self.input, chunks[1]);
 
         let mut details = Vec::new();
@@ -221,7 +223,7 @@ impl AiQueryModal {
             details.push(Line::from(Span::styled(
                 "Generating query...",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
             if let Some(prompt) = self.pending_prompt.as_deref() {
@@ -234,7 +236,7 @@ impl AiQueryModal {
             details.push(Line::from(Span::styled(
                 "Proposed query:",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )));
             for line in proposal.query.lines() {
@@ -244,7 +246,7 @@ impl AiQueryModal {
                 details.push(Line::from(""));
                 details.push(Line::from(Span::styled(
                     "Explanation:",
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(theme.text_muted),
                 )));
                 details.push(Line::from(explanation.to_string()));
             }
@@ -252,7 +254,7 @@ impl AiQueryModal {
         } else {
             details.push(Line::from(Span::styled(
                 "No proposal yet. Type a prompt and press Ctrl+E.",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme.text_muted),
             )));
             details.push(Line::from(""));
         }
@@ -261,7 +263,7 @@ impl AiQueryModal {
             details.push(Line::from(Span::styled(
                 "Recent turns:",
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
             for turn in self.conversation.iter().rev().take(3).rev() {
@@ -275,9 +277,12 @@ impl AiQueryModal {
             Paragraph::new(details)
                 .block(
                     Block::default()
-                        .title(" Proposal ")
+                        .title(Span::styled(
+                            " Proposal ",
+                            Style::default().fg(theme.accent),
+                        ))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Blue)),
+                        .border_style(theme.overlay_border),
                 )
                 .wrap(Wrap { trim: false }),
             chunks[2],
@@ -286,17 +291,17 @@ impl AiQueryModal {
         let status = if let Some(err) = self.last_error.as_deref() {
             Line::from(Span::styled(
                 err.to_string(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             ))
         } else if self.pending {
             Line::from(Span::styled(
                 "Waiting for AI response...",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             ))
         } else {
             Line::from(Span::styled(
                 "Accept replaces the entire query editor content.",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme.text_muted),
             ))
         };
         frame.render_widget(Paragraph::new(status), chunks[3]);
@@ -325,7 +330,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    modal.render(frame, area);
+                    modal.render(frame, area, &UiTheme::fallback());
                 })
                 .unwrap();
         }));

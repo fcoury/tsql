@@ -12,8 +12,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{BorderType, Borders};
 use ratatui::Frame;
+use std::path::PathBuf;
 use tui_confirm_dialog_with_mouse::{ConfirmDialog, ConfirmDialogState};
 
+use super::UiTheme;
 use crate::config::ConnectionEntry;
 use crate::update::UpdateInfo;
 
@@ -44,6 +46,12 @@ pub enum ConfirmContext {
     QuitAppClean,
     /// Deleting a saved connection.
     DeleteConnection { name: String },
+    /// Deleting a notebook cell with source, output, or lineage.
+    DeleteNotebookCell { cell_id: u64 },
+    /// Clearing a notebook cell execution and any dependent executions.
+    ClearNotebookCellExecution { cell_id: u64 },
+    /// Replacing the current notebook with another portable notebook document.
+    OpenNotebook { path: PathBuf },
     /// Closing connection form with unsaved changes.
     CloseConnectionForm,
     /// Switching to a new connection with unsaved query changes.
@@ -124,29 +132,35 @@ impl ConfirmPrompt {
             | ConfirmContext::QuitApp
             | ConfirmContext::CloseConnectionForm
             | ConfirmContext::SwitchConnection { .. }
-            | ConfirmContext::OpenAiAssistant { .. } => " Unsaved Changes ",
+            | ConfirmContext::OpenAiAssistant { .. }
+            | ConfirmContext::OpenNotebook { .. } => " Unsaved Changes ",
             ConfirmContext::ReplaceQuery { .. } | ConfirmContext::ReplaceAndExecuteQuery { .. } => {
                 " Replace Query "
             }
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
+            ConfirmContext::DeleteNotebookCell { .. } => " Delete Notebook Cell ",
+            ConfirmContext::ClearNotebookCellExecution { .. } => " Clear Cell Execution ",
             ConfirmContext::ApplyUpdate { .. } => " Apply Update ",
         }
     }
 
     /// Render the confirmation dialog.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        // Confirmations keep a warning-colored border on purpose: they are the
+        // one overlay that should read as urgent.
         let dialog = ConfirmDialog::new()
+            .bg(theme.overlay.bg.unwrap_or(Color::Reset))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
-            .button_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme.warning))
+            .button_style(Style::default().fg(theme.text))
             .selected_button_style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )
-            .text_style(Style::default().fg(Color::White));
+            .text_style(Style::default().fg(theme.text));
 
         frame.render_stateful_widget(dialog, area, &mut self.state);
     }
@@ -265,6 +279,21 @@ mod tests {
             }
             _ => panic!("Expected CloseCellEditor context"),
         }
+    }
+
+    #[test]
+    fn test_clear_notebook_cell_execution_context_and_title() {
+        let context = ConfirmContext::ClearNotebookCellExecution { cell_id: 7 };
+        let prompt = ConfirmPrompt::new("Clear cell 7 and its dependent executions?", context);
+
+        assert!(matches!(
+            prompt.context(),
+            ConfirmContext::ClearNotebookCellExecution { cell_id: 7 }
+        ));
+        assert_eq!(
+            ConfirmPrompt::title_for_context(prompt.context()),
+            " Clear Cell Execution "
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::mouse_util::{is_inside, MOUSE_SCROLL_LINES};
-use super::style::{selected_line, selected_primary_style, selected_row_style};
+use super::{overlay_block, UiTheme};
 use crate::config::{ConnectionEntry, ConnectionsFile, SortMode};
 
 /// Result of handling a key event in the connection manager.
@@ -536,9 +536,7 @@ impl ConnectionManagerModal {
                     .cmp(&a.use_count)
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
-            SortMode::Alpha => {
-                sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
+            SortMode::Alpha => sorted.sort_by_key(|a| a.name.to_lowercase()),
             SortMode::Folder => sorted.sort_by(|a, b| {
                 let fa = a.folder.as_deref().unwrap_or("~");
                 let fb = b.folder.as_deref().unwrap_or("~");
@@ -641,7 +639,7 @@ impl ConnectionManagerModal {
     }
 
     /// Render the connection manager modal.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Wider modal now that we also show a detail pane. Falls back
         // gracefully on narrow terminals.
         let modal_width = ((area.width as f32 * 0.85) as u16).clamp(60, 120);
@@ -680,15 +678,7 @@ impl ConnectionManagerModal {
             )
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .border_style(Style::default().fg(Color::Cyan));
+        let block = overlay_block(title.trim(), theme);
 
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
@@ -707,7 +697,7 @@ impl ConnectionManagerModal {
 
         let mut idx = 0;
         if show_search_bar {
-            self.render_search_bar(frame, vchunks[idx]);
+            self.render_search_bar(frame, vchunks[idx], theme);
             idx += 1;
         }
         let body_area = vchunks[idx];
@@ -722,45 +712,44 @@ impl ConnectionManagerModal {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body_area);
-            self.render_list(frame, hchunks[0]);
-            self.render_detail(frame, hchunks[1]);
+            self.render_list(frame, hchunks[0], theme);
+            self.render_detail(frame, hchunks[1], theme);
         } else {
-            self.render_list(frame, body_area);
+            self.render_list(frame, body_area, theme);
         }
 
-        let sep = Paragraph::new("─".repeat(sep_area.width as usize))
-            .style(Style::default().fg(Color::DarkGray));
+        let sep = Paragraph::new("─".repeat(sep_area.width as usize)).style(theme.overlay_border);
         frame.render_widget(sep, sep_area);
 
-        self.render_help(frame, help_area);
+        self.render_help(frame, help_area, theme);
     }
 
-    fn render_search_bar(&self, frame: &mut Frame, area: Rect) {
+    fn render_search_bar(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let mut spans = vec![
             Span::styled(
                 "/",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::raw(self.search.as_str()),
         ];
         if self.search_active {
-            spans.push(Span::styled("▎", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("▎", Style::default().fg(theme.warning)));
         }
         let p = Paragraph::new(Line::from(spans));
         frame.render_widget(p, area);
     }
 
-    fn render_detail(&self, frame: &mut Frame, area: Rect) {
+    fn render_detail(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let Some(entry) = self.selected_connection() else {
             return;
         };
 
         let mut lines: Vec<Line<'_>> = Vec::new();
 
-        let name_color = entry.color.to_ratatui_color().unwrap_or(Color::White);
+        let name_color = entry.color.to_ratatui_color().unwrap_or(theme.text);
         lines.push(Line::from(vec![Span::styled(
             entry.name.as_str(),
             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
@@ -771,29 +760,53 @@ impl ConnectionManagerModal {
         };
         lines.push(Line::from(Span::styled(
             kind_label,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )));
         lines.push(Line::from(""));
 
-        lines.push(detail_row_owned("Target", entry.display_string()));
+        lines.push(detail_row_owned(
+            "Target",
+            entry.display_string(),
+            theme.text_muted,
+        ));
         if let Some(folder) = entry.folder.as_deref() {
-            lines.push(detail_row("Folder", folder));
+            lines.push(detail_row("Folder", folder, theme.text_muted));
         }
         if !entry.tags.is_empty() {
-            lines.push(detail_row_owned("Tags", entry.tags.join(", ")));
+            lines.push(detail_row_owned(
+                "Tags",
+                entry.tags.join(", "),
+                theme.text_muted,
+            ));
         }
         if let Some(app) = entry.application_name.as_deref() {
-            lines.push(detail_row("App name", app));
+            lines.push(detail_row("App name", app, theme.text_muted));
         }
         if let Some(t) = entry.connect_timeout_secs {
-            lines.push(detail_row_owned("Timeout", format!("{}s", t)));
+            lines.push(detail_row_owned(
+                "Timeout",
+                format!("{}s", t),
+                theme.text_muted,
+            ));
         }
         if let Some(ssl) = entry.ssl_mode {
-            lines.push(detail_row("SSL", ssl.as_str()));
+            lines.push(detail_row("SSL", ssl.as_str(), theme.text_muted));
         }
-        lines.push(detail_row("Password", entry.password_source_label()));
-        lines.push(detail_row_owned("Last used", entry.last_used_label()));
-        lines.push(detail_row_owned("Use count", entry.use_count.to_string()));
+        lines.push(detail_row(
+            "Password",
+            entry.password_source_label(),
+            theme.text_muted,
+        ));
+        lines.push(detail_row_owned(
+            "Last used",
+            entry.last_used_label(),
+            theme.text_muted,
+        ));
+        lines.push(detail_row_owned(
+            "Use count",
+            entry.use_count.to_string(),
+            theme.text_muted,
+        ));
 
         if let Some(desc) = entry.description.as_deref() {
             if !desc.trim().is_empty() {
@@ -801,7 +814,7 @@ impl ConnectionManagerModal {
                 lines.push(Line::from(Span::styled(
                     "Notes",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme.text_muted)
                         .add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(Span::raw(desc)));
@@ -810,14 +823,14 @@ impl ConnectionManagerModal {
 
         let block = Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(theme.overlay_border);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let p = Paragraph::new(lines).wrap(Wrap { trim: true });
         frame.render_widget(p, inner);
     }
 
-    fn render_list(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         self.visible_height = area.height as usize;
 
         if self.connections.is_empty() {
@@ -825,12 +838,12 @@ impl ConnectionManagerModal {
                 Line::from(""),
                 Line::from(Span::styled(
                     "No connections saved",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled("a", Style::default().fg(Color::Yellow)),
+                    Span::styled("a", Style::default().fg(theme.warning)),
                     Span::raw(" to add a new connection"),
                 ]),
             ])
@@ -861,7 +874,7 @@ impl ConnectionManagerModal {
             .enumerate()
             .skip(self.scroll_offset)
             .take(self.visible_height)
-            .map(|(i, conn)| self.render_connection_item(conn, i == self.selected))
+            .map(|(i, conn)| self.render_connection_item(conn, i == self.selected, theme))
             .collect();
 
         let list = List::new(items);
@@ -875,12 +888,14 @@ impl ConnectionManagerModal {
                     .end_symbol(Some("▼"))
                     .thumb_symbol("█")
                     .track_symbol(Some("░"))
+                    .style(theme.scrollbar)
             } else {
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
                     .end_symbol(None)
                     .thumb_symbol("█")
                     .track_symbol(Some("│"))
+                    .style(theme.scrollbar)
             };
 
             let mut scrollbar_state = ScrollbarState::new(total_items).position(self.scroll_offset);
@@ -893,6 +908,7 @@ impl ConnectionManagerModal {
         &self,
         conn: &ConnectionEntry,
         is_selected: bool,
+        theme: &UiTheme,
     ) -> ListItem<'static> {
         let mut spans = Vec::new();
 
@@ -900,7 +916,7 @@ impl ConnectionManagerModal {
         if let Some(fav) = conn.favorite {
             spans.push(Span::styled(
                 format!("{}", fav),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             ));
         } else {
             spans.push(Span::raw(" "));
@@ -915,16 +931,16 @@ impl ConnectionManagerModal {
             .unwrap_or(false);
 
         if is_connected {
-            spans.push(Span::styled("●", Style::default().fg(Color::Green)));
+            spans.push(Span::styled("●", Style::default().fg(theme.success)));
         } else {
-            spans.push(Span::styled("○", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("○", Style::default().fg(theme.text_muted)));
         }
         spans.push(Span::raw(" "));
 
         // Connection name with color
-        let name_color = conn.color.to_ratatui_color().unwrap_or(Color::White);
+        let name_color = conn.color.to_ratatui_color().unwrap_or(theme.text);
         let name_style = if is_selected {
-            selected_primary_style().add_modifier(Modifier::BOLD)
+            theme.selection.add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(name_color).add_modifier(Modifier::BOLD)
         };
@@ -936,57 +952,53 @@ impl ConnectionManagerModal {
 
         // Connection details
         let details = conn.short_display();
-        spans.push(Span::styled(details, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(details, Style::default().fg(theme.text_muted)));
 
-        let line = if is_selected {
-            selected_line(Line::from(spans))
-        } else {
-            Line::from(spans)
-        };
+        let line = Line::from(spans);
 
         if is_selected {
-            ListItem::new(line).style(selected_row_style())
+            ListItem::new(line).style(theme.selection)
         } else {
             ListItem::new(line)
         }
     }
 
-    fn render_help(&self, frame: &mut Frame, area: Rect) {
+    fn render_help(&self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         if let Some(ref msg) = self.toast {
             let p = Paragraph::new(Line::from(Span::styled(
                 msg.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             )))
             .alignment(ratatui::layout::Alignment::Center);
             frame.render_widget(p, area);
             return;
         }
         let help_spans = vec![
-            Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+            Span::styled("[Enter]", Style::default().fg(theme.warning)),
             Span::raw(" connect  "),
-            Span::styled("[a]", Style::default().fg(Color::Yellow)),
+            Span::styled("[a]", Style::default().fg(theme.warning)),
             Span::raw("dd "),
-            Span::styled("[e]", Style::default().fg(Color::Yellow)),
+            Span::styled("[e]", Style::default().fg(theme.warning)),
             Span::raw("dit "),
-            Span::styled("[D]", Style::default().fg(Color::Yellow)),
+            Span::styled("[D]", Style::default().fg(theme.warning)),
             Span::raw("up "),
-            Span::styled("[d]", Style::default().fg(Color::Yellow)),
+            Span::styled("[d]", Style::default().fg(theme.warning)),
             Span::raw("el "),
-            Span::styled("[f]", Style::default().fg(Color::Yellow)),
+            Span::styled("[f]", Style::default().fg(theme.warning)),
             Span::raw("av "),
-            Span::styled("[t]", Style::default().fg(Color::Yellow)),
+            Span::styled("[t]", Style::default().fg(theme.warning)),
             Span::raw("est "),
-            Span::styled("[/]", Style::default().fg(Color::Yellow)),
+            Span::styled("[/]", Style::default().fg(theme.warning)),
             Span::raw("find "),
-            Span::styled("[s]", Style::default().fg(Color::Yellow)),
+            Span::styled("[s]", Style::default().fg(theme.warning)),
             Span::raw("ort "),
-            Span::styled("[y]", Style::default().fg(Color::Yellow)),
+            Span::styled("[y]", Style::default().fg(theme.warning)),
             Span::raw("ank "),
-            Span::styled("[c]", Style::default().fg(Color::Yellow)),
+            Span::styled("[c]", Style::default().fg(theme.warning)),
             Span::raw("li "),
-            Span::styled("[^K/^J]", Style::default().fg(Color::Yellow)),
+            Span::styled("[^K/^J]", Style::default().fg(theme.warning)),
             Span::raw(" reorder "),
-            Span::styled("[q]", Style::default().fg(Color::Yellow)),
+            Span::styled("[q]", Style::default().fg(theme.warning)),
             Span::raw(" close"),
         ];
 
@@ -996,22 +1008,16 @@ impl ConnectionManagerModal {
     }
 }
 
-fn detail_row<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+fn detail_row<'a>(label: &'a str, value: &'a str, muted: Color) -> Line<'a> {
     Line::from(vec![
-        Span::styled(
-            format!("{:<10}", label),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{:<10}", label), Style::default().fg(muted)),
         Span::raw(value),
     ])
 }
 
-fn detail_row_owned(label: &str, value: String) -> Line<'static> {
+fn detail_row_owned(label: &str, value: String, muted: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{:<10}", label),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{:<10}", label), Style::default().fg(muted)),
         Span::raw(value),
     ])
 }

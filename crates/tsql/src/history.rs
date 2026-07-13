@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::history_path;
 
+const MAX_SAVED_SNIPPETS: usize = 512;
+
 /// A single history entry with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -39,11 +41,29 @@ impl HistoryEntry {
     }
 }
 
+/// A named, reusable query saved independently of execution history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedQuerySnippet {
+    /// Human-readable snippet name, unique without regard to case.
+    pub name: String,
+    /// The SQL or Mongo query source.
+    pub query: String,
+    /// Optional connection hint (sanitized - no passwords).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    /// When this snippet was first saved.
+    pub created_at: DateTime<Utc>,
+    /// When this snippet was most recently updated.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// The history file format.
 #[derive(Debug, Serialize, Deserialize)]
 struct HistoryFile {
     version: u32,
     entries: Vec<HistoryEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    snippets: Vec<SavedQuerySnippet>,
 }
 
 impl Default for HistoryFile {
@@ -51,6 +71,7 @@ impl Default for HistoryFile {
         Self {
             version: 1,
             entries: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -71,6 +92,7 @@ pub struct HistoryMatch {
 /// Manages query history with persistence and fuzzy search.
 pub struct History {
     entries: Vec<HistoryEntry>,
+    snippets: Vec<SavedQuerySnippet>,
     max_entries: usize,
     path: PathBuf,
     dirty: bool,
@@ -85,17 +107,21 @@ impl History {
 
     /// Load history from a specific path.
     pub fn load_from_path(path: &Path, max_entries: usize) -> Result<Self> {
-        let entries = if path.exists() {
+        let (entries, mut snippets) = if path.exists() {
             let content = fs::read_to_string(path)
                 .with_context(|| format!("Failed to read history file: {}", path.display()))?;
 
             let file: HistoryFile = serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse history file: {}", path.display()))?;
 
-            file.entries
+            (file.entries, file.snippets)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+
+        if snippets.len() > MAX_SAVED_SNIPPETS {
+            snippets.drain(..snippets.len() - MAX_SAVED_SNIPPETS);
+        }
 
         // Enforce max_entries limit on load, skipping pinned entries when pruning.
         let mut entries = entries;
@@ -109,6 +135,7 @@ impl History {
 
         Ok(Self {
             entries,
+            snippets,
             max_entries,
             path: path.to_path_buf(),
             dirty: false,
@@ -119,6 +146,7 @@ impl History {
     pub fn new_empty(max_entries: usize) -> Self {
         Self {
             entries: Vec::new(),
+            snippets: Vec::new(),
             max_entries,
             path: PathBuf::new(),
             dirty: false,
@@ -140,6 +168,7 @@ impl History {
         let file = HistoryFile {
             version: 1,
             entries: self.entries.clone(),
+            snippets: self.snippets.clone(),
         };
 
         let content = serde_json::to_string_pretty(&file).context("Failed to serialize history")?;
@@ -197,6 +226,93 @@ impl History {
         &self.entries
     }
 
+    /// Returns saved snippets in their stable creation order.
+    pub fn snippets(&self) -> &[SavedQuerySnippet] {
+        &self.snippets
+    }
+
+    /// Creates or replaces a named query snippet. Names are case-insensitive.
+    pub fn save_snippet(
+        &mut self,
+        name: &str,
+        query: String,
+        connection: Option<String>,
+    ) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "Snippet name cannot be empty");
+        anyhow::ensure!(name.chars().count() <= 80, "Snippet name is too long");
+        let query = query.trim();
+        anyhow::ensure!(!query.is_empty(), "Cannot save an empty query snippet");
+
+        let now = Utc::now();
+        if let Some(snippet) = self
+            .snippets
+            .iter_mut()
+            .find(|snippet| snippet.name.eq_ignore_ascii_case(name))
+        {
+            snippet.name = name.to_string();
+            snippet.query = query.to_string();
+            snippet.connection = connection;
+            snippet.updated_at = now;
+        } else {
+            anyhow::ensure!(
+                self.snippets.len() < MAX_SAVED_SNIPPETS,
+                "Cannot save more than {MAX_SAVED_SNIPPETS} query snippets"
+            );
+            self.snippets.push(SavedQuerySnippet {
+                name: name.to_string(),
+                query: query.to_string(),
+                connection,
+                created_at: now,
+                updated_at: now,
+            });
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Removes a named query snippet. Returns whether a snippet was removed.
+    pub fn remove_snippet(&mut self, name: &str) -> bool {
+        let Some(index) = self
+            .snippets
+            .iter()
+            .position(|snippet| snippet.name.eq_ignore_ascii_case(name.trim()))
+        else {
+            return false;
+        };
+        self.snippets.remove(index);
+        self.dirty = true;
+        true
+    }
+
+    /// Fuzzy-searches saved snippets by both name and query source.
+    pub fn search_snippets(&self, pattern: &str) -> Vec<SavedQuerySnippet> {
+        if pattern.trim().is_empty() {
+            return self.snippets.iter().rev().cloned().collect();
+        }
+
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pattern = Pattern::parse(pattern, CaseMatching::Ignore, Normalization::Smart);
+        let mut matches = self
+            .snippets
+            .iter()
+            .filter_map(|snippet| {
+                let text = format!("{} {}", snippet.name, snippet.query);
+                let mut indices = Vec::new();
+                let mut buffer = Vec::new();
+                pattern
+                    .indices(
+                        Utf32Str::new(&text, &mut buffer),
+                        &mut matcher,
+                        &mut indices,
+                    )
+                    .map(|score| (score, snippet.clone()))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        matches.into_iter().map(|(_, snippet)| snippet).collect()
+    }
+
     /// Get the number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -251,7 +367,7 @@ impl History {
             .collect();
 
         // Sort by score descending (best matches first).
-        matches.sort_by(|a, b| b.score.cmp(&a.score));
+        matches.sort_by_key(|b| std::cmp::Reverse(b.score));
 
         matches
     }
@@ -465,6 +581,7 @@ mod tests {
         let file = HistoryFile {
             version: 1,
             entries,
+            snippets: Vec::new(),
         };
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(serde_json::to_string(&file).unwrap().as_bytes())
@@ -492,6 +609,7 @@ mod tests {
             entries: (1..=10)
                 .map(|i| HistoryEntry::new(format!("query{}", i), None))
                 .collect(),
+            snippets: Vec::new(),
         };
 
         let mut f = fs::File::create(&path).unwrap();
@@ -506,6 +624,78 @@ mod tests {
         assert_eq!(history.entries()[1].query, "query9");
         assert_eq!(history.entries()[2].query, "query10");
 
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn snippets_round_trip_update_case_insensitively_and_search_name_or_source() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+        let created_at;
+
+        {
+            let mut history = History::load_from_path(&path, 100).unwrap();
+            history
+                .save_snippet(
+                    "Recent users",
+                    " SELECT * FROM users ORDER BY created_at DESC ".to_string(),
+                    Some("localhost/app".to_string()),
+                )
+                .unwrap();
+            created_at = history.snippets()[0].created_at;
+            history
+                .save_snippet("recent USERS", "SELECT id FROM users".to_string(), None)
+                .unwrap();
+            assert_eq!(history.snippets().len(), 1);
+            assert_eq!(history.snippets()[0].created_at, created_at);
+            assert_eq!(history.snippets()[0].name, "recent USERS");
+            assert_eq!(history.snippets()[0].query, "SELECT id FROM users");
+            assert!(history.snippets()[0].connection.is_none());
+            assert_eq!(history.search_snippets("recent").len(), 1);
+            assert_eq!(history.search_snippets("id users").len(), 1);
+            history.save().unwrap();
+        }
+
+        let history = History::load_from_path(&path, 100).unwrap();
+        assert_eq!(history.snippets().len(), 1);
+        assert_eq!(history.snippets()[0].created_at, created_at);
+        assert_eq!(history.search_snippets("")[0].query, "SELECT id FROM users");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn snippet_validation_and_removal_are_safe() {
+        let mut history = History::new_empty(100);
+        assert!(history
+            .save_snippet(" ", "SELECT 1".to_string(), None)
+            .is_err());
+        assert!(history
+            .save_snippet("valid", "  ".to_string(), None)
+            .is_err());
+        assert!(history
+            .save_snippet(&"x".repeat(81), "SELECT 1".to_string(), None)
+            .is_err());
+        history
+            .save_snippet("Useful", "SELECT 1".to_string(), None)
+            .unwrap();
+        assert!(!history.remove_snippet("missing"));
+        assert!(history.remove_snippet(" useful "));
+        assert!(history.snippets().is_empty());
+    }
+
+    #[test]
+    fn legacy_history_without_snippets_still_loads() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{"version":1,"entries":[{"query":"SELECT 1","timestamp":"2026-01-01T00:00:00Z","pinned":false}]}"#,
+        )
+        .unwrap();
+
+        let history = History::load_from_path(&path, 100).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history.snippets().is_empty());
         fs::remove_file(&path).ok();
     }
 }

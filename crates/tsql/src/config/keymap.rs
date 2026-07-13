@@ -55,6 +55,22 @@ pub enum Action {
     ExecuteQuery,
     CancelQuery,
 
+    // Notebook cell actions
+    PreviousCell,
+    NextCell,
+    FirstCell,
+    LastCell,
+    EnterCellEditor,
+    InspectCellResult,
+    ExecuteCellAndAdvance,
+    NewNotebookCell,
+    RefineNotebookCell,
+    ToggleCellOutput,
+    CollapseCellOutput,
+    ExpandCellOutput,
+    ClearNotebookCellExecution,
+    DeleteNotebookCell,
+
     // Grid actions
     SelectRow,
     GridSelectAll,
@@ -156,6 +172,20 @@ impl Action {
             Action::SelectAll => "Select all",
             Action::ExecuteQuery => "Execute query",
             Action::CancelQuery => "Cancel running query",
+            Action::PreviousCell => "Select previous notebook cell",
+            Action::NextCell => "Select next notebook cell",
+            Action::FirstCell => "Select first notebook cell",
+            Action::LastCell => "Select last notebook cell",
+            Action::EnterCellEditor => "Edit selected notebook cell",
+            Action::InspectCellResult => "Inspect selected cell result",
+            Action::ExecuteCellAndAdvance => "Execute cell and advance",
+            Action::NewNotebookCell => "Select or create notebook draft",
+            Action::RefineNotebookCell => "Refine selected cell result",
+            Action::ToggleCellOutput => "Collapse or expand cell output",
+            Action::CollapseCellOutput => "Collapse selected cell output",
+            Action::ExpandCellOutput => "Expand selected cell output",
+            Action::ClearNotebookCellExecution => "Clear cell and dependent executions",
+            Action::DeleteNotebookCell => "Delete selected notebook cell",
             Action::SelectRow => "Select/toggle row",
             Action::GridSelectAll => "Select all rows",
             Action::ClearSelection => "Clear selection",
@@ -254,6 +284,20 @@ impl FromStr for Action {
             // Query execution
             "execute_query" => Ok(Action::ExecuteQuery),
             "cancel_query" => Ok(Action::CancelQuery),
+            "previous_cell" => Ok(Action::PreviousCell),
+            "next_cell" => Ok(Action::NextCell),
+            "first_cell" => Ok(Action::FirstCell),
+            "last_cell" => Ok(Action::LastCell),
+            "enter_cell_editor" => Ok(Action::EnterCellEditor),
+            "inspect_cell_result" => Ok(Action::InspectCellResult),
+            "execute_cell_and_advance" => Ok(Action::ExecuteCellAndAdvance),
+            "new_notebook_cell" => Ok(Action::NewNotebookCell),
+            "refine_notebook_cell" => Ok(Action::RefineNotebookCell),
+            "toggle_cell_output" => Ok(Action::ToggleCellOutput),
+            "collapse_cell_output" => Ok(Action::CollapseCellOutput),
+            "expand_cell_output" => Ok(Action::ExpandCellOutput),
+            "clear_notebook_cell_execution" => Ok(Action::ClearNotebookCellExecution),
+            "delete_notebook_cell" => Ok(Action::DeleteNotebookCell),
 
             // Grid actions
             "select_row" => Ok(Action::SelectRow),
@@ -967,6 +1011,106 @@ impl Keymap {
         km
     }
 
+    /// Create the default keymap for Notebook Cell focus.
+    pub fn default_notebook_keymap() -> Self {
+        let mut keymap = Self::new();
+        keymap.bind_focus_cycle();
+        keymap.bind_directional_focus(KeyModifiers::CONTROL);
+        keymap.bind_directional_focus(KeyModifiers::ALT);
+        for code in [KeyCode::Char('k'), KeyCode::Up] {
+            keymap.bind(
+                KeyBinding::new(code, KeyModifiers::NONE),
+                Action::PreviousCell,
+            );
+        }
+        for code in [KeyCode::Char('j'), KeyCode::Down] {
+            keymap.bind(KeyBinding::new(code, KeyModifiers::NONE), Action::NextCell);
+        }
+        keymap.bind(
+            KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
+            Action::FirstCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            Action::LastCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            Action::LastCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('G'), KeyModifiers::NONE),
+            Action::LastCell,
+        );
+        for code in [KeyCode::Enter, KeyCode::Char('e')] {
+            keymap.bind(
+                KeyBinding::new(code, KeyModifiers::NONE),
+                Action::EnterCellEditor,
+            );
+        }
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            Action::InspectCellResult,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            Action::NewNotebookCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            Action::RefineNotebookCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            Action::ToggleCellOutput,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            Action::CollapseCellOutput,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            Action::ExpandCellOutput,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            Action::ClearNotebookCellExecution,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Action::ExecuteQuery,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+            Action::ExecuteCellAndAdvance,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
+            Action::PageUp,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
+            Action::PageDown,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Action::HalfPageUp,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Action::HalfPageDown,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Delete, KeyModifiers::NONE),
+            Action::DeleteNotebookCell,
+        );
+        keymap.bind(
+            KeyBinding::new(KeyCode::Char(':'), KeyModifiers::NONE),
+            Action::EnterCommandMode,
+        );
+        keymap
+    }
+
     /// Create the default keymap for the query editor in visual mode.
     pub fn default_editor_visual_keymap() -> Self {
         let mut km = Self::new();
@@ -1139,6 +1283,20 @@ mod tests {
     }
 
     #[test]
+    fn test_default_notebook_keymap() {
+        let km = Keymap::default_notebook_keymap();
+        let colon = KeyBinding::new(KeyCode::Char(':'), KeyModifiers::NONE);
+        let h = KeyBinding::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        let l = KeyBinding::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        let x = KeyBinding::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert_eq!(km.get(&colon), Some(&Action::EnterCommandMode));
+        assert_eq!(km.get(&h), Some(&Action::CollapseCellOutput));
+        assert_eq!(km.get(&l), Some(&Action::ExpandCellOutput));
+        assert_eq!(km.get(&x), Some(&Action::ClearNotebookCellExecution));
+    }
+
+    #[test]
     fn test_visual_and_sidebar_focus_keymaps() {
         let visual = Keymap::default_editor_visual_keymap();
         let sidebar = Keymap::default_sidebar_keymap();
@@ -1211,6 +1369,18 @@ mod tests {
         assert_eq!("focus_down".parse::<Action>().unwrap(), Action::FocusDown);
         assert_eq!("focus_up".parse::<Action>().unwrap(), Action::FocusUp);
         assert_eq!("focus_right".parse::<Action>().unwrap(), Action::FocusRight);
+        assert_eq!(
+            "collapse_cell_output".parse::<Action>().unwrap(),
+            Action::CollapseCellOutput
+        );
+        assert_eq!(
+            "expand_cell_output".parse::<Action>().unwrap(),
+            Action::ExpandCellOutput
+        );
+        assert_eq!(
+            "clear_notebook_cell_execution".parse::<Action>().unwrap(),
+            Action::ClearNotebookCellExecution
+        );
     }
 
     #[test]
