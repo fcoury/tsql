@@ -49,6 +49,7 @@ use super::notebook_run::{
     notebook_run_plan_with_names, notebook_run_plan_without_references, NotebookRunScope,
 };
 use super::pg_snapshot::{self, PgSnapshotRequest, PgTempSnapshot};
+use super::query_safety::{bounded_dml_returning, classify_postgres, QuerySafety};
 use super::refinement::{
     compile_logical_references_mapped, logical_result_reference, logical_result_references,
     normalize_result_name, LogicalResultReference, RefinementAvailability,
@@ -73,7 +74,7 @@ use crate::session::{
     NotebookRunRecord, NotebookRunStatus, NotebookSession, SessionState,
 };
 use crate::ui::{
-    action_entries, create_sql_highlighter, determine_context, escape_sql_value,
+    action_entries, create_sql_highlighter, determine_context, escape_sql_value_for_type,
     get_word_before_cursor, is_inside, load_theme, overlay_block, quote_identifier, zone_block,
     zone_inner, zone_label, zone_scrollbar_area, ActionContext, ActionEntry, AiQueryModal,
     AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind, CompletionPopup, ConfirmContext,
@@ -461,6 +462,21 @@ async fn probe_connection(url: &str, kind: DbKind) -> std::result::Result<(), St
     }
 }
 
+async fn configure_postgres_session(client: &Client, read_only: bool) -> Result<(), String> {
+    if read_only {
+        client
+            .batch_execute("SET default_transaction_read_only = on")
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to enable the read-only PostgreSQL session: {}",
+                    format_pg_error(&error)
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// Normalize the max_rows config value.
 ///
 /// If the user sets max_rows to 0 in config (or leaves it unset), this returns
@@ -593,10 +609,10 @@ ORDER BY schema_name
 /// Describe a table (columns, types, constraints)
 const META_QUERY_DESCRIBE: &str = r#"
 SELECT 
-    c.column_name AS column,
-    c.data_type AS type,
+    c.column_name::text AS column,
+    c.data_type::text AS type,
     CASE WHEN c.is_nullable = 'YES' THEN 'NULL' ELSE 'NOT NULL' END AS nullable,
-    c.column_default AS default,
+    c.column_default::text AS default,
     CASE WHEN pk.column_name IS NOT NULL THEN 'PK' ELSE '' END AS key
 FROM information_schema.columns c
 LEFT JOIN (
@@ -606,9 +622,9 @@ LEFT JOIN (
         ON tc.constraint_name = ku.constraint_name
         AND tc.table_schema = ku.table_schema
     WHERE tc.constraint_type = 'PRIMARY KEY'
-      AND tc.table_name = '$1'
+      AND tc.table_name = $1
 ) pk ON c.column_name = pk.column_name
-WHERE c.table_name = '$1'
+WHERE c.table_name = $1
 ORDER BY c.ordinal_position
 "#;
 
@@ -680,57 +696,34 @@ ORDER BY n.nspname, p.proname
 
 /// Get primary key columns for a table
 const META_QUERY_PRIMARY_KEYS: &str = r#"
-SELECT ku.column_name
+SELECT ku.column_name::text
 FROM information_schema.table_constraints tc
 JOIN information_schema.key_column_usage ku
     ON tc.constraint_name = ku.constraint_name
     AND tc.table_schema = ku.table_schema
 WHERE tc.constraint_type = 'PRIMARY KEY'
-  AND tc.table_name = '$1'
+  AND tc.table_name = $1
 ORDER BY ku.ordinal_position
 "#;
 
-/// Escape a SQL identifier for use in queries (prevents SQL injection)
-fn escape_sql_identifier(s: &str) -> String {
-    // Remove any existing quotes and escape internal quotes
-    let cleaned = s.trim_matches('"').replace('"', "\"\"");
-    // For simple identifiers, return as-is; otherwise quote
-    if cleaned
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        cleaned
-    } else {
-        format!("\"{}\"", cleaned)
-    }
-}
-
 /// Fetch primary key column names for a table.
 async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
-    let query = META_QUERY_PRIMARY_KEYS.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
 
-    match guard.simple_query(&query).await {
-        Ok(messages) => {
-            let mut pks = Vec::new();
-            for msg in messages {
-                if let SimpleQueryMessage::Row(row) = msg {
-                    if let Some(col_name) = row.get(0) {
-                        pks.push(col_name.to_string());
-                    }
-                }
-            }
-            pks
-        }
+    match guard.query(META_QUERY_PRIMARY_KEYS, &[&table]).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<_, String>(0).ok())
+            .collect(),
         Err(_) => Vec::new(), // Silently fail - PK detection is optional
     }
 }
 
 /// Query to fetch column types for a table.
 const META_QUERY_COLUMN_TYPES: &str = r#"
-SELECT column_name, data_type
+SELECT column_name::text, data_type::text
 FROM information_schema.columns
-WHERE table_name = '$1'
+WHERE table_name = $1
 ORDER BY ordinal_position
 "#;
 
@@ -739,17 +732,16 @@ async fn fetch_column_types(
     client: &SharedClient,
     table: &str,
 ) -> std::collections::HashMap<String, String> {
-    let query = META_QUERY_COLUMN_TYPES.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
 
-    match guard.simple_query(&query).await {
-        Ok(messages) => {
+    match guard.query(META_QUERY_COLUMN_TYPES, &[&table]).await {
+        Ok(rows) => {
             let mut types = std::collections::HashMap::new();
-            for msg in messages {
-                if let SimpleQueryMessage::Row(row) = msg {
-                    if let (Some(col_name), Some(data_type)) = (row.get(0), row.get(1)) {
-                        types.insert(col_name.to_string(), data_type.to_string());
-                    }
+            for row in rows {
+                if let (Ok(col_name), Ok(data_type)) =
+                    (row.try_get::<_, String>(0), row.try_get::<_, String>(1))
+                {
+                    types.insert(col_name, data_type);
                 }
             }
             types
@@ -842,23 +834,19 @@ const MIN_GRID_HEIGHT: u16 = 3;
 const QUERY_CHROME_ROWS: u16 = 1;
 const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
-/// Check if a query is suitable for cursor-based paging.
-///
-/// Returns true for simple SELECT queries without:
-/// - JOINs
-/// - Subqueries in FROM clause
-/// - Multiple statements
-///
-/// This allows us to use server-side cursors for efficient streaming.
 fn is_pageable_query(query: &str) -> bool {
-    // Reuse the logic from extract_table_from_query - if it can extract a table,
-    // the query is simple enough to page.
-    // Also check for multiple statements (semicolons not at the end).
-    let trimmed = query.trim().trim_end_matches(';');
-    if trimmed.contains(';') {
-        return false; // Multiple statements
+    pg_snapshot::is_snapshot_candidate(query)
+}
+
+fn bounded_classic_cursor_query(query: &str, max_rows: usize) -> Option<String> {
+    if !is_pageable_query(query) {
+        return None;
     }
-    extract_table_from_query(query).is_some()
+    let statement = single_statement(query).ok()?;
+    Some(format!(
+        "SELECT * FROM (\n{statement}\n) AS __tsql_classic_result LIMIT {}",
+        max_rows.saturating_add(1)
+    ))
 }
 
 fn is_row_returning_query(query: &str) -> bool {
@@ -1524,6 +1512,36 @@ enum MongoQuery {
         collection: String,
         filter: Document,
     },
+}
+
+fn classify_mongo_safety(query: &str) -> QuerySafety {
+    match parse_mongo_query(query) {
+        Ok(MongoQuery::Find { .. })
+        | Ok(MongoQuery::FindOne { .. })
+        | Ok(MongoQuery::CountDocuments { .. }) => QuerySafety::ReadOnly,
+        Ok(MongoQuery::Aggregate { pipeline, .. }) => {
+            if pipeline
+                .iter()
+                .any(|stage| stage.contains_key("$out") || stage.contains_key("$merge"))
+            {
+                QuerySafety::Destructive
+            } else {
+                QuerySafety::ReadOnly
+            }
+        }
+        Ok(MongoQuery::UpdateMany { filter, .. }) | Ok(MongoQuery::DeleteMany { filter, .. })
+            if filter.is_empty() =>
+        {
+            QuerySafety::Destructive
+        }
+        Ok(MongoQuery::InsertOne { .. })
+        | Ok(MongoQuery::InsertMany { .. })
+        | Ok(MongoQuery::UpdateOne { .. })
+        | Ok(MongoQuery::UpdateMany { .. })
+        | Ok(MongoQuery::DeleteOne { .. })
+        | Ok(MongoQuery::DeleteMany { .. }) => QuerySafety::Write,
+        Err(_) => QuerySafety::Unknown,
+    }
 }
 
 struct MongoQueryLimits {
@@ -6060,6 +6078,11 @@ impl App {
     }
 
     fn start_cell_edit(&mut self, row: usize, col: usize) {
+        if self.active_connection_is_read_only() {
+            self.last_error =
+                Some("Cell editing is disabled for the active read-only connection".to_string());
+            return;
+        }
         // Check if we have a source table
         if self.grid.source_table.is_none() {
             self.last_error =
@@ -6283,6 +6306,32 @@ impl App {
                 self.replace_editor_and_execute_schema_query(query);
                 false
             }
+            ConfirmContext::ExecuteDestructiveQuery { query, refresh } => {
+                if self.active_connection_is_read_only() {
+                    self.last_error = Some(
+                        "Write blocked: the active saved connection is configured as read-only"
+                            .to_string(),
+                    );
+                    self.last_status = Some("Read-only connection".to_string());
+                } else {
+                    let kind = if refresh {
+                        QueryExecutionKind::Refresh
+                    } else {
+                        QueryExecutionKind::New
+                    };
+                    self.execute_query_text_unchecked(query, kind);
+                }
+                false
+            }
+            ConfirmContext::ExecuteCellUpdate {
+                sql,
+                row,
+                col,
+                new_value,
+            } => {
+                self.execute_cell_update(sql, row, col, new_value);
+                false
+            }
         }
     }
 
@@ -6334,6 +6383,10 @@ impl App {
             }
             ConfirmContext::ReplaceAndExecuteQuery { .. } => {
                 self.last_status = Some("Query execution cancelled".to_string());
+            }
+            ConfirmContext::ExecuteDestructiveQuery { .. }
+            | ConfirmContext::ExecuteCellUpdate { .. } => {
+                self.last_status = Some("Database write cancelled".to_string());
             }
         }
     }
@@ -6488,11 +6541,11 @@ impl App {
             "UPDATE {} SET {} = {} WHERE {}",
             quote_identifier(&table),
             quote_identifier(&column_name),
-            escape_sql_value(&new_value),
+            escape_sql_value_for_type(&new_value, self.grid.col_type(col)),
             where_clause
         );
 
-        self.execute_cell_update(update_sql, row, col, new_value);
+        self.request_cell_update_confirmation(update_sql, row, col, new_value);
     }
 
     fn commit_cell_edit(&mut self) {
@@ -6547,13 +6600,13 @@ impl App {
             "UPDATE {} SET {} = {} WHERE {}",
             quote_identifier(&table),
             quote_identifier(&column_name),
-            escape_sql_value(&new_value),
+            escape_sql_value_for_type(&new_value, self.grid.col_type(col)),
             where_clause
         );
 
-        // Close editor and execute update
+        // Close the editor before showing the generated SQL confirmation.
         self.cell_editor.close();
-        self.execute_cell_update(update_sql, row, col, new_value);
+        self.request_cell_update_confirmation(update_sql, row, col, new_value);
     }
 
     fn commit_mongo_edit(
@@ -6712,6 +6765,14 @@ impl App {
     }
 
     fn execute_cell_update(&mut self, sql: String, row: usize, col: usize, new_value: String) {
+        if self.active_connection_is_read_only() {
+            self.last_error = Some(
+                "Cell update blocked: the active saved connection is configured as read-only"
+                    .to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
         let Some(client) = self.db.client.clone() else {
             self.last_error = Some("Not connected".to_string());
             return;
@@ -6731,7 +6792,8 @@ impl App {
         // Store row/col/value for updating grid on success
         let update_row = row;
         let update_col = col;
-        let update_is_null = new_value.is_empty() || new_value.eq_ignore_ascii_case("null");
+        let update_is_null =
+            escape_sql_value_for_type(&new_value, self.grid.col_type(col)) == "NULL";
         let update_value = new_value;
 
         self.rt.spawn(async move {
@@ -6774,6 +6836,32 @@ impl App {
         });
     }
 
+    fn request_cell_update_confirmation(
+        &mut self,
+        sql: String,
+        row: usize,
+        col: usize,
+        new_value: String,
+    ) {
+        if self.active_connection_is_read_only() {
+            self.last_error = Some(
+                "Cell update blocked: the active saved connection is configured as read-only"
+                    .to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+        self.confirm_prompt = Some(ConfirmPrompt::new(
+            format!("Execute this generated cell update?\n\n{sql}"),
+            ConfirmContext::ExecuteCellUpdate {
+                sql,
+                row,
+                col,
+                new_value,
+            },
+        ));
+    }
+
     fn build_update_where_clause(
         &self,
         row: usize,
@@ -6796,7 +6884,11 @@ impl App {
                 Some(format!(
                     "{} = {}",
                     quote_identifier(pk_name),
-                    escape_sql_value(pk_value)
+                    if self.grid.cell_is_null(row, pk_col_idx) {
+                        "NULL".to_string()
+                    } else {
+                        escape_sql_value_for_type(pk_value, self.grid.col_type(pk_col_idx))
+                    }
                 ))
             })
             .collect();
@@ -6823,16 +6915,21 @@ impl App {
 
         let mut match_conditions = Vec::new();
         for (idx, header) in self.grid.headers.iter().enumerate() {
-            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
-            if idx == edited_col {
-                if let Some(original) = edited_original_value {
-                    value = original;
+            let value = if self.grid.cell_is_null(row, idx) {
+                "NULL".to_string()
+            } else {
+                let mut raw = row_values.get(idx).map(String::as_str).unwrap_or("NULL");
+                if idx == edited_col {
+                    if let Some(original) = edited_original_value {
+                        raw = original;
+                    }
                 }
-            }
+                escape_sql_value_for_type(raw, self.grid.col_type(idx))
+            };
             match_conditions.push(format!(
                 "{} IS NOT DISTINCT FROM {}",
                 quote_identifier(header),
-                escape_sql_literal_for_where(value)
+                value
             ));
         }
 
@@ -7565,6 +7662,12 @@ impl App {
         }
     }
 
+    fn active_connection_is_read_only(&self) -> bool {
+        self.active_connection_name
+            .as_deref()
+            .is_some_and(|name| self.connections.is_read_only(name))
+    }
+
     fn request_open_ai_modal(&mut self, prefill: Option<String>) {
         if !self.config.ai.enabled {
             self.last_error =
@@ -8015,12 +8118,8 @@ impl App {
             return;
         }
 
-        // Build the query, substituting table name if provided
-        let query = if let Some(table) = table_arg {
-            query_template.replace("$1", &escape_sql_identifier(table))
-        } else {
-            query_template.to_string()
-        };
+        let query = query_template.to_string();
+        let table_arg = table_arg.map(str::to_string);
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
@@ -8031,40 +8130,73 @@ impl App {
 
         self.rt.spawn(async move {
             let guard = client.lock().await;
-            match guard.simple_query(&query).await {
-                Ok(messages) => {
-                    drop(guard);
-                    let elapsed = started.elapsed();
-
-                    let mut headers: Vec<String> = Vec::new();
-                    let mut rows: Vec<Vec<String>> = Vec::new();
-                    let mut null_cells: Vec<Vec<bool>> = Vec::new();
-
-                    for msg in messages {
-                        match msg {
-                            SimpleQueryMessage::Row(row) => {
+            let query_result: Result<_, String> = if let Some(table) = table_arg {
+                match guard.query(&query, &[&table]).await {
+                    Ok(db_rows) => (|| {
+                        let headers = db_rows
+                            .first()
+                            .map(|row| {
+                                row.columns()
+                                    .iter()
+                                    .map(|column| column.name().to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let mut rows = Vec::with_capacity(db_rows.len());
+                        let mut null_cells = Vec::with_capacity(db_rows.len());
+                        for row in db_rows {
+                            let mut out_row = Vec::with_capacity(row.len());
+                            let mut null_row = Vec::with_capacity(row.len());
+                            for index in 0..row.len() {
+                                let cell = row
+                                    .try_get::<_, Option<String>>(index)
+                                    .map_err(|error| format_pg_error(&error))?;
+                                null_row.push(cell.is_none());
+                                out_row.push(cell.unwrap_or_else(|| "NULL".to_string()));
+                            }
+                            rows.push(out_row);
+                            null_cells.push(null_row);
+                        }
+                        Ok((headers, rows, null_cells))
+                    })(),
+                    Err(error) => Err(format_pg_error(&error)),
+                }
+            } else {
+                match guard.simple_query(&query).await {
+                    Ok(messages) => {
+                        let mut headers = Vec::new();
+                        let mut rows = Vec::new();
+                        let mut null_cells = Vec::new();
+                        for message in messages {
+                            if let SimpleQueryMessage::Row(row) = message {
                                 if headers.is_empty() {
                                     headers = row
                                         .columns()
                                         .iter()
-                                        .map(|c| c.name().to_string())
+                                        .map(|column| column.name().to_string())
                                         .collect();
                                 }
                                 let mut out_row = Vec::with_capacity(row.len());
                                 let mut null_row = Vec::with_capacity(row.len());
-                                for i in 0..row.len() {
-                                    let cell = row.get(i);
+                                for index in 0..row.len() {
+                                    let cell = row.get(index);
                                     null_row.push(cell.is_none());
                                     out_row.push(cell.unwrap_or("NULL").to_string());
                                 }
                                 rows.push(out_row);
                                 null_cells.push(null_row);
                             }
-                            SimpleQueryMessage::CommandComplete(_) => {}
-                            _ => {}
                         }
+                        Ok((headers, rows, null_cells))
                     }
+                    Err(error) => Err(format_pg_error(&error)),
+                }
+            };
+            drop(guard);
 
+            match query_result {
+                Ok((headers, rows, null_cells)) => {
+                    let elapsed = started.elapsed();
                     let result = QueryResult {
                         headers,
                         rows,
@@ -8079,10 +8211,8 @@ impl App {
 
                     let _ = tx.send(DbEvent::QueryFinished { result });
                 }
-                Err(e) => {
-                    let _ = tx.send(DbEvent::QueryError {
-                        error: format_pg_error(&e),
-                    });
+                Err(error) => {
+                    let _ = tx.send(DbEvent::QueryError { error });
                 }
             }
         });
@@ -9667,6 +9797,10 @@ impl App {
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let connect_generation = self.connect_generation;
         self.connect_generation_name = self.current_connection_name.clone();
+        let read_only = self
+            .connect_generation_name
+            .as_deref()
+            .is_some_and(|name| self.connections.is_read_only(name));
 
         let tx = self.db_events_tx.clone();
         let rt = self.rt.clone();
@@ -9726,6 +9860,15 @@ impl App {
                                 }
                             });
 
+                            if let Err(error) = configure_postgres_session(&client, read_only).await
+                            {
+                                let _ = tx.send(DbEvent::ConnectError {
+                                    error,
+                                    connect_generation,
+                                });
+                                return;
+                            }
+
                             let token = client.cancel_token();
                             let shared = Arc::new(Mutex::new(client));
                             let _ = tx.send(DbEvent::Connected {
@@ -9757,6 +9900,15 @@ impl App {
                                     });
                                 }
                             });
+
+                            if let Err(error) = configure_postgres_session(&client, read_only).await
+                            {
+                                let _ = tx.send(DbEvent::ConnectError {
+                                    error,
+                                    connect_generation,
+                                });
+                                return;
+                            }
 
                             let token = client.cancel_token();
                             let shared = Arc::new(Mutex::new(client));
@@ -9790,6 +9942,15 @@ impl App {
                                 }
                             });
 
+                            if let Err(error) = configure_postgres_session(&client, read_only).await
+                            {
+                                let _ = tx.send(DbEvent::ConnectError {
+                                    error,
+                                    connect_generation,
+                                });
+                                return;
+                            }
+
                             let token = client.cancel_token();
                             let shared = Arc::new(Mutex::new(client));
                             let _ = tx.send(DbEvent::Connected {
@@ -9812,6 +9973,16 @@ impl App {
                                             });
                                         }
                                     });
+
+                                    if let Err(error) =
+                                        configure_postgres_session(&client, read_only).await
+                                    {
+                                        let _ = tx.send(DbEvent::ConnectError {
+                                            error,
+                                            connect_generation,
+                                        });
+                                        return;
+                                    }
 
                                     let token = client.cancel_token();
                                     let shared = Arc::new(Mutex::new(client));
@@ -9849,6 +10020,15 @@ impl App {
                                     });
                                 }
                             });
+
+                            if let Err(error) = configure_postgres_session(&client, read_only).await
+                            {
+                                let _ = tx.send(DbEvent::ConnectError {
+                                    error,
+                                    connect_generation,
+                                });
+                                return;
+                            }
 
                             let token = client.cancel_token();
                             let shared = Arc::new(Mutex::new(client));
@@ -12742,6 +12922,24 @@ impl App {
                 }
             }
         };
+        let safety = if is_mongo {
+            classify_mongo_safety(&query)
+        } else {
+            classify_postgres(&query)
+        };
+        if self.active_connection_is_read_only() && safety.requires_write_access() {
+            self.last_error = Some(
+                "Write blocked: the active saved connection is configured as read-only".to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+        if safety == QuerySafety::Destructive {
+            self.last_status = Some(
+                "Run destructive statements in Classic mode to review and confirm them".to_string(),
+            );
+            return;
+        }
         if !is_mongo
             && matches!(
                 classify_transaction_control(&query),
@@ -12907,6 +13105,39 @@ impl App {
             return;
         }
 
+        let safety = if self.db.kind == Some(DbKind::Mongo) {
+            classify_mongo_safety(&query)
+        } else {
+            classify_postgres(&query)
+        };
+        if self.active_connection_is_read_only() && safety.requires_write_access() {
+            self.last_error = Some(
+                "Write blocked: the active saved connection is configured as read-only".to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+        if safety == QuerySafety::Destructive {
+            let preview = query.trim();
+            let preview = if preview.chars().count() > 240 {
+                format!("{}…", preview.chars().take(240).collect::<String>())
+            } else {
+                preview.to_string()
+            };
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                format!("Execute this potentially destructive statement?\n\n{preview}"),
+                ConfirmContext::ExecuteDestructiveQuery {
+                    query,
+                    refresh: kind == QueryExecutionKind::Refresh,
+                },
+            ));
+            return;
+        }
+
+        self.execute_query_text_unchecked(query, kind);
+    }
+
+    fn execute_query_text_unchecked(&mut self, query: String, kind: QueryExecutionKind) {
         if kind == QueryExecutionKind::New {
             // Push new executions to both editor history (for Ctrl-p/n navigation)
             // and persistent history. Refreshes intentionally do not add duplicates.
@@ -13010,7 +13241,9 @@ impl App {
         // same server-side cursor even though the wrapper contains a subquery.
         let transformed_pageable =
             kind == QueryExecutionKind::Refresh && !self.classic_result_transform.is_empty();
-        if is_pageable_query(&query) || transformed_pageable {
+        let bounded_cursor_query = bounded_classic_cursor_query(&query, max_rows);
+        let bounded_dml_query = bounded_dml_returning(&query, max_rows);
+        if let Some(execution_query) = bounded_cursor_query {
             // Create channel for fetch-more requests
             let (fetch_more_tx, fetch_more_rx) = mpsc::unbounded_channel();
 
@@ -13021,21 +13254,21 @@ impl App {
 
             self.execute_query_paged(
                 client,
-                query,
+                execution_query,
                 max_rows,
                 page_size,
                 source_table,
                 tx,
                 fetch_more_rx,
                 self.config.connection.query_timeout_secs,
-                transformed_pageable,
+                transformed_pageable || self.active_connection_is_read_only(),
                 self.db.connected_with_tls,
             );
         } else {
             self.paged_query = None;
             self.execute_query_simple(
                 client,
-                query,
+                bounded_dml_query.unwrap_or(query),
                 max_rows,
                 usize::MAX,
                 source_table,
@@ -15782,7 +16015,7 @@ impl App {
             .add_modifier(Modifier::BOLD);
 
         // Connection info
-        let conn_segment = if self.db.status == DbStatus::Connected {
+        let mut conn_segment = if self.db.status == DbStatus::Connected {
             if let Some(ref conn_str) = self.db.conn_str {
                 let mut info = ConnectionInfo::parse(conn_str);
                 if self.db.kind == Some(DbKind::Mongo) {
@@ -15802,6 +16035,9 @@ impl App {
         } else {
             "disconnected".to_string()
         };
+        if self.db.status == DbStatus::Connected && self.active_connection_is_read_only() {
+            conn_segment.push_str(" [read-only]");
+        }
 
         let conn_style = match self.db.status {
             DbStatus::Connected => Style::default().fg(self.ui_theme.success),
@@ -17706,22 +17942,6 @@ fn calculate_editor_scroll(
     }
 
     (scroll_row as u16, scroll_col as u16)
-}
-
-fn escape_sql_literal_for_where(s: &str) -> String {
-    if s.eq_ignore_ascii_case("null") {
-        return "NULL".to_string();
-    }
-
-    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-        return s.to_string();
-    }
-
-    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
-        return s.to_uppercase();
-    }
-
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -22879,7 +23099,9 @@ mod tests {
         let mut grid = GridModel::new(
             vec!["a".to_string(), "b".to_string()],
             vec![vec!["1".to_string(), "NULL".to_string()]],
-        );
+        )
+        .with_col_types(vec!["text".to_string(), "text".to_string()])
+        .with_null_cells(vec![vec![false, true]]);
         grid.source_table = Some("t".to_string());
         grid.primary_keys = Vec::new();
 
@@ -22895,6 +23117,10 @@ mod tests {
         assert!(
             where_clause.contains("b IS NOT DISTINCT FROM NULL"),
             "Should use IS NOT DISTINCT FROM and preserve NULLs"
+        );
+        assert!(
+            where_clause.contains("a IS NOT DISTINCT FROM '1'"),
+            "Should preserve numeric-looking text values"
         );
     }
 
@@ -26307,20 +26533,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_pageable_query_rejects_joins() {
-        assert!(!is_pageable_query(
+    fn test_is_pageable_query_accepts_joins() {
+        assert!(is_pageable_query(
             "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
         ));
-        assert!(!is_pageable_query(
+        assert!(is_pageable_query(
             "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id"
         ));
     }
 
     #[test]
-    fn test_is_pageable_query_rejects_subqueries() {
-        assert!(!is_pageable_query(
+    fn test_is_pageable_query_accepts_subqueries() {
+        assert!(is_pageable_query(
             "SELECT * FROM (SELECT * FROM users) AS sub"
         ));
+    }
+
+    #[test]
+    fn test_classic_cursor_query_has_a_server_side_cap() {
+        assert_eq!(
+            bounded_classic_cursor_query(
+                "WITH users AS (SELECT * FROM accounts) SELECT * FROM users;",
+                2_000
+            )
+            .as_deref(),
+            Some(
+                "SELECT * FROM (\nWITH users AS (SELECT * FROM accounts) SELECT * FROM users\n) AS __tsql_classic_result LIMIT 2001"
+            )
+        );
     }
 
     #[test]
@@ -26557,5 +26797,76 @@ mod tests {
             resolve_ssl_mode("host=localhost port=5432 sslmode=verify-full user=postgres"),
             Ok(SslMode::VerifyFull)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn destructive_query_requests_confirmation() {
+        let _guard = ConfigDirGuard::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(GridModel::empty(), runtime.handle().clone(), tx, rx, None);
+
+        app.execute_query_text("DELETE FROM users".to_string(), QueryExecutionKind::New);
+
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+            Some(ConfirmContext::ExecuteDestructiveQuery { query, refresh: false })
+                if query == "DELETE FROM users"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn read_only_saved_connection_fails_closed_for_writes_and_unknown_sql() {
+        let _guard = ConfigDirGuard::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(GridModel::empty(), runtime.handle().clone(), tx, rx, None);
+        app.connections = ConnectionsFile::new();
+        app.connections
+            .read_only_connections
+            .push("production".to_string());
+        app.active_connection_name = Some("production".to_string());
+
+        for query in [
+            "UPDATE users SET active = false WHERE id = 1",
+            "CALL mutate_users()",
+        ] {
+            app.last_error = None;
+            app.execute_query_text(query.to_string(), QueryExecutionKind::New);
+            assert!(
+                app.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Write blocked")),
+                "query was not blocked: {query}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cell_update_confirmation_includes_generated_sql() {
+        let _guard = ConfigDirGuard::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(GridModel::empty(), runtime.handle().clone(), tx, rx, None);
+        let sql = "UPDATE users SET name = 'Ada' WHERE id = 1".to_string();
+
+        app.request_cell_update_confirmation(sql.clone(), 0, 1, "Ada".to_string());
+
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+            Some(ConfirmContext::ExecuteCellUpdate { sql: pending, .. }) if pending == &sql
+        ));
     }
 }

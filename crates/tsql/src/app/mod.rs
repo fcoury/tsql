@@ -5,6 +5,7 @@ mod notebook;
 mod notebook_export;
 mod notebook_run;
 mod pg_snapshot;
+mod query_safety;
 mod refinement;
 mod result_transform;
 mod sql_lexer;
