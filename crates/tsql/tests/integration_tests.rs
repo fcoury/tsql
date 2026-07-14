@@ -2,15 +2,12 @@
 
 mod common;
 
-use common::{get_test_database_url, TestDatabase};
+use common::{require_test_database_url, TestDatabase};
 
 /// Test that we can connect to a PostgreSQL database successfully.
 #[tokio::test]
 async fn test_connection_success() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -38,10 +35,7 @@ async fn test_connection_failure_invalid_host() {
 /// Test that query errors are properly reported (not just "db error").
 #[tokio::test]
 async fn test_query_error_message() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -92,10 +86,7 @@ async fn test_query_error_message() {
 /// Test that we can execute DDL statements.
 #[tokio::test]
 async fn test_ddl_create_table() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -124,10 +115,7 @@ async fn test_ddl_create_table() {
 /// Test insert and select operations.
 #[tokio::test]
 async fn test_insert_and_select() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -161,10 +149,7 @@ async fn test_insert_and_select() {
 /// Test that simple_query works and returns results.
 #[tokio::test]
 async fn test_simple_query() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -187,10 +172,7 @@ async fn test_simple_query() {
 /// Test that multiple tests can run in parallel with isolated databases.
 #[tokio::test]
 async fn test_parallel_isolation_1() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();
@@ -218,10 +200,7 @@ async fn test_parallel_isolation_1() {
 
 #[tokio::test]
 async fn test_parallel_isolation_2() {
-    let Some(admin_url) = get_test_database_url() else {
-        eprintln!("Skipping: TEST_DATABASE_URL not set");
-        return;
-    };
+    let admin_url = require_test_database_url();
 
     let test_db = TestDatabase::new(&admin_url).await.unwrap();
     let client = test_db.connect().await.unwrap();

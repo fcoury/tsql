@@ -132,17 +132,8 @@ pub fn get_test_database_url() -> Option<String> {
         .ok()
 }
 
-/// Skips a test if no database URL is configured.
-///
-/// Returns `Some(url)` if a database is available, `None` otherwise.
-/// Prints a message when skipping.
-#[allow(dead_code)]
-pub fn require_database() -> Option<String> {
-    match get_test_database_url() {
-        Some(url) => Some(url),
-        None => {
-            eprintln!("Skipping test: TEST_DATABASE_URL not set");
-            None
-        }
-    }
+/// Returns the configured test database URL or fails loudly.
+pub fn require_test_database_url() -> String {
+    get_test_database_url()
+        .expect("database-backed integration tests require TEST_DATABASE_URL (or DATABASE_URL)")
 }
