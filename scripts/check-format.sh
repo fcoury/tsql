@@ -1,15 +1,13 @@
 #!/bin/bash
 
-# Get list of staged server files that need formatting check
-CHANGED_FILES=$(git diff --cached --name-only | grep -E "^api/.*\.rs$")
+# Run workspace formatting when staged Rust or Cargo manifest files change.
+CHANGED_FILES=$(git diff --cached --name-only | grep -E '(^|/)Cargo\.toml$|\.rs$')
 
 if [ -n "$CHANGED_FILES" ]; then
-    echo "Checking format for changed rust server files:"
+    echo "Checking workspace format for staged Rust files:"
     echo "$CHANGED_FILES"
-    cd api && cargo fmt -- --check
+    cargo fmt --all -- --check
 else
-    echo "No server files changed, skipping format check"
+    echo "No staged Rust files changed, skipping format check"
     exit 0
 fi
-
-

@@ -209,6 +209,42 @@ pub(crate) fn code_words(source: &str, limit: usize) -> Result<Vec<String>, Stri
     Ok(words)
 }
 
+/// Returns uppercase identifier-like words outside literals and comments,
+/// together with their parenthesis depth.
+pub(crate) fn code_words_with_depth(source: &str) -> Result<Vec<(String, usize)>, String> {
+    fn flush_word(word: &mut String, depth: usize, words: &mut Vec<(String, usize)>) {
+        if !word.is_empty() {
+            words.push((std::mem::take(word).to_ascii_uppercase(), depth));
+        }
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut depth = 0usize;
+
+    for segment in scan(source)? {
+        if segment.kind != SqlSegmentKind::Code {
+            flush_word(&mut word, depth, &mut words);
+            continue;
+        }
+        for character in source[segment.range].chars() {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                word.push(character);
+                continue;
+            }
+            flush_word(&mut word, depth, &mut words);
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        flush_word(&mut word, depth, &mut words);
+    }
+
+    Ok(words)
+}
+
 fn is_escape_string(source: &str, quote: usize) -> bool {
     let bytes = source.as_bytes();
     if quote > 0 && matches!(bytes[quote - 1], b'E' | b'e') {
@@ -277,6 +313,32 @@ mod tests {
         assert_eq!(masked.len(), statement.len());
         assert!(masked.contains("SELECT $body$one; @result_2$body$"));
         assert!(!masked.contains("nested"));
+    }
+
+    #[test]
+    fn reports_parenthesis_depth_for_structural_words() {
+        assert_eq!(
+            code_words_with_depth(
+                "UPDATE users SET active = EXISTS (SELECT 1 FROM audit WHERE audit.id = users.id)"
+            )
+            .unwrap(),
+            [
+                ("UPDATE".to_string(), 0),
+                ("USERS".to_string(), 0),
+                ("SET".to_string(), 0),
+                ("ACTIVE".to_string(), 0),
+                ("EXISTS".to_string(), 0),
+                ("SELECT".to_string(), 1),
+                ("1".to_string(), 1),
+                ("FROM".to_string(), 1),
+                ("AUDIT".to_string(), 1),
+                ("WHERE".to_string(), 1),
+                ("AUDIT".to_string(), 1),
+                ("ID".to_string(), 1),
+                ("USERS".to_string(), 1),
+                ("ID".to_string(), 1),
+            ]
+        );
     }
 
     #[test]

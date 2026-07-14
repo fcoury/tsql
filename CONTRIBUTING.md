@@ -6,7 +6,7 @@ Thank you for your interest in contributing to tsql! This document provides guid
 
 ### Prerequisites
 
-- **Rust 1.80 or later** - Install via [rustup](https://rustup.rs/)
+- **Rust 1.88 or later** - Install via [rustup](https://rustup.rs/)
 - **PostgreSQL** - For running integration tests (optional but recommended)
 
 ### Clone and Build

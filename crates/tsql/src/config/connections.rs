@@ -1037,6 +1037,10 @@ pub struct ConnectionsFile {
     /// user's preference survives restarts.
     #[serde(default, skip_serializing_if = "is_default_sort")]
     pub last_sort_mode: SortMode,
+    /// Saved connection names that should reject writes locally. PostgreSQL
+    /// connections also enable the server's read-only session default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_connections: Vec<String>,
 }
 
 fn is_default_sort(mode: &SortMode) -> bool {
@@ -1049,7 +1053,14 @@ impl ConnectionsFile {
         Self {
             connections: Vec::new(),
             last_sort_mode: SortMode::default(),
+            read_only_connections: Vec::new(),
         }
+    }
+
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.read_only_connections
+            .iter()
+            .any(|candidate| candidate == name)
     }
 
     /// Find a connection by name
@@ -1140,8 +1151,15 @@ impl ConnectionsFile {
             }
         }
 
+        let renamed_to = entry.name.clone();
+        let was_read_only = self.is_read_only(name);
         if let Some(existing) = self.connections.iter_mut().find(|c| c.name == name) {
             *existing = entry;
+            if name != renamed_to && was_read_only {
+                self.read_only_connections
+                    .retain(|candidate| candidate != name);
+                self.read_only_connections.push(renamed_to);
+            }
             Ok(())
         } else {
             Err(anyhow!("Connection '{}' not found", name))
@@ -1156,6 +1174,8 @@ impl ConnectionsFile {
             .position(|c| c.name == name)
             .ok_or_else(|| anyhow!("Connection '{}' not found", name))?;
 
+        self.read_only_connections
+            .retain(|candidate| candidate != name);
         Ok(self.connections.remove(idx))
     }
 
@@ -1471,6 +1491,7 @@ pub fn export_to_path(path: &Path, entries: Vec<ConnectionEntry>) -> Result<()> 
     let file = ConnectionsFile {
         connections: entries,
         last_sort_mode: SortMode::default(),
+        read_only_connections: Vec::new(),
     };
     write_connections_atomic(path, &file)
 }
@@ -2586,6 +2607,26 @@ user = "me"
         let removed = file.remove("test").unwrap();
         assert_eq!(removed.name, "test");
         assert!(file.find_by_name("test").is_none());
+    }
+
+    #[test]
+    fn read_only_connection_setting_tracks_rename_and_remove() {
+        let mut file = ConnectionsFile::new();
+        let mut prod = ConnectionEntry::new("prod");
+        prod.database = "app".to_string();
+        prod.user = "postgres".to_string();
+        file.add(prod).unwrap();
+        file.read_only_connections.push("prod".to_string());
+
+        let mut production = ConnectionEntry::new("production");
+        production.database = "app".to_string();
+        production.user = "postgres".to_string();
+        file.update("prod", production).unwrap();
+        assert!(!file.is_read_only("prod"));
+        assert!(file.is_read_only("production"));
+
+        file.remove("production").unwrap();
+        assert!(!file.is_read_only("production"));
     }
 
     #[test]

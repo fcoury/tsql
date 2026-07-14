@@ -22,6 +22,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Smart completion** - Schema-aware autocomplete for tables, columns, and keywords
 - **Results grid** - Scrollable, searchable data grid with column resizing, multi-row selection, flexible yank (TSV/CSV/JSON/Markdown), and server-backed Classic/PostgreSQL result transformations
 - **Inline editing** - Edit cells directly in the grid with automatic SQL generation
+- **Write safeguards** - Review destructive SQL and generated cell updates; protect saved connections with a read-only session default
 - **JSON support** - Detect, format, and edit JSON/JSONB columns with syntax highlighting
 - **Postgres + MongoDB** - Connect with `postgres://...` or `mongodb://...` URLs
 - **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`)
@@ -417,6 +418,22 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 See [config.example.toml](config.example.toml) for all available options.
+
+Saved connections live in `~/.tsql/connections.toml`. Add saved names to the
+top-level `read_only_connections` list to reject writes locally. PostgreSQL
+connections also set `default_transaction_read_only` for the session so writes
+attempted through functions are rejected by the server:
+
+```toml
+read_only_connections = ["production", "analytics-replica"]
+
+[[connection]]
+name = "production"
+# ...remaining connection fields...
+```
+
+This is an accident-prevention guard, not a database authorization boundary;
+use a PostgreSQL role without write privileges for security enforcement.
 
 ### Custom themes
 

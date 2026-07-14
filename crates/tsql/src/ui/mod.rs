@@ -33,8 +33,8 @@ pub use connection_manager::{ConnectionManagerAction, ConnectionManagerModal};
 pub use editor::{CommandPrompt, QueryEditor, SearchPrompt};
 pub use fuzzy_picker::{FilteredItem, FuzzyPicker, PickerAction};
 pub use grid::{
-    escape_sql_value, quote_identifier, DataGrid, GridKeyResult, GridModel, GridSearch, GridState,
-    GridViewport, ResizeAction,
+    escape_sql_value, escape_sql_value_for_type, quote_identifier, DataGrid, GridKeyResult,
+    GridModel, GridSearch, GridState, GridViewport, ResizeAction,
 };
 pub use help_popup::{HelpAction, HelpPopup};
 pub use highlighted_editor::{create_sql_highlighter, CursorShape, HighlightedTextArea};
