@@ -316,6 +316,10 @@ fn main() -> Result<()> {
             err
         ));
     }
+    // Install the aws_lc_rs Rustls provider
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
 
     // Load configuration from ~/.tsql/config.toml
     let cfg = config::load_config().unwrap_or_else(|e| {
