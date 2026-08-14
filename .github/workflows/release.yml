@@ -140,10 +140,11 @@ jobs:
       - name: Wait for crates.io index
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "tui-syntax"))')
-          for _ in {1..20}; do
+          for attempt in {1..60}; do
             if cargo search tui-syntax --limit 1 | grep -q "tui-syntax = \"$VERSION\""; then
               exit 0
             fi
+            echo "Waiting for tui-syntax $VERSION to reach the crates.io index ($attempt/60)"
             sleep 15
           done
           echo "tui-syntax $VERSION did not appear in the crates.io index in time" >&2
