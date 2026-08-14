@@ -1435,11 +1435,97 @@ impl GridModel {
 
 /// Quote a SQL identifier (column/table name).
 pub fn quote_identifier(s: &str) -> String {
-    // If it contains special chars or is a reserved word, quote it
-    if s.chars()
+    let is_simple = s
+        .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && !s.chars().next().is_none_or(|c| c.is_ascii_digit())
-    {
+        && !s.chars().next().is_none_or(|c| c.is_ascii_digit());
+    let is_reserved = matches!(
+        s.to_ascii_uppercase().as_str(),
+        "ALL"
+            | "ANALYSE"
+            | "ANALYZE"
+            | "AND"
+            | "ANY"
+            | "ARRAY"
+            | "AS"
+            | "ASC"
+            | "ASYMMETRIC"
+            | "AUTHORIZATION"
+            | "BINARY"
+            | "BOTH"
+            | "CASE"
+            | "CAST"
+            | "CHECK"
+            | "COLLATE"
+            | "COLUMN"
+            | "CONSTRAINT"
+            | "CREATE"
+            | "CURRENT_CATALOG"
+            | "CURRENT_DATE"
+            | "CURRENT_ROLE"
+            | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_USER"
+            | "DEFAULT"
+            | "DEFERRABLE"
+            | "DESC"
+            | "DISTINCT"
+            | "DO"
+            | "ELSE"
+            | "END"
+            | "EXCEPT"
+            | "FALSE"
+            | "FETCH"
+            | "FOR"
+            | "FOREIGN"
+            | "FROM"
+            | "GRANT"
+            | "GROUP"
+            | "HAVING"
+            | "IN"
+            | "INITIALLY"
+            | "INTERSECT"
+            | "INTO"
+            | "LATERAL"
+            | "LEADING"
+            | "LIMIT"
+            | "LOCALTIME"
+            | "LOCALTIMESTAMP"
+            | "NEW"
+            | "NOT"
+            | "NULL"
+            | "OFF"
+            | "OFFSET"
+            | "OLD"
+            | "ON"
+            | "ONLY"
+            | "OR"
+            | "ORDER"
+            | "PLACING"
+            | "PRIMARY"
+            | "REFERENCES"
+            | "RETURNING"
+            | "SELECT"
+            | "SESSION_USER"
+            | "SOME"
+            | "SYMMETRIC"
+            | "TABLE"
+            | "THEN"
+            | "TO"
+            | "TRAILING"
+            | "TRUE"
+            | "UNION"
+            | "UNIQUE"
+            | "USER"
+            | "USING"
+            | "VARIADIC"
+            | "WHEN"
+            | "WHERE"
+            | "WINDOW"
+            | "WITH"
+    );
+
+    if is_simple && !is_reserved {
         s.to_string()
     } else {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -1465,6 +1551,31 @@ pub fn escape_sql_value(s: &str) -> String {
 
     // Otherwise, quote as string
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Escape an edited value using its PostgreSQL type instead of guessing from
+/// the value's spelling. PostgreSQL coerces quoted unknown literals to the
+/// target column type, while text columns retain values such as `NULL`, `123`,
+/// and `true` exactly as entered.
+pub fn escape_sql_value_for_type(s: &str, type_hint: Option<&str>) -> String {
+    let type_hint = type_hint.unwrap_or_default().trim();
+    let is_text = matches!(
+        type_hint,
+        "text"
+            | "character"
+            | "character varying"
+            | "varchar"
+            | "char"
+            | "bpchar"
+            | "name"
+            | "citext"
+    );
+
+    if s.eq_ignore_ascii_case("null") && !is_text {
+        "NULL".to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
 }
 
 /// Escape a string for CSV output.
@@ -2049,6 +2160,20 @@ fn truncate_by_display_width(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_reserved_identifiers() {
+        assert_eq!(quote_identifier("order"), "\"order\"");
+        assert_eq!(quote_identifier("select"), "\"select\"");
+        assert_eq!(quote_identifier("account_id"), "account_id");
+    }
+
+    #[test]
+    fn typed_sql_values_preserve_text_spelling() {
+        assert_eq!(escape_sql_value_for_type("123", Some("text")), "'123'");
+        assert_eq!(escape_sql_value_for_type("null", Some("text")), "'null'");
+        assert_eq!(escape_sql_value_for_type("null", Some("integer")), "NULL");
+    }
     use crate::ui::style::assert_nonblank_cells_have_explicit_fg;
 
     fn create_test_model() -> GridModel {

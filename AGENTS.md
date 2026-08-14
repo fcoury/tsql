@@ -25,7 +25,7 @@
 
 ## Coding Style & Naming Conventions
 
-- Rust toolchain: Rust **1.80+** (see workspace `rust-version`).
+- Rust toolchain: Rust **1.88+** (see workspace `rust-version`).
 - Formatting: `rustfmt` (default settings) is the source of truth.
 - Naming: `snake_case` (fns/modules), `CamelCase` (types/traits), `SCREAMING_SNAKE_CASE` (consts).
 - Keep changes focused; prefer small, composable helpers over large UI/app methods.

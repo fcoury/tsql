@@ -34,7 +34,25 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -W clippy::all
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: Check MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
 
   # Build and test on multiple platforms
   test:
@@ -61,6 +79,9 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --lib --bins
+
+      - name: Run non-database integration tests
+        run: cargo test -p tsql --test startup_nonblocking
 
   # Integration tests with PostgreSQL
   integration:
