@@ -68,7 +68,7 @@ tempfile.workspace = true
 uuid.workspace = true
 
 # Internal crate
-tui-syntax = { path = "../tui-syntax", version = "0.6.0" }
+tui-syntax = { path = "../tui-syntax", version = "0.7.0" }
 tree-sitter.workspace = true
 tree-sitter-sequel.workspace = true
 
