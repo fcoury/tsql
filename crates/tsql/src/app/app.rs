@@ -15440,6 +15440,14 @@ impl App {
                 width: composer_area.width.saturating_sub(1),
                 height: composer_area.height,
             };
+            // A cell at the bottom of the viewport may only fit partially. Keep the
+            // source editor inside that clipped composer, reserving one row each for
+            // the header and footer hint.
+            let source_height = if focused_result_layout || cell.source_collapsed {
+                source_height
+            } else {
+                source_height.min(composer_body.height.saturating_sub(2))
+            };
             let output_toggle = cell.output.as_ref().and_then(|_| {
                 (composer_body.width >= 3).then_some(Rect::new(
                     composer_body.right().saturating_sub(2),
@@ -22271,6 +22279,30 @@ mod tests {
                 .cursor_row,
             3
         );
+    }
+
+    #[test]
+    fn notebook_partial_last_cell_does_not_render_past_buffer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = notebook_test_app(&runtime);
+        app.config.notebook.composer_max_rows = 10;
+        let source = (1..=10)
+            .map(|line| format!("SELECT {line} AS line_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for _ in 0..7 {
+            app.notebook
+                .selected_cell_mut()
+                .replace_source(source.clone());
+            app.notebook.select_or_create_draft();
+        }
+        app.notebook.select_first();
+
+        let _ = notebook_buffer(&mut app, 100, 50);
     }
 
     #[test]
