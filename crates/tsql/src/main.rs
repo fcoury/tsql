@@ -141,10 +141,15 @@ fn build_url_from_libpq_env() -> LibpqEnvResult {
     }
 }
 
+fn is_headless_exec(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "exec")
+}
+
 fn print_usage() {
     eprintln!("tsql - A modern SQL and MongoDB CLI");
     eprintln!();
     eprintln!("Usage: tsql [OPTIONS] [CONNECTION_URL|CONNECTION_NAME]");
+    eprintln!("       tsql exec [OPTIONS] [CONNECTION_URL]");
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  [CONNECTION_URL|CONNECTION_NAME]");
@@ -155,6 +160,7 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  -h, --help        Print this help message");
     eprintln!("  -V, --version     Print version information");
+    eprintln!("  exec              Run one query without the TUI (`tsql exec --help`)");
     eprintln!("      --debug-keys  Print detected key/mouse events (for troubleshooting)");
     eprintln!("      --mouse       (with --debug-keys) Also print mouse events");
     eprintln!("      --safe-mode   Skip session reconnect and startup side effects");
@@ -180,6 +186,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  tsql postgres://localhost/mydb");
+    eprintln!(
+        "  tsql exec postgres://localhost/mydb --read-only --timeout 30s --format json -e \"SELECT 1\""
+    );
     eprintln!("  tsql mongodb://localhost:27017/mydb");
     eprintln!("  tsql -- -prod");
     eprintln!("  DATABASE_URL=postgres://localhost/mydb tsql");
@@ -285,6 +294,12 @@ fn onepassword_startup_warning_nonblocking(onepassword_enabled: bool) -> Option<
 fn main() -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
+
+    // Headless execution never touches the TUI. A saved connection named
+    // `exec` is still opened by the TUI via `tsql -- exec`.
+    if is_headless_exec(&args) {
+        std::process::exit(tsql::exec::run(&args));
+    }
 
     // Check for help flag
     if has_any_startup_option(&args, &["-h", "--help"]) {
@@ -573,6 +588,25 @@ mod tests {
         ] {
             env::remove_var(var);
         }
+    }
+
+    #[test]
+    fn test_exec_subcommand_is_only_the_first_argument() {
+        assert!(is_headless_exec(&args(&["tsql", "exec"])));
+        assert!(is_headless_exec(&args(&[
+            "tsql",
+            "exec",
+            "--read-only",
+            "-e",
+            "SELECT 1"
+        ])));
+        assert!(!is_headless_exec(&args(&["tsql"])));
+        assert!(!is_headless_exec(&args(&["tsql", "--", "exec"])));
+        assert!(!is_headless_exec(&args(&["tsql", "--safe-mode", "exec"])));
+        assert!(!is_headless_exec(&args(&[
+            "tsql",
+            "postgres://localhost/exec"
+        ])));
     }
 
     #[test]

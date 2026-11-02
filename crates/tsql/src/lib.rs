@@ -2,6 +2,7 @@ pub mod ai;
 pub mod app;
 mod clipboard;
 pub mod config;
+pub mod exec;
 pub mod history;
 pub mod session;
 pub mod ui;

@@ -2,7 +2,27 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{require_test_database_url, TestDatabase};
+use tsql::exec::{ExecError, ExecRequest, OutputFormat};
+
+async fn exec(
+    url: &str,
+    sql: &str,
+    read_only: bool,
+    timeout: Option<Duration>,
+    format: OutputFormat,
+) -> Result<String, ExecError> {
+    tsql::exec::run_query(ExecRequest {
+        url: url.to_string(),
+        sql: sql.to_string(),
+        read_only,
+        timeout,
+        format,
+    })
+    .await
+}
 
 /// Test that we can connect to a PostgreSQL database successfully.
 #[tokio::test]
@@ -232,4 +252,179 @@ async fn test_parallel_isolation_2() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 0, "Should not see other test's table");
+}
+
+/// `tsql exec --read-only` returns JSON for a SELECT and refuses a DELETE
+/// before the statement runs.
+#[tokio::test]
+async fn exec_read_only_returns_json_and_refuses_delete() {
+    let admin_url = require_test_database_url();
+    let test_db = TestDatabase::new(&admin_url).await.unwrap();
+    let client = test_db.connect().await.unwrap();
+    client
+        .batch_execute(
+            "CREATE TABLE agents (id int, name text);
+             INSERT INTO agents VALUES (1, 'ada'), (2, NULL);",
+        )
+        .await
+        .unwrap();
+
+    let json = exec(
+        &test_db.url,
+        "SELECT id, name FROM agents ORDER BY id",
+        true,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value[0]["id"], "1");
+    assert_eq!(value[0]["name"], "ada");
+    assert_eq!(value[1]["id"], "2");
+    assert!(value[1]["name"].is_null(), "{json}");
+
+    let table = exec(
+        &test_db.url,
+        "SELECT id, name FROM agents ORDER BY id",
+        true,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Table,
+    )
+    .await
+    .unwrap();
+    assert!(table.contains("ada"), "{table}");
+    assert!(table.contains("(2 rows)"), "{table}");
+
+    let refused = exec(
+        &test_db.url,
+        "DELETE FROM agents",
+        true,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.exit_code(), 2);
+    assert!(
+        refused.to_string().contains("destructive"),
+        "classifier should refuse before execution, got: {refused}"
+    );
+
+    let remaining: i64 = client
+        .query_one("SELECT count(*) FROM agents", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 2);
+
+    let deleted = exec(
+        &test_db.url,
+        "DELETE FROM agents",
+        false,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap();
+    let deleted: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+    assert_eq!(deleted["rows_affected"], 2);
+    let remaining: i64 = client
+        .query_one("SELECT count(*) FROM agents", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0);
+}
+
+/// A SELECT the classifier accepts still cannot write inside the read-only
+/// transaction. The same statement writes when `--read-only` is off.
+#[tokio::test]
+async fn exec_read_only_transaction_blocks_writing_function() {
+    let admin_url = require_test_database_url();
+    let test_db = TestDatabase::new(&admin_url).await.unwrap();
+    let client = test_db.connect().await.unwrap();
+    client
+        .batch_execute(
+            "CREATE TABLE kept (id int);
+             INSERT INTO kept VALUES (1);
+             CREATE FUNCTION sneak_delete() RETURNS integer LANGUAGE sql AS $$
+               DELETE FROM kept;
+               SELECT 1;
+             $$;",
+        )
+        .await
+        .unwrap();
+
+    let refused = exec(
+        &test_db.url,
+        "SELECT sneak_delete()",
+        true,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.exit_code(), 2, "{refused}");
+    assert!(
+        refused.to_string().contains("read-only transaction"),
+        "{refused}"
+    );
+
+    let remaining: i64 = client
+        .query_one("SELECT count(*) FROM kept", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        remaining, 1,
+        "the refused statement must not delete the row"
+    );
+
+    exec(
+        &test_db.url,
+        "SELECT sneak_delete()",
+        false,
+        Some(Duration::from_secs(30)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap();
+    let remaining: i64 = client
+        .query_one("SELECT count(*) FROM kept", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0, "without --read-only the function writes");
+}
+
+/// `pg_sleep` is a read, so `--read-only` allows it, and `statement_timeout`
+/// cancels it on the server.
+#[tokio::test]
+async fn exec_statement_timeout_cancels_pg_sleep() {
+    let admin_url = require_test_database_url();
+    let test_db = TestDatabase::new(&admin_url).await.unwrap();
+
+    let started = Instant::now();
+    let error = exec(
+        &test_db.url,
+        "SELECT pg_sleep(10)",
+        true,
+        Some(Duration::from_secs(1)),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.exit_code(), 4, "{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("statement timeout") || message.contains("57014"),
+        "expected a server-side statement_timeout, got: {message} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "timeout took too long: {elapsed:?} ({message})"
+    );
 }

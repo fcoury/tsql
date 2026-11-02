@@ -17,6 +17,7 @@ pub use execution::{
 };
 pub use notebook::{NotebookCell, NotebookFocus, NotebookState};
 pub use pg_snapshot::PgTempSnapshot;
+pub(crate) use query_safety::{classify_postgres, QuerySafety};
 pub use refinement::{
     RefinementAvailability, RefinementUnavailableReason, ResultVersion, RetainedResult,
     RetainedResultHandle,
